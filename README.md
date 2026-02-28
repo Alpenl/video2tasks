@@ -458,4 +458,13 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 **⭐ Star this repo if you find it useful! ⭐**
 
+WARNING!!
+thanks for the great using tips from YuanJingYi (Sun Yat-sen University）
+PLEASE name your video like this:
+<img width="386" height="143" alt="348e206ad4948edee65c82d8c12ae671" src="https://github.com/user-attachments/assets/272bad75-872d-4321-9e24-e59f211ae880" />
+and put each video in each folder like this
+<img width="355" height="139" alt="1be04121f3312610400b559daa5bd7b3" src="https://github.com/user-attachments/assets/c65e841f-893e-411d-8e33-3a52cef95a1b" />
+
+
+
 </div>
