@@ -1,5 +1,6 @@
 """Worker runner implementation."""
 
+import os
 import time
 import json
 import base64
@@ -37,25 +38,44 @@ def decode_b64_to_numpy(b64_str: str) -> Optional[np.ndarray]:
         return None
 
 
-def run_worker(config: Config) -> None:
-    """Run the worker loop."""
-    server_url = config.worker.server_url
-    
-    # Create and warmup backend
-    backend_kwargs = {}
+def build_backend_kwargs(config: Config) -> Dict[str, Any]:
+    """Build backend kwargs from worker configuration."""
     if config.worker.backend == "qwen3vl":
-        backend_kwargs = {
+        return {
             "model_path": config.worker.qwen3vl.model_path,
             "device_map": config.worker.qwen3vl.device_map,
         }
-    elif config.worker.backend == "remote_api":
-        backend_kwargs = {
+
+    if config.worker.backend == "remote_api":
+        return {
             "url": config.worker.remote_api.api_url,
             "api_key": config.worker.remote_api.api_key,
             "headers": config.worker.remote_api.headers,
             "timeout_sec": config.worker.remote_api.timeout_sec,
         }
+
+    if config.worker.backend == "openai":
+        return {
+            "api_key": config.worker.openai.api_key or os.getenv("OPENAI_API_KEY", ""),
+            "model": config.worker.openai.model,
+            "base_url": config.worker.openai.base_url,
+            "timeout_sec": config.worker.openai.timeout_sec,
+            "organization": config.worker.openai.organization,
+            "project": config.worker.openai.project,
+            "reasoning_effort": config.worker.openai.reasoning_effort,
+            "max_output_tokens": config.worker.openai.max_output_tokens,
+            "jpeg_quality": config.worker.openai.jpeg_quality,
+        }
+
+    return {}
+
+
+def run_worker(config: Config) -> None:
+    """Run the worker loop."""
+    server_url = config.worker.server_url
     
+    # Create and warmup backend
+    backend_kwargs = build_backend_kwargs(config)
     backend = create_backend(config.worker.backend, **backend_kwargs)
     print(f"[Worker] Using backend: {backend.name}")
     backend.warmup()

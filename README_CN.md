@@ -310,7 +310,8 @@ worker:
 ```yaml
 worker:
   backend: qwen3vl
-  model_path: /path/to/model
+  qwen3vl:
+    model_path: /path/to/model
 ```
 
 ### 远程 API 后端
@@ -320,7 +321,8 @@ worker:
 ```yaml
 worker:
   backend: remote_api
-  api_url: http://your-api-server/infer
+  remote_api:
+    api_url: http://your-api-server/infer
 ```
 
 <details>
@@ -355,6 +357,25 @@ worker:
 ```
 
 </details>
+
+### OpenAI 后端
+
+Worker 可直接调用 OpenAI Responses API。这个后端默认面向 `gpt-5.2`。
+
+```yaml
+worker:
+  backend: openai
+  openai:
+    api_key: ""  # 如果设置了 OPENAI_API_KEY，这里可以留空
+    model: gpt-5.2
+    reasoning_effort: low
+```
+
+API Key 可以写在 `config.yaml` 中，也可以通过环境变量提供：
+
+```bash
+export OPENAI_API_KEY=your_api_key
+```
 
 ### 自定义后端
 

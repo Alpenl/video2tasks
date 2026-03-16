@@ -48,17 +48,42 @@ class RemoteAPIConfig(BaseModel):
     headers: dict = Field(default_factory=dict, description="Extra headers for remote API")
 
 
+class OpenAIConfig(BaseModel):
+    """OpenAI Responses API backend configuration."""
+    api_key: str = Field(default="", description="OpenAI API key")
+    model: str = Field(default="gpt-5.2", description="OpenAI model name")
+    base_url: str = Field(
+        default="https://api.openai.com/v1",
+        description="OpenAI API base URL"
+    )
+    timeout_sec: float = Field(default=60.0, description="Request timeout in seconds")
+    organization: str = Field(default="", description="OpenAI organization header")
+    project: str = Field(default="", description="OpenAI project header")
+    reasoning_effort: str = Field(default="low", description="Reasoning effort")
+    max_output_tokens: int = Field(default=512, description="Maximum output tokens")
+    jpeg_quality: int = Field(default=85, description="JPEG quality for uploaded images")
+
+    @field_validator("reasoning_effort")
+    @classmethod
+    def validate_reasoning_effort(cls, v: str) -> str:
+        allowed = ["low", "medium", "high"]
+        if v not in allowed:
+            raise ValueError(f"reasoning_effort must be one of {allowed}, got {v}")
+        return v
+
+
 class WorkerConfig(BaseModel):
     """Worker configuration."""
     server_url: str = Field(default="http://127.0.0.1:8099", description="Server URL")
     backend: str = Field(default="dummy", description="VLM backend type")
     qwen3vl: Qwen3VLConfig = Field(default_factory=Qwen3VLConfig)
     remote_api: RemoteAPIConfig = Field(default_factory=RemoteAPIConfig)
+    openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
 
     @field_validator("backend")
     @classmethod
     def validate_backend(cls, v: str) -> str:
-        allowed = ["dummy", "qwen3vl", "remote_api"]
+        allowed = ["dummy", "qwen3vl", "remote_api", "openai"]
         if v not in allowed:
             raise ValueError(f"backend must be one of {allowed}, got {v}")
         return v
@@ -147,6 +172,24 @@ class Config(BaseModel):
             if not isinstance(headers, dict):
                 raise ValueError("REMOTE_API_HEADERS must be a JSON object")
             config.worker.remote_api.headers = headers
+        if "OPENAI_API_KEY" in os.environ:
+            config.worker.openai.api_key = os.environ["OPENAI_API_KEY"]
+        if "OPENAI_MODEL" in os.environ:
+            config.worker.openai.model = os.environ["OPENAI_MODEL"]
+        if "OPENAI_BASE_URL" in os.environ:
+            config.worker.openai.base_url = os.environ["OPENAI_BASE_URL"]
+        if "OPENAI_TIMEOUT" in os.environ:
+            config.worker.openai.timeout_sec = float(os.environ["OPENAI_TIMEOUT"])
+        if "OPENAI_ORGANIZATION" in os.environ:
+            config.worker.openai.organization = os.environ["OPENAI_ORGANIZATION"]
+        if "OPENAI_PROJECT" in os.environ:
+            config.worker.openai.project = os.environ["OPENAI_PROJECT"]
+        if "OPENAI_REASONING_EFFORT" in os.environ:
+            config.worker.openai.reasoning_effort = os.environ["OPENAI_REASONING_EFFORT"]
+        if "OPENAI_MAX_OUTPUT_TOKENS" in os.environ:
+            config.worker.openai.max_output_tokens = int(os.environ["OPENAI_MAX_OUTPUT_TOKENS"])
+        if "OPENAI_JPEG_QUALITY" in os.environ:
+            config.worker.openai.jpeg_quality = int(os.environ["OPENAI_JPEG_QUALITY"])
         
         return config
     

@@ -310,7 +310,8 @@ Full inference using Qwen3-VL-32B-Instruct (or other variants).
 ```yaml
 worker:
   backend: qwen3vl
-  model_path: /path/to/model
+  qwen3vl:
+    model_path: /path/to/model
 ```
 
 ### Remote API Backend
@@ -320,7 +321,8 @@ Use an external API endpoint for inference:
 ```yaml
 worker:
   backend: remote_api
-  api_url: http://your-api-server/infer
+  remote_api:
+    api_url: http://your-api-server/infer
 ```
 
 <details>
@@ -344,6 +346,25 @@ worker:
 ```
 
 </details>
+
+### OpenAI Backend
+
+Call OpenAI Responses API directly from the worker. `gpt-5.2` is the default target model for this backend.
+
+```yaml
+worker:
+  backend: openai
+  openai:
+    api_key: ""  # Optional when OPENAI_API_KEY is set
+    model: gpt-5.2
+    reasoning_effort: low
+```
+
+You can provide the API key either in `config.yaml` or through the environment:
+
+```bash
+export OPENAI_API_KEY=your_api_key
+```
 
 ### Custom Backend
 

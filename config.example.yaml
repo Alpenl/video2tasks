@@ -24,7 +24,7 @@ server:
 # Worker configuration
 worker:
   server_url: "http://127.0.0.1:8099"
-  backend: "dummy"  # Options: "dummy", "qwen3vl", "remote_api"
+  backend: "dummy"  # Options: "dummy", "qwen3vl", "remote_api", "openai"
   
   # Qwen3VL-specific settings (only used when backend: qwen3vl)
   qwen3vl:
@@ -37,6 +37,19 @@ worker:
     api_key: ""
     timeout_sec: 60.0
     headers: {}
+
+  # OpenAI Responses API settings (only used when backend: openai)
+  # api_key can also be provided via OPENAI_API_KEY
+  openai:
+    api_key: ""
+    model: "gpt-5.2"
+    base_url: "https://api.openai.com/v1"
+    timeout_sec: 60.0
+    organization: ""
+    project: ""
+    reasoning_effort: "low"
+    max_output_tokens: 512
+    jpeg_quality: 85
 
 # Windowing configuration
 windowing:
