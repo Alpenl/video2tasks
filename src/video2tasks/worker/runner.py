@@ -16,6 +16,8 @@ from ..vlm import create_backend
 from ..prompt import prompt_switch_detection
 
 MAX_LOCAL_RETRIES = 2
+MAX_CONNECTION_RETRIES = 30
+MAX_SHUTDOWN_RETRIES = 3
 
 
 def _is_empty_vlm_json(vlm_json: Optional[Dict[str, Any]]) -> bool:
@@ -82,8 +84,8 @@ def run_worker(config: Config) -> None:
     
     print(f"[Worker] Connecting to {server_url}")
     
-    max_connection_retries = 30  # ~60 seconds total
     connection_retry_count = 0
+    had_prior_connection = False
     
     try:
         while True:
@@ -91,13 +93,20 @@ def run_worker(config: Config) -> None:
                 # Get job
                 try:
                     r = requests.get(f"{server_url}/get_job", timeout=60)
+                    had_prior_connection = True
                     connection_retry_count = 0  # Reset on successful connection
                 except requests.exceptions.RequestException as e:
                     connection_retry_count += 1
-                    if connection_retry_count >= max_connection_retries:
-                        print(f"[Worker] Failed to connect after {max_connection_retries} retries. Exiting.")
+                    max_retries = (
+                        MAX_SHUTDOWN_RETRIES if had_prior_connection else MAX_CONNECTION_RETRIES
+                    )
+                    if connection_retry_count >= max_retries:
+                        if had_prior_connection:
+                            print("[Worker] Server became unavailable after prior connection. Exiting.")
+                        else:
+                            print(f"[Worker] Failed to connect after {MAX_CONNECTION_RETRIES} retries. Exiting.")
                         break
-                    print(f"[Worker] Waiting for server at {server_url}... (attempt {connection_retry_count}/{max_connection_retries})")
+                    print(f"[Worker] Waiting for server at {server_url}... (attempt {connection_retry_count}/{max_retries})")
                     time.sleep(2)
                     continue
                 
