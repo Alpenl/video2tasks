@@ -53,9 +53,9 @@ worker:
 
 # Windowing configuration
 windowing:
-  window_sec: 16.0        # Window duration in seconds
-  step_sec: 8.0          # Step size between windows
-  frames_per_window: 16  # Number of frames to sample per window
+  window_sec: 12.0        # Window duration in seconds
+  step_sec: 6.0           # Step size between windows
+  frames_per_window: 24   # Number of frames to sample per window
   target_width: 720      # Target frame width
   target_height: 480     # Target frame height
   png_compression: 0     # PNG compression level (0-9)
