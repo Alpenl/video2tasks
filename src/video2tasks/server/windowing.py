@@ -163,13 +163,15 @@ _FILLER_TOKENS = {"wait", "explain", "describe", "narrate", "instruction", "gest
 _COOKING_CONTAINER_TOKENS = {"bowl", "pot", "pan", "processor", "salad"}
 _PREP_INGREDIENT_ACTION_TOKENS = {
     "chop", "slice", "dice", "mince", "grate", "tear", "peel", "cut",
-    "crush", "smash", "slit", "roll", "flatten",
+    "crush", "smash", "slit", "trim", "roll", "flatten",
 }
 _RECIPE_ACTION_TOKENS = {
     "add", "season", "stir", "mix", "whisk", "pour", "cook", "saute", "grind",
+    "toss", "fry", "boil",
     "fill", "fold", "roll",
 }
-_MIXING_ACTION_TOKENS = {"season", "stir", "mix", "whisk"}
+_MIXING_ACTION_TOKENS = {"season", "stir", "mix", "whisk", "toss"}
+_ACTION_FAMILY_SUPPORT_THRESHOLD = 1.2
 
 
 def _singularize_token(token: str) -> str:
@@ -316,6 +318,10 @@ def _ingredient_tokens(text: str) -> set[str]:
     tokens -= _PREP_INGREDIENT_ACTION_TOKENS
     tokens -= _RECIPE_ACTION_TOKENS
     tokens -= {"ingredient", "mixture", "content", "topping", "top"}
+    if "scallion" in tokens:
+        tokens |= {"green", "onion"}
+    if "green" in tokens and "onion" in tokens:
+        tokens.add("scallion")
     return tokens
 
 
@@ -331,6 +337,23 @@ def _instruction_has_mixing_action(text: str) -> bool:
     return bool(_instruction_action_head_tokens(text) & _MIXING_ACTION_TOKENS)
 
 
+def _instruction_mentions_wrapper(text: str) -> bool:
+    lower = text.lower()
+    if "spring roll" in lower or "egg roll" in lower:
+        return True
+    tokens = set(_instruction_tokens(text.replace("/", " ")))
+    return bool(tokens & {"wrap", "wrapper"})
+
+
+def _is_wrapper_fill_to_roll_pair(left_instruction: str, right_instruction: str) -> bool:
+    return (
+        _instruction_mentions_wrapper(left_instruction)
+        and _instruction_mentions_wrapper(right_instruction)
+        and bool(_instruction_action_head_tokens(left_instruction) & {"place", "fill", "spread"})
+        and bool(_instruction_action_head_tokens(right_instruction) & {"roll", "fold", "tuck"})
+    )
+
+
 def _action_tokens(text: str) -> set[str]:
     tokens = _instruction_action_head_tokens(text)
     return tokens & (
@@ -339,6 +362,22 @@ def _action_tokens(text: str) -> set[str]:
         | _MIXING_ACTION_TOKENS
         | _STRONG_ACTION_TOKENS
     )
+
+
+def _action_families(text: str) -> set[str]:
+    tokens = _action_tokens(text)
+    families = set()
+    if tokens & {"add", "pour", "fill"}:
+        families.add("add")
+    if tokens & {"season", "stir", "mix", "whisk", "toss"}:
+        families.add("mix")
+    if tokens & {"cook", "saute", "fry", "boil"}:
+        families.add("cook")
+    if tokens & _PREP_INGREDIENT_ACTION_TOKENS:
+        families.add("prep")
+    if tokens & {"place", "transfer", "remove", "move"}:
+        families.add("transfer")
+    return families
 
 
 def _segment_duration_sec(segment: dict, fps: float) -> float:
@@ -361,6 +400,9 @@ def _boundary_support_between(left: dict, right: dict) -> Tuple[float, bool]:
 
 
 def _choose_instruction(left: dict, right: dict, fps: float) -> str:
+    if _is_wrapper_fill_to_roll_pair(left["instruction"], right["instruction"]):
+        return right["instruction"]
+
     shared_ingredient_tokens = _ingredient_tokens(left["instruction"]) & _ingredient_tokens(right["instruction"])
     if (
         shared_ingredient_tokens
@@ -395,6 +437,7 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
     right_ingredient_tokens = _ingredient_tokens(right["instruction"])
     shared_ingredient_tokens = left_ingredient_tokens & right_ingredient_tokens
     shared_action_tokens = _action_tokens(left["instruction"]) & _action_tokens(right["instruction"])
+    shared_action_families = _action_families(left["instruction"]) & _action_families(right["instruction"])
     boundary_support, has_boundary_support = _boundary_support_between(left, right)
     strong_boundary = has_boundary_support and boundary_support_threshold > 0.0 and boundary_support >= boundary_support_threshold
 
@@ -435,6 +478,13 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
         and not shared_ingredient_tokens
         and (left_prep_ingredient or right_prep_ingredient)
     )
+    same_container_same_family_recipe_steps = (
+        bool(shared_dest_tokens & _COOKING_CONTAINER_TOKENS)
+        and left_recipe
+        and right_recipe
+        and bool(shared_action_families & {"add", "mix"})
+    )
+    wrapper_fill_to_roll = _is_wrapper_fill_to_roll_pair(left["instruction"], right["instruction"])
 
     if similarity < 0.34:
         # Adjacent cooking sub-steps often swap ingredients while staying in the same bowl/pot.
@@ -451,6 +501,12 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
             or same_ingredient_prep_to_transfer
             or same_ingredient_same_action_prep
             or (distinct_same_ingredient_prep_steps and has_boundary_support and not strong_boundary)
+            or (
+                same_container_same_family_recipe_steps
+                and has_boundary_support
+                and boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD
+            )
+            or wrapper_fill_to_roll
         ):
             return False
 
@@ -474,10 +530,12 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
         return True
     if right_generic and right_duration <= 4.5 and not (right_prep or right_filler):
         return True
+    if wrapper_fill_to_roll:
+        return True
     if shared_dest_tokens & _COOKING_CONTAINER_TOKENS and (left_recipe or right_recipe):
         if shared_ingredient_tokens and min(left_duration, right_duration) <= 8.0:
             return True
-        if shared_action_tokens and min(left_duration, right_duration) <= 8.0:
+        if shared_action_tokens and max(left_duration, right_duration) <= 8.0:
             return True
         if (left_mixing or right_mixing) and shared_ingredient_tokens and max(left_duration, right_duration) <= 20.0:
             return True
@@ -486,6 +544,9 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
             return True
     if same_ingredient_same_action_prep:
         if min(left_duration, right_duration) <= 8.0:
+            return True
+    if same_container_same_family_recipe_steps and has_boundary_support and boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD:
+        if min(left_duration, right_duration) <= 16.0:
             return True
     if similarity >= 0.6 and min(left_duration, right_duration) <= 6.5:
         return True
@@ -722,6 +783,221 @@ def refine_segment_instructions(final_segments: List[dict], source_segments: Lis
     return refined
 
 
+def _dominant_instruction_from_candidates(candidates: List[str]) -> Optional[str]:
+    if not candidates:
+        return None
+
+    counts = Counter(candidates)
+    return max(
+        counts.items(),
+        key=lambda item: (
+            item[1],
+            _instruction_specificity(item[0]),
+            len(_ingredient_tokens(item[0])),
+            len(_action_families(item[0])),
+        ),
+    )[0]
+
+
+def _instruction_phase_signature(text: str) -> tuple:
+    action_families = tuple(sorted(_action_families(text)))
+    if not action_families:
+        action_families = tuple(sorted(_action_tokens(text)))
+
+    dest_tokens = tuple(sorted(_destination_tokens(text) & _COOKING_CONTAINER_TOKENS))
+    focus_tokens = list(sorted(_ingredient_tokens(text)))
+    if not focus_tokens:
+        focus_tokens = list(sorted(_primary_object_tokens(text) - _COOKING_CONTAINER_TOKENS))
+
+    return (
+        action_families,
+        dest_tokens[:1],
+        tuple(focus_tokens[:2]),
+    )
+
+
+def _should_split_on_instruction_drift(left_instruction: str, right_instruction: str) -> bool:
+    left_actions = _action_families(left_instruction)
+    right_actions = _action_families(right_instruction)
+
+    shared_containers = (
+        _destination_tokens(left_instruction)
+        & _destination_tokens(right_instruction)
+        & _COOKING_CONTAINER_TOKENS
+    )
+    if not shared_containers:
+        return False
+
+    if shared_containers & {"bowl", "processor", "salad"}:
+        if left_actions <= {"add", "mix"} and right_actions <= {"add", "mix"}:
+            return False
+
+    if left_actions != right_actions and (left_actions or right_actions):
+        return True
+
+    left_ingredients = _ingredient_tokens(left_instruction)
+    right_ingredients = _ingredient_tokens(right_instruction)
+    if (
+        left_actions == right_actions == {"add"}
+        and left_ingredients
+        and right_ingredients
+        and not (left_ingredients & right_ingredients)
+    ):
+        return True
+
+    return False
+
+
+def _instruction_runs_for_segment(
+    segment: dict,
+    instruction_timeline: List[List[str]],
+    fps: float,
+    bin_sec: float = 2.0,
+) -> List[dict]:
+    bin_frames = max(1, int(round(max(0.5, bin_sec) * max(fps, 1.0))))
+    runs: List[dict] = []
+
+    for start in range(int(segment["start_frame"]), int(segment["end_frame"]), bin_frames):
+        end = min(int(segment["end_frame"]), start + bin_frames)
+        candidates: List[str] = []
+        for fid in range(start, end):
+            if 0 <= fid < len(instruction_timeline):
+                candidates.extend(instruction_timeline[fid])
+
+        instruction = _dominant_instruction_from_candidates(candidates)
+        if not instruction:
+            continue
+
+        signature = _instruction_phase_signature(instruction)
+        if runs and runs[-1]["signature"] == signature:
+            runs[-1]["end_frame"] = end
+            runs[-1]["candidates"].append(instruction)
+            runs[-1]["instruction"] = _dominant_instruction_from_candidates(runs[-1]["candidates"]) or runs[-1]["instruction"]
+            continue
+
+        runs.append({
+            "start_frame": start,
+            "end_frame": end,
+            "instruction": instruction,
+            "signature": signature,
+            "candidates": [instruction],
+        })
+
+    return runs
+
+
+def _split_segment_on_instruction_drift(
+    segment: dict,
+    instruction_timeline: List[List[str]],
+    fps: float,
+    min_segment_frames: int,
+    min_phase_frames: int,
+    depth: int,
+) -> List[dict]:
+    current = dict(segment)
+    if depth <= 0 or (int(current["end_frame"]) - int(current["start_frame"])) < min_segment_frames:
+        return [current]
+
+    runs = _instruction_runs_for_segment(current, instruction_timeline, fps)
+    if len(runs) < 2:
+        return [current]
+
+    candidates = []
+    for idx in range(len(runs) - 1):
+        left_run = runs[idx]
+        right_run = runs[idx + 1]
+        left_duration = int(left_run["end_frame"]) - int(left_run["start_frame"])
+        right_duration = int(right_run["end_frame"]) - int(right_run["start_frame"])
+        if left_duration < min_phase_frames or right_duration < min_phase_frames:
+            continue
+        if not _should_split_on_instruction_drift(left_run["instruction"], right_run["instruction"]):
+            continue
+
+        boundary = int((int(left_run["end_frame"]) + int(right_run["start_frame"])) / 2)
+        if boundary - int(current["start_frame"]) < min_phase_frames:
+            continue
+        if int(current["end_frame"]) - boundary < min_phase_frames:
+            continue
+
+        score = float(min(left_duration, right_duration))
+        if _action_families(left_run["instruction"]) != _action_families(right_run["instruction"]):
+            score += float(min_phase_frames)
+        if _is_specific_instruction(left_run["instruction"]):
+            score += 0.25 * min_phase_frames
+        if _is_specific_instruction(right_run["instruction"]):
+            score += 0.25 * min_phase_frames
+
+        candidates.append((score, boundary, left_run, right_run))
+
+    if not candidates:
+        return [current]
+
+    _, boundary, left_run, right_run = max(candidates, key=lambda item: item[0])
+    left_segment = dict(current)
+    left_segment["end_frame"] = boundary
+    left_segment["instruction"] = left_run["instruction"]
+    left_segment["boundary_support_after"] = 0.0
+
+    right_segment = dict(current)
+    right_segment["start_frame"] = boundary
+    right_segment["instruction"] = right_run["instruction"]
+    right_segment["boundary_support_before"] = 0.0
+
+    return (
+        _split_segment_on_instruction_drift(
+            left_segment,
+            instruction_timeline,
+            fps,
+            min_segment_frames,
+            min_phase_frames,
+            depth - 1,
+        )
+        + _split_segment_on_instruction_drift(
+            right_segment,
+            instruction_timeline,
+            fps,
+            min_segment_frames,
+            min_phase_frames,
+            depth - 1,
+        )
+    )
+
+
+def split_long_raw_segments_on_instruction_drift(
+    raw_segments: List[dict],
+    instruction_timeline: List[List[str]],
+    fps: float,
+    min_segment_sec: float = 30.0,
+    min_phase_sec: float = 5.0,
+) -> List[dict]:
+    if not raw_segments:
+        return []
+
+    if fps < 1e-6:
+        fps = 30.0
+
+    min_segment_frames = max(1, int(round(min_segment_sec * fps)))
+    min_phase_frames = max(1, int(round(min_phase_sec * fps)))
+    split_segments: List[dict] = []
+
+    for segment in raw_segments:
+        split_segments.extend(
+            _split_segment_on_instruction_drift(
+                segment,
+                instruction_timeline,
+                fps,
+                min_segment_frames,
+                min_phase_frames,
+                depth=3,
+            )
+        )
+
+    for idx, segment in enumerate(split_segments):
+        segment["seg_id"] = idx
+
+    return split_segments
+
+
 def build_segments_via_cuts(
     sample_id: str,
     windows: List[Window],
@@ -873,6 +1149,11 @@ def build_segments_via_cuts(
             })
             seg_id += 1
 
+    raw_segments = split_long_raw_segments_on_instruction_drift(
+        raw_segments,
+        instruction_timeline,
+        fps,
+    )
     light_segments = cleanup_auxiliary_segments(raw_segments, fps)
     merged_segments = merge_task_level_segments(
         raw_segments,

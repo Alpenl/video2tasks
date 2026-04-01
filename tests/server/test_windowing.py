@@ -2,6 +2,7 @@ from video2tasks.server.windowing import (
     merge_task_level_segments,
     cleanup_auxiliary_segments,
     refine_segment_instructions,
+    split_long_raw_segments_on_instruction_drift,
     _should_fallback_to_light_cleanup,
 )
 
@@ -489,6 +490,285 @@ def test_merge_task_level_segments_merges_same_ingredient_prep_steps_when_bounda
     assert merged[0]["start_frame"] == 0
     assert merged[0]["end_frame"] == 519
     assert merged[0]["instruction"] == "Grate the peeled ginger"
+
+
+def test_merge_task_level_segments_merges_scallion_and_green_onion_prep_when_boundary_is_weak() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 193,
+            "instruction": "Chop the scallions",
+            "confidence": 1.0,
+            "boundary_support_after": 0.75,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 193,
+            "end_frame": 360,
+            "instruction": "Trim the roots off the green onions",
+            "confidence": 1.0,
+            "boundary_support_before": 0.75,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["start_frame"] == 0
+    assert merged[0]["end_frame"] == 360
+    assert merged[0]["instruction"] == "Trim the roots off the green onions"
+
+
+def test_merge_task_level_segments_merges_same_container_add_steps_when_boundary_is_weak() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 390,
+            "instruction": "Add broccoli slaw to the bowl",
+            "confidence": 1.0,
+            "boundary_support_after": 1.1,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 390,
+            "end_frame": 780,
+            "instruction": "Add chopped garlic to the bowl",
+            "confidence": 1.0,
+            "boundary_support_before": 1.1,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["start_frame"] == 0
+    assert merged[0]["end_frame"] == 780
+    assert merged[0]["instruction"] == "Add chopped garlic to the bowl"
+
+
+def test_merge_task_level_segments_keeps_add_and_stir_separate_even_with_weak_boundary() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 390,
+            "instruction": "Add chopped garlic to the bowl",
+            "confidence": 1.0,
+            "boundary_support_after": 0.4,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 390,
+            "end_frame": 780,
+            "instruction": "Stir the mixture in the bowl",
+            "confidence": 1.0,
+            "boundary_support_before": 0.4,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 2
+    assert merged[0]["instruction"] == "Add chopped garlic to the bowl"
+    assert merged[1]["instruction"] == "Stir the mixture in the bowl"
+
+
+def test_merge_task_level_segments_merges_wrapper_fill_then_roll_into_single_assembly_step() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 575,
+            "instruction": "Place the filling onto the wrapper",
+            "confidence": 1.0,
+            "boundary_support_after": 1.4,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 575,
+            "end_frame": 2037,
+            "instruction": "Roll the spring roll",
+            "confidence": 1.0,
+            "boundary_support_before": 1.4,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["start_frame"] == 0
+    assert merged[0]["end_frame"] == 2037
+    assert merged[0]["instruction"] == "Roll the spring roll"
+
+
+def test_merge_task_level_segments_keeps_wrapper_transfer_and_frying_separate() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 331,
+            "instruction": "Place the spring rolls on a baking sheet",
+            "confidence": 1.0,
+            "boundary_support_after": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 331,
+            "end_frame": 632,
+            "instruction": "Deep fry the spring rolls in the wok",
+            "confidence": 1.0,
+            "boundary_support_before": 1.0,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 2
+    assert merged[0]["instruction"] == "Place the spring rolls on a baking sheet"
+    assert merged[1]["instruction"] == "Deep fry the spring rolls in the wok"
+
+
+def test_merge_task_level_segments_keeps_long_same_action_pot_steps_separate() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 111,
+            "instruction": "Add the sliced ingredients to the pot and stir",
+            "confidence": 1.0,
+            "boundary_support_after": 1.4,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 111,
+            "end_frame": 750,
+            "instruction": "Add spices and seasoning to the pot",
+            "confidence": 1.0,
+            "boundary_support_before": 1.4,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 2
+    assert merged[0]["instruction"] == "Add the sliced ingredients to the pot and stir"
+    assert merged[1]["instruction"] == "Add spices and seasoning to the pot"
+
+
+def test_split_long_raw_segments_on_instruction_drift_splits_long_heated_add_sequence() -> None:
+    raw_segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 900,
+            "instruction": "Add ingredients into the pot",
+            "confidence": 1.0,
+            "boundary_support_before": 0.0,
+            "boundary_support_after": 0.0,
+        }
+    ]
+    instruction_timeline = (
+        [["Add ginger and garlic paste to the pot"] for _ in range(450)]
+        + [["Add chopped tomatoes to the pot"] for _ in range(450)]
+    )
+
+    split_segments = split_long_raw_segments_on_instruction_drift(
+        raw_segments,
+        instruction_timeline,
+        fps=25.0,
+    )
+
+    assert len(split_segments) == 2
+    assert split_segments[0]["start_frame"] == 0
+    assert split_segments[0]["end_frame"] == 450
+    assert split_segments[0]["instruction"] == "Add ginger and garlic paste to the pot"
+    assert split_segments[1]["start_frame"] == 450
+    assert split_segments[1]["end_frame"] == 900
+    assert split_segments[1]["instruction"] == "Add chopped tomatoes to the pot"
+
+
+def test_split_long_raw_segments_on_instruction_drift_keeps_long_bowl_assembly_together() -> None:
+    raw_segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 900,
+            "instruction": "Add ingredients into the bowl",
+            "confidence": 1.0,
+            "boundary_support_before": 0.0,
+            "boundary_support_after": 0.0,
+        }
+    ]
+    instruction_timeline = (
+        [["Add chopped scallions to the bowl"] for _ in range(450)]
+        + [["Add minced garlic to the bowl"] for _ in range(450)]
+    )
+
+    split_segments = split_long_raw_segments_on_instruction_drift(
+        raw_segments,
+        instruction_timeline,
+        fps=25.0,
+    )
+
+    assert len(split_segments) == 1
+    assert split_segments[0]["start_frame"] == 0
+    assert split_segments[0]["end_frame"] == 900
+    assert split_segments[0]["instruction"] == "Add ingredients into the bowl"
+
+
+def test_split_long_raw_segments_on_instruction_drift_keeps_bowl_add_and_mix_assembly_together() -> None:
+    raw_segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 900,
+            "instruction": "Prepare the salad in the bowl",
+            "confidence": 1.0,
+            "boundary_support_before": 0.0,
+            "boundary_support_after": 0.0,
+        }
+    ]
+    instruction_timeline = (
+        [["Add minced garlic to the bowl"] for _ in range(450)]
+        + [["Toss the salad in the bowl"] for _ in range(450)]
+    )
+
+    split_segments = split_long_raw_segments_on_instruction_drift(
+        raw_segments,
+        instruction_timeline,
+        fps=25.0,
+    )
+
+    assert len(split_segments) == 1
+    assert split_segments[0]["start_frame"] == 0
+    assert split_segments[0]["end_frame"] == 900
+    assert split_segments[0]["instruction"] == "Prepare the salad in the bowl"
 
 
 def test_adaptive_merge_fallback_preserves_light_segments() -> None:
