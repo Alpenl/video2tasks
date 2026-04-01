@@ -524,6 +524,38 @@ def test_merge_task_level_segments_merges_scallion_and_green_onion_prep_when_bou
     assert merged[0]["instruction"] == "Trim the roots off the green onions"
 
 
+def test_merge_task_level_segments_merges_roll_out_dough_steps_when_boundary_is_weak() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 180,
+            "instruction": "Flatten and roll out the dough",
+            "confidence": 1.0,
+            "boundary_support_after": 0.75,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 180,
+            "end_frame": 660,
+            "instruction": "Roll out the dough with a rolling pin",
+            "confidence": 1.0,
+            "boundary_support_before": 0.75,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["start_frame"] == 0
+    assert merged[0]["end_frame"] == 660
+    assert merged[0]["instruction"] == "Roll out the dough with a rolling pin"
+
+
 def test_merge_task_level_segments_merges_same_container_add_steps_when_boundary_is_weak() -> None:
     segments = [
         {
@@ -554,6 +586,37 @@ def test_merge_task_level_segments_merges_same_container_add_steps_when_boundary
     assert merged[0]["start_frame"] == 0
     assert merged[0]["end_frame"] == 780
     assert merged[0]["instruction"] == "Add chopped garlic to the bowl"
+
+
+def test_merge_task_level_segments_keeps_distinct_pot_add_sequences_separate_even_with_weak_boundary() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 436,
+            "instruction": "Pour water into the pot with chopped potatoes",
+            "confidence": 1.0,
+            "boundary_support_after": 0.75,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 436,
+            "end_frame": 642,
+            "instruction": "Pour peas into the pot",
+            "confidence": 1.0,
+            "boundary_support_before": 0.75,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 2
+    assert merged[0]["instruction"] == "Pour water into the pot with chopped potatoes"
+    assert merged[1]["instruction"] == "Pour peas into the pot"
 
 
 def test_merge_task_level_segments_keeps_add_and_stir_separate_even_with_weak_boundary() -> None:
@@ -617,6 +680,70 @@ def test_merge_task_level_segments_merges_wrapper_fill_then_roll_into_single_ass
     assert merged[0]["start_frame"] == 0
     assert merged[0]["end_frame"] == 2037
     assert merged[0]["instruction"] == "Roll the spring roll"
+
+
+def test_merge_task_level_segments_merges_wrapper_fill_then_pleat_into_single_assembly_step() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 784,
+            "instruction": "Assemble the dumplings by filling and folding the wrappers",
+            "confidence": 1.0,
+            "boundary_support_after": 1.1,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 784,
+            "end_frame": 1193,
+            "instruction": "Pleat the edges of the dumpling wrapper",
+            "confidence": 1.0,
+            "boundary_support_before": 1.1,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["start_frame"] == 0
+    assert merged[0]["end_frame"] == 1193
+    assert merged[0]["instruction"] == "Pleat the edges of the dumpling wrapper"
+
+
+def test_merge_task_level_segments_merges_dumpling_assembly_then_pleat_into_single_step() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 784,
+            "instruction": "Assemble the dumplings by filling, folding, and plating them",
+            "confidence": 1.0,
+            "boundary_support_after": 0.97,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 784,
+            "end_frame": 1193,
+            "instruction": "Pleat the edges of the dumpling wrapper",
+            "confidence": 1.0,
+            "boundary_support_before": 0.97,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["start_frame"] == 0
+    assert merged[0]["end_frame"] == 1193
+    assert merged[0]["instruction"] == "Pleat the edges of the dumpling wrapper"
 
 
 def test_merge_task_level_segments_keeps_wrapper_transfer_and_frying_separate() -> None:

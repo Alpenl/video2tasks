@@ -346,11 +346,22 @@ def _instruction_mentions_wrapper(text: str) -> bool:
 
 
 def _is_wrapper_fill_to_roll_pair(left_instruction: str, right_instruction: str) -> bool:
-    return (
+    left_tokens = set(_instruction_tokens(left_instruction.replace("/", " ")))
+    right_tokens = set(_instruction_tokens(right_instruction.replace("/", " ")))
+    left_head_tokens = _instruction_action_head_tokens(left_instruction)
+    right_head_tokens = _instruction_action_head_tokens(right_instruction)
+    left_wrapper_or_dumpling_assembly = (
         _instruction_mentions_wrapper(left_instruction)
+        or (
+            bool(left_tokens & {"dumpling", "pierogi", "pierogy"})
+            and bool(left_tokens & {"assemble", "fill", "fold"})
+        )
+    )
+    return (
+        left_wrapper_or_dumpling_assembly
         and _instruction_mentions_wrapper(right_instruction)
-        and bool(_instruction_action_head_tokens(left_instruction) & {"place", "fill", "spread"})
-        and bool(_instruction_action_head_tokens(right_instruction) & {"roll", "fold", "tuck"})
+        and bool((left_head_tokens & {"place", "fill", "spread", "assemble", "fold"}) or (left_tokens & {"assemble"}))
+        and bool((right_head_tokens & {"roll", "fold", "tuck"}) or (right_tokens & {"pleat"}))
     )
 
 
@@ -484,6 +495,13 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
         and right_recipe
         and bool(shared_action_families & {"add", "mix"})
     )
+    heated_distinct_add_sequence = (
+        bool(shared_dest_tokens & {"pot", "pan"})
+        and shared_action_families == {"add"}
+        and bool(left_ingredient_tokens)
+        and bool(right_ingredient_tokens)
+        and not shared_ingredient_tokens
+    )
     wrapper_fill_to_roll = _is_wrapper_fill_to_roll_pair(left["instruction"], right["instruction"])
 
     if similarity < 0.34:
@@ -503,6 +521,7 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
             or (distinct_same_ingredient_prep_steps and has_boundary_support and not strong_boundary)
             or (
                 same_container_same_family_recipe_steps
+                and not heated_distinct_add_sequence
                 and has_boundary_support
                 and boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD
             )
@@ -545,7 +564,12 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
     if same_ingredient_same_action_prep:
         if min(left_duration, right_duration) <= 8.0:
             return True
-    if same_container_same_family_recipe_steps and has_boundary_support and boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD:
+    if (
+        same_container_same_family_recipe_steps
+        and not heated_distinct_add_sequence
+        and has_boundary_support
+        and boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD
+    ):
         if min(left_duration, right_duration) <= 16.0:
             return True
     if similarity >= 0.6 and min(left_duration, right_duration) <= 6.5:
