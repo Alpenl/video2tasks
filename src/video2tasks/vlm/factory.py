@@ -2,12 +2,14 @@ from typing import Any, Dict, Type
 
 from .base import VLMBackend
 from .dummy import DummyBackend
+from .gemini_api import GeminiBackend
 from .openai_api import OpenAIBackend
 from .remote_api import RemoteAPIBackend
 
 
 BACKENDS: Dict[str, Type[VLMBackend]] = {
     "dummy": DummyBackend,
+    "gemini": GeminiBackend,
     "openai": OpenAIBackend,
     "remote_api": RemoteAPIBackend,
 }

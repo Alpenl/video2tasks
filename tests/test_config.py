@@ -12,6 +12,15 @@ def test_config_accepts_openai_backend() -> None:
     assert cfg.worker.openai.base_url == "https://api.openai.com/v1"
 
 
+def test_config_accepts_gemini_backend() -> None:
+    cfg = Config(worker={"backend": "gemini"})
+
+    assert cfg.worker.backend == "gemini"
+    assert cfg.worker.gemini.api_mode == "native"
+    assert cfg.worker.gemini.model == "gemini-3-flash-preview"
+    assert cfg.worker.gemini.base_url == "https://generativelanguage.googleapis.com/v1beta"
+
+
 def test_config_reads_openai_values_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("BACKEND", "openai")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
@@ -26,6 +35,24 @@ def test_config_reads_openai_values_from_environment(monkeypatch) -> None:
     assert cfg.worker.openai.model == "gpt-5.2"
     assert cfg.worker.openai.base_url == "https://example.test/v1"
     assert cfg.worker.openai.timeout_sec == 42.0
+
+
+def test_config_reads_gemini_values_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("BACKEND", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-test")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    monkeypatch.setenv("GEMINI_BASE_URL", "https://example.test/gemini")
+    monkeypatch.setenv("GEMINI_API_MODE", "openai_compatible")
+    monkeypatch.setenv("GEMINI_TIMEOUT", "18")
+
+    cfg = Config.from_env()
+
+    assert cfg.worker.backend == "gemini"
+    assert cfg.worker.gemini.api_key == "gem-test"
+    assert cfg.worker.gemini.model == "gemini-2.5-flash"
+    assert cfg.worker.gemini.base_url == "https://example.test/gemini"
+    assert cfg.worker.gemini.api_mode == "openai_compatible"
+    assert cfg.worker.gemini.timeout_sec == 18.0
 
 
 def test_validate_config_cli_module_is_importable() -> None:

@@ -72,6 +72,28 @@ class OpenAIConfig(BaseModel):
         return v
 
 
+class GeminiConfig(BaseModel):
+    """Gemini API backend configuration."""
+    api_key: str = Field(default="", description="Gemini API key")
+    model: str = Field(default="gemini-3-flash-preview", description="Gemini model name")
+    api_mode: str = Field(default="native", description="Gemini API mode")
+    base_url: str = Field(
+        default="https://generativelanguage.googleapis.com/v1beta",
+        description="Gemini API base URL"
+    )
+    timeout_sec: float = Field(default=60.0, description="Request timeout in seconds")
+    max_output_tokens: int = Field(default=512, description="Maximum output tokens")
+    jpeg_quality: int = Field(default=85, description="JPEG quality for uploaded images")
+
+    @field_validator("api_mode")
+    @classmethod
+    def validate_api_mode(cls, v: str) -> str:
+        allowed = ["native", "openai_compatible"]
+        if v not in allowed:
+            raise ValueError(f"api_mode must be one of {allowed}, got {v}")
+        return v
+
+
 class WorkerConfig(BaseModel):
     """Worker configuration."""
     server_url: str = Field(default="http://127.0.0.1:8099", description="Server URL")
@@ -79,11 +101,12 @@ class WorkerConfig(BaseModel):
     qwen3vl: Qwen3VLConfig = Field(default_factory=Qwen3VLConfig)
     remote_api: RemoteAPIConfig = Field(default_factory=RemoteAPIConfig)
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
+    gemini: GeminiConfig = Field(default_factory=GeminiConfig)
 
     @field_validator("backend")
     @classmethod
     def validate_backend(cls, v: str) -> str:
-        allowed = ["dummy", "qwen3vl", "remote_api", "openai"]
+        allowed = ["dummy", "qwen3vl", "remote_api", "openai", "gemini"]
         if v not in allowed:
             raise ValueError(f"backend must be one of {allowed}, got {v}")
         return v
@@ -190,6 +213,20 @@ class Config(BaseModel):
             config.worker.openai.max_output_tokens = int(os.environ["OPENAI_MAX_OUTPUT_TOKENS"])
         if "OPENAI_JPEG_QUALITY" in os.environ:
             config.worker.openai.jpeg_quality = int(os.environ["OPENAI_JPEG_QUALITY"])
+        if "GEMINI_API_KEY" in os.environ:
+            config.worker.gemini.api_key = os.environ["GEMINI_API_KEY"]
+        if "GEMINI_MODEL" in os.environ:
+            config.worker.gemini.model = os.environ["GEMINI_MODEL"]
+        if "GEMINI_API_MODE" in os.environ:
+            config.worker.gemini.api_mode = os.environ["GEMINI_API_MODE"]
+        if "GEMINI_BASE_URL" in os.environ:
+            config.worker.gemini.base_url = os.environ["GEMINI_BASE_URL"]
+        if "GEMINI_TIMEOUT" in os.environ:
+            config.worker.gemini.timeout_sec = float(os.environ["GEMINI_TIMEOUT"])
+        if "GEMINI_MAX_OUTPUT_TOKENS" in os.environ:
+            config.worker.gemini.max_output_tokens = int(os.environ["GEMINI_MAX_OUTPUT_TOKENS"])
+        if "GEMINI_JPEG_QUALITY" in os.environ:
+            config.worker.gemini.jpeg_quality = int(os.environ["GEMINI_JPEG_QUALITY"])
         
         return config
     

@@ -134,7 +134,7 @@ class FrameExtractor:
 
 
 _DESTINATION_SPLIT_RE = re.compile(
-    r"\b(?:onto|into|over|inside|within|toward|towards|from|in|on)\b"
+    r"\b(?:to|onto|into|over|inside|within|toward|towards|from|in|on)\b"
 )
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STOPWORDS = {
@@ -158,6 +158,14 @@ _ACTION_FILLERS = {
     "placing", "picking", "lifting", "holding",
 }
 _ROBOT_MOTION_TOKENS = {"gripper", "robot", "arm", "workspace", "area", "work"}
+_FILLER_TOKENS = {"wait", "explain", "describe", "narrate", "instruction", "gesture", "gesturing"}
+_COOKING_CONTAINER_TOKENS = {"bowl", "pot", "pan", "processor", "salad"}
+_PREP_INGREDIENT_ACTION_TOKENS = {"chop", "slice", "dice", "mince", "grate", "tear", "peel", "cut", "crush", "smash", "slit"}
+_RECIPE_ACTION_TOKENS = {
+    "add", "season", "stir", "mix", "whisk", "pour", "cook", "saute", "grind",
+    "fill", "fold", "roll",
+}
+_MIXING_ACTION_TOKENS = {"season", "stir", "mix", "whisk"}
 
 
 def _singularize_token(token: str) -> str:
@@ -194,16 +202,22 @@ def _primary_object_tokens(text: str) -> set[str]:
 
 def _instruction_specificity(text: str) -> int:
     tokens = set(_instruction_tokens(text.replace("/", " ")))
+    if tokens & _FILLER_TOKENS:
+        return -3
     strong = len(tokens & _STRONG_ACTION_TOKENS)
+    mixing = len(tokens & _MIXING_ACTION_TOKENS)
     generic = len(tokens & _GENERIC_ACTION_TOKENS)
+    prep_ingredient = len(tokens & _PREP_INGREDIENT_ACTION_TOKENS)
     prep = len(tokens & _PREP_ACTION_TOKENS)
     if prep:
         return -2
-    return strong * 2 - generic
+    return strong * 2 + mixing * 2 - generic - prep_ingredient
 
 
 def _instruction_is_generic(text: str) -> bool:
     tokens = set(_instruction_tokens(text.replace("/", " ")))
+    if tokens & _FILLER_TOKENS:
+        return True
     if tokens & _PREP_ACTION_TOKENS:
         return True
     strong = len(tokens & _STRONG_ACTION_TOKENS)
@@ -226,6 +240,14 @@ def _instruction_is_bridge_motion(text: str) -> bool:
     return ("reposition" in tokens or "move" in tokens) and "gripper" in tokens
 
 
+def _instruction_is_filler_segment(text: str) -> bool:
+    lower = text.lower().strip()
+    if any(lower.startswith(prefix) for prefix in ("wait", "explain", "describe", "narrate")):
+        return True
+    tokens = set(_instruction_tokens(text.replace("/", " ")))
+    return bool(tokens & _FILLER_TOKENS)
+
+
 def _instruction_is_preparatory_segment(text: str) -> bool:
     lower = text.lower().strip()
     tokens = set(_instruction_tokens(text.replace("/", " ")))
@@ -241,6 +263,8 @@ def _instruction_is_preparatory_segment(text: str) -> bool:
         return True
     if "reposition the gripper" in lower:
         return True
+    if "prepare" in tokens and not (tokens & completion_tokens):
+        return True
     if (tokens & {"align", "hover", "reach", "approach"}) and not (tokens & completion_tokens):
         return True
     return False
@@ -252,6 +276,51 @@ def _token_similarity(left: set[str], right: set[str]) -> float:
     return len(left & right) / float(len(left | right))
 
 
+def _destination_tokens(text: str) -> set[str]:
+    parts = _DESTINATION_SPLIT_RE.split(text.lower(), maxsplit=1)
+    if len(parts) < 2:
+        return set()
+
+    tokens = []
+    for token in _instruction_tokens(parts[1].replace("/", " ")):
+        if (
+            token in _STOPWORDS
+            or token in _STRONG_ACTION_TOKENS
+            or token in _GENERIC_ACTION_TOKENS
+            or token in _PREP_ACTION_TOKENS
+            or token in _ACTION_FILLERS
+            or token in _ROBOT_MOTION_TOKENS
+            or token in _FILLER_TOKENS
+            or token == "new"
+        ):
+            continue
+        tokens.append(token)
+    return set(tokens)
+
+
+def _ingredient_tokens(text: str) -> set[str]:
+    tokens = _primary_object_tokens(text) - _COOKING_CONTAINER_TOKENS
+    tokens -= _PREP_INGREDIENT_ACTION_TOKENS
+    tokens -= _RECIPE_ACTION_TOKENS
+    tokens -= {"ingredient", "mixture", "content", "topping", "top"}
+    return tokens
+
+
+def _instruction_has_recipe_action(text: str) -> bool:
+    tokens = set(_instruction_tokens(text.replace("/", " ")))
+    return bool(tokens & _RECIPE_ACTION_TOKENS)
+
+
+def _instruction_has_prep_ingredient_action(text: str) -> bool:
+    tokens = set(_instruction_tokens(text.replace("/", " ")))
+    return bool(tokens & _PREP_INGREDIENT_ACTION_TOKENS)
+
+
+def _instruction_has_mixing_action(text: str) -> bool:
+    tokens = set(_instruction_tokens(text.replace("/", " ")))
+    return bool(tokens & _MIXING_ACTION_TOKENS)
+
+
 def _segment_duration_sec(segment: dict, fps: float) -> float:
     if fps < 1e-6:
         fps = 30.0
@@ -259,38 +328,87 @@ def _segment_duration_sec(segment: dict, fps: float) -> float:
 
 
 def _choose_instruction(left: dict, right: dict, fps: float) -> str:
-    candidates = [left, right]
-    candidates.sort(
-        key=lambda seg: (
-            _instruction_specificity(seg["instruction"]),
-            _segment_duration_sec(seg, fps),
-        )
-    )
-    return candidates[-1]["instruction"]
+    left_specificity = _instruction_specificity(left["instruction"])
+    right_specificity = _instruction_specificity(right["instruction"])
+    if right_specificity > left_specificity:
+        return right["instruction"]
+    if left_specificity > right_specificity:
+        return left["instruction"]
+
+    left_duration = _segment_duration_sec(left, fps)
+    right_duration = _segment_duration_sec(right, fps)
+    if right_duration >= left_duration * 0.75:
+        return right["instruction"]
+    return left["instruction"]
 
 
 def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
     left_tokens = _primary_object_tokens(left["instruction"])
     right_tokens = _primary_object_tokens(right["instruction"])
     similarity = _token_similarity(left_tokens, right_tokens)
-    if similarity < 0.34:
-        return False
+    left_dest_tokens = _destination_tokens(left["instruction"])
+    right_dest_tokens = _destination_tokens(right["instruction"])
+    shared_dest_tokens = left_dest_tokens & right_dest_tokens
+    left_ingredient_tokens = _ingredient_tokens(left["instruction"])
+    right_ingredient_tokens = _ingredient_tokens(right["instruction"])
+    shared_ingredient_tokens = left_ingredient_tokens & right_ingredient_tokens
 
-    left_duration = _segment_duration_sec(left, fps)
-    right_duration = _segment_duration_sec(right, fps)
+    left_recipe = _instruction_has_recipe_action(left["instruction"])
+    right_recipe = _instruction_has_recipe_action(right["instruction"])
+    left_prep_ingredient = _instruction_has_prep_ingredient_action(left["instruction"])
+    right_prep_ingredient = _instruction_has_prep_ingredient_action(right["instruction"])
+    left_mixing = _instruction_has_mixing_action(left["instruction"])
+    right_mixing = _instruction_has_mixing_action(right["instruction"])
     left_generic = _instruction_is_generic(left["instruction"])
     right_generic = _instruction_is_generic(right["instruction"])
     left_prep = _instruction_is_prep_like(left["instruction"])
     right_prep = _instruction_is_prep_like(right["instruction"])
+    left_filler = _instruction_is_filler_segment(left["instruction"])
+    right_filler = _instruction_is_filler_segment(right["instruction"])
+    distinct_prepped_ingredient_steps = (
+        bool(shared_dest_tokens & _COOKING_CONTAINER_TOKENS)
+        and left_recipe
+        and right_recipe
+        and not (left_mixing or right_mixing)
+        and bool(left_ingredient_tokens)
+        and bool(right_ingredient_tokens)
+        and not shared_ingredient_tokens
+        and (left_prep_ingredient or right_prep_ingredient)
+    )
 
-    if left_prep or right_prep:
+    if similarity < 0.34:
+        # Adjacent cooking sub-steps often swap ingredients while staying in the same bowl/pot.
+        if not (
+            left_prep
+            or right_prep
+            or left_filler
+            or right_filler
+            or
+            (shared_dest_tokens & _COOKING_CONTAINER_TOKENS and (left_recipe or right_recipe))
+            or (shared_ingredient_tokens and (left_prep_ingredient or right_prep_ingredient))
+        ):
+            return False
+
+    left_duration = _segment_duration_sec(left, fps)
+    right_duration = _segment_duration_sec(right, fps)
+
+    if distinct_prepped_ingredient_steps:
+        return False
+
+    if left_generic and right_generic and not (left_prep or right_prep or left_filler or right_filler):
         return True
-    if left_generic and right_generic:
+    if left_generic and left_duration <= 4.5 and not (left_prep or left_filler):
         return True
-    if left_generic and left_duration <= 4.5:
+    if right_generic and right_duration <= 4.5 and not (right_prep or right_filler):
         return True
-    if right_generic and right_duration <= 4.5:
-        return True
+    if shared_dest_tokens & _COOKING_CONTAINER_TOKENS and (left_recipe or right_recipe):
+        if min(left_duration, right_duration) <= 8.0:
+            return True
+        if (left_mixing or right_mixing) and max(left_duration, right_duration) <= 20.0:
+            return True
+    if shared_ingredient_tokens and (left_prep_ingredient or right_prep_ingredient):
+        if min(left_duration, right_duration) <= 8.0:
+            return True
     if similarity >= 0.6 and min(left_duration, right_duration) <= 6.5:
         return True
     return False
@@ -311,8 +429,9 @@ def merge_task_level_segments(segments: List[dict], fps: float) -> List[dict]:
 
         previous = merged[-1]
         if _should_merge_segments(previous, current, fps):
+            chosen_instruction = _choose_instruction(previous, current, fps)
             previous["end_frame"] = current["end_frame"]
-            previous["instruction"] = _choose_instruction(previous, current, fps)
+            previous["instruction"] = chosen_instruction
             previous["confidence"] = max(
                 float(previous.get("confidence", 0.0)),
                 float(current.get("confidence", 0.0)),
@@ -324,7 +443,7 @@ def merge_task_level_segments(segments: List[dict], fps: float) -> List[dict]:
     pending_bridge: Optional[dict] = None
     for segment in merged:
         current = dict(segment)
-        if _instruction_is_bridge_motion(current["instruction"]):
+        if _instruction_is_bridge_motion(current["instruction"]) or _instruction_is_filler_segment(current["instruction"]):
             if pending_bridge is None:
                 pending_bridge = current
             else:

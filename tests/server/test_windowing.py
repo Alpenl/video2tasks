@@ -247,3 +247,127 @@ def test_merge_task_level_segments_drops_tiny_trailing_prep_segment() -> None:
     assert merged[0]["start_frame"] == 0
     assert merged[0]["end_frame"] == 1525
     assert merged[0]["instruction"] == "Place the blue bowl onto the stack of bowls"
+
+
+def test_merge_task_level_segments_merges_same_bowl_recipe_assembly_steps() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 150,
+            "instruction": "Add mayonnaise to the red bowl",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 150,
+            "end_frame": 330,
+            "instruction": "Add chopped garlic to the bowl",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 2,
+            "start_frame": 330,
+            "end_frame": 520,
+            "instruction": "Season the mixture in the bowl",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 3,
+            "start_frame": 520,
+            "end_frame": 940,
+            "instruction": "Whisk the ingredients in the red bowl",
+            "confidence": 1.0,
+        },
+    ]
+
+    merged = merge_task_level_segments(segments, fps=30.0)
+
+    assert len(merged) == 1
+    assert merged[0]["start_frame"] == 0
+    assert merged[0]["end_frame"] == 940
+    assert merged[0]["instruction"] == "Whisk the ingredients in the red bowl"
+
+
+def test_merge_task_level_segments_merges_prepared_ingredient_into_following_transfer() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 180,
+            "instruction": "Grate cheese onto the cutting board",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 180,
+            "end_frame": 460,
+            "instruction": "Add shredded cheese to the bowl",
+            "confidence": 1.0,
+        },
+    ]
+
+    merged = merge_task_level_segments(segments, fps=30.0)
+
+    assert len(merged) == 1
+    assert merged[0]["start_frame"] == 0
+    assert merged[0]["end_frame"] == 460
+    assert merged[0]["instruction"] == "Add shredded cheese to the bowl"
+
+
+def test_merge_task_level_segments_absorbs_explanatory_filler_into_following_task() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 420,
+            "instruction": "Saute the onions in the pot",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 420,
+            "end_frame": 560,
+            "instruction": "Explain the cooking instructions",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 2,
+            "start_frame": 560,
+            "end_frame": 980,
+            "instruction": "Add chopped tomatoes to the pot and stir",
+            "confidence": 1.0,
+        },
+    ]
+
+    merged = merge_task_level_segments(segments, fps=30.0)
+
+    assert len(merged) == 2
+    assert merged[1]["start_frame"] == 420
+    assert merged[1]["end_frame"] == 980
+    assert merged[1]["instruction"] == "Add chopped tomatoes to the pot and stir"
+
+
+def test_merge_task_level_segments_keeps_distinct_salad_ingredient_tasks_separate() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 326,
+            "instruction": "Slice cherry tomatoes and add them to the salad bowl",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 326,
+            "end_frame": 502,
+            "instruction": "Chop basil and add it to the salad bowl",
+            "confidence": 1.0,
+        },
+    ]
+
+    merged = merge_task_level_segments(segments, fps=25.0)
+
+    assert len(merged) == 2
+    assert merged[0]["instruction"] == "Slice cherry tomatoes and add them to the salad bowl"
+    assert merged[1]["instruction"] == "Chop basil and add it to the salad bowl"

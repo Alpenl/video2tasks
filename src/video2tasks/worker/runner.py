@@ -69,6 +69,17 @@ def build_backend_kwargs(config: Config) -> Dict[str, Any]:
             "jpeg_quality": config.worker.openai.jpeg_quality,
         }
 
+    if config.worker.backend == "gemini":
+        return {
+            "api_key": config.worker.gemini.api_key or os.getenv("GEMINI_API_KEY", ""),
+            "model": config.worker.gemini.model,
+            "api_mode": config.worker.gemini.api_mode,
+            "base_url": config.worker.gemini.base_url,
+            "timeout_sec": config.worker.gemini.timeout_sec,
+            "max_output_tokens": config.worker.gemini.max_output_tokens,
+            "jpeg_quality": config.worker.gemini.jpeg_quality,
+        }
+
     return {}
 
 
