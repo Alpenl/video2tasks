@@ -19,6 +19,10 @@ def test_config_accepts_gemini_backend() -> None:
     assert cfg.worker.gemini.api_mode == "native"
     assert cfg.worker.gemini.model == "gemini-3-flash-preview"
     assert cfg.worker.gemini.base_url == "https://generativelanguage.googleapis.com/v1beta"
+    assert cfg.windowing.adaptive_merge_guard is True
+    assert cfg.windowing.adaptive_merge_min_segments == 8
+    assert cfg.windowing.adaptive_merge_collapse_ratio == 0.6
+    assert cfg.windowing.refine_final_instructions is True
 
 
 def test_config_reads_openai_values_from_environment(monkeypatch) -> None:

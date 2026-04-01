@@ -1,4 +1,9 @@
-from video2tasks.server.windowing import merge_task_level_segments
+from video2tasks.server.windowing import (
+    merge_task_level_segments,
+    cleanup_auxiliary_segments,
+    refine_segment_instructions,
+    _should_fallback_to_light_cleanup,
+)
 
 
 def test_merge_task_level_segments_merges_short_adjustments_around_same_bowl_task() -> None:
@@ -249,7 +254,7 @@ def test_merge_task_level_segments_drops_tiny_trailing_prep_segment() -> None:
     assert merged[0]["instruction"] == "Place the blue bowl onto the stack of bowls"
 
 
-def test_merge_task_level_segments_merges_same_bowl_recipe_assembly_steps() -> None:
+def test_merge_task_level_segments_keeps_distinct_bowl_recipe_actions_separate() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -283,10 +288,16 @@ def test_merge_task_level_segments_merges_same_bowl_recipe_assembly_steps() -> N
 
     merged = merge_task_level_segments(segments, fps=30.0)
 
-    assert len(merged) == 1
+    assert len(merged) == 3
     assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 940
-    assert merged[0]["instruction"] == "Whisk the ingredients in the red bowl"
+    assert merged[0]["end_frame"] == 330
+    assert merged[0]["instruction"] == "Add chopped garlic to the bowl"
+    assert merged[1]["start_frame"] == 330
+    assert merged[1]["end_frame"] == 520
+    assert merged[1]["instruction"] == "Season the mixture in the bowl"
+    assert merged[2]["start_frame"] == 520
+    assert merged[2]["end_frame"] == 940
+    assert merged[2]["instruction"] == "Whisk the ingredients in the red bowl"
 
 
 def test_merge_task_level_segments_merges_prepared_ingredient_into_following_transfer() -> None:
@@ -371,3 +382,166 @@ def test_merge_task_level_segments_keeps_distinct_salad_ingredient_tasks_separat
     assert len(merged) == 2
     assert merged[0]["instruction"] == "Slice cherry tomatoes and add them to the salad bowl"
     assert merged[1]["instruction"] == "Chop basil and add it to the salad bowl"
+
+
+def test_merge_task_level_segments_keeps_distinct_pot_recipe_actions_separate() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 210,
+            "instruction": "Add whole spices to the pot",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 210,
+            "end_frame": 510,
+            "instruction": "Stir the onions in the pot",
+            "confidence": 1.0,
+        },
+    ]
+
+    merged = merge_task_level_segments(segments, fps=30.0)
+
+    assert len(merged) == 2
+    assert merged[0]["instruction"] == "Add whole spices to the pot"
+    assert merged[1]["instruction"] == "Stir the onions in the pot"
+
+
+def test_merge_task_level_segments_keeps_distinct_prep_actions_on_same_ingredient_separate() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 180,
+            "instruction": "Cut the dough ball in half",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 180,
+            "end_frame": 480,
+            "instruction": "Roll out the dough with a rolling pin",
+            "confidence": 1.0,
+        },
+    ]
+
+    merged = merge_task_level_segments(segments, fps=30.0)
+
+    assert len(merged) == 2
+    assert merged[0]["instruction"] == "Cut the dough ball in half"
+    assert merged[1]["instruction"] == "Roll out the dough with a rolling pin"
+
+
+def test_merge_task_level_segments_does_not_treat_object_name_as_action_token() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 240,
+            "instruction": "Roll the spring roll",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 240,
+            "end_frame": 480,
+            "instruction": "Place the spring rolls on a baking sheet",
+            "confidence": 1.0,
+        },
+    ]
+
+    merged = merge_task_level_segments(segments, fps=30.0)
+
+    assert len(merged) == 2
+    assert merged[0]["instruction"] == "Roll the spring roll"
+    assert merged[1]["instruction"] == "Place the spring rolls on a baking sheet"
+
+
+def test_adaptive_merge_fallback_preserves_light_segments() -> None:
+    fps = 30.0
+    raw_segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 120,
+            "instruction": "Pick up the red bowl from the counter",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 120,
+            "end_frame": 240,
+            "instruction": "Place the red bowl onto the blue plate",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 2,
+            "start_frame": 240,
+            "end_frame": 360,
+            "instruction": "Stack the red bowl with the green bowl",
+            "confidence": 1.0,
+        },
+    ]
+
+    light_segments = cleanup_auxiliary_segments(raw_segments, fps)
+    merged_segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 360,
+            "instruction": "Move the red bowl through the workspace",
+            "confidence": 1.0,
+        }
+    ]
+
+    fallback = _should_fallback_to_light_cleanup(
+        light_segments,
+        merged_segments,
+        fps,
+        min_segments=3,
+        collapse_ratio=0.6,
+    )
+
+    assert fallback
+    final_segments = light_segments if fallback else merged_segments
+    assert final_segments == light_segments
+
+
+def test_refine_segment_instructions_prefers_specific_contributors() -> None:
+    final_segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 240,
+            "instruction": "Adjust the red bowl",
+            "confidence": 1.0,
+        }
+    ]
+    source_segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 150,
+            "instruction": "Pick up the red bowl from the counter",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 150,
+            "end_frame": 210,
+            "instruction": "Place the red bowl onto the blue plate",
+            "confidence": 1.0,
+        },
+        {
+            "seg_id": 2,
+            "start_frame": 210,
+            "end_frame": 240,
+            "instruction": "Adjust the red bowl slightly",
+            "confidence": 1.0,
+        },
+    ]
+
+    refined = refine_segment_instructions(final_segments, source_segments)
+    assert refined[0]["instruction"] == "Pick up the red bowl from the counter"

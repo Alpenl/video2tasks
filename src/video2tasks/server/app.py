@@ -347,7 +347,11 @@ def create_app(config: Config) -> FastAPI:
                             
                             final_res = build_segments_via_cuts(
                                 sid, windows, by_wid, fps, nframes,
-                                config.windowing.frames_per_window
+                                config.windowing.frames_per_window,
+                                adaptive_merge_guard=config.windowing.adaptive_merge_guard,
+                                adaptive_merge_min_segments=config.windowing.adaptive_merge_min_segments,
+                                adaptive_merge_collapse_ratio=config.windowing.adaptive_merge_collapse_ratio,
+                                refine_final_instructions=config.windowing.refine_final_instructions,
                             )
                             
                             with open(segments_path(ctx.samples_dir, sid), "w", encoding="utf-8") as f:

@@ -4,6 +4,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
+from collections import Counter
 import numpy as np
 import cv2
 import base64
@@ -160,7 +161,10 @@ _ACTION_FILLERS = {
 _ROBOT_MOTION_TOKENS = {"gripper", "robot", "arm", "workspace", "area", "work"}
 _FILLER_TOKENS = {"wait", "explain", "describe", "narrate", "instruction", "gesture", "gesturing"}
 _COOKING_CONTAINER_TOKENS = {"bowl", "pot", "pan", "processor", "salad"}
-_PREP_INGREDIENT_ACTION_TOKENS = {"chop", "slice", "dice", "mince", "grate", "tear", "peel", "cut", "crush", "smash", "slit"}
+_PREP_INGREDIENT_ACTION_TOKENS = {
+    "chop", "slice", "dice", "mince", "grate", "tear", "peel", "cut",
+    "crush", "smash", "slit", "roll", "flatten",
+}
 _RECIPE_ACTION_TOKENS = {
     "add", "season", "stir", "mix", "whisk", "pour", "cook", "saute", "grind",
     "fill", "fold", "roll",
@@ -180,6 +184,14 @@ def _singularize_token(token: str) -> str:
 
 def _instruction_tokens(text: str) -> List[str]:
     return [_singularize_token(tok) for tok in _TOKEN_RE.findall(text.lower())]
+
+
+def _instruction_action_head_tokens(text: str, limit: int = 2) -> set[str]:
+    tokens = [
+        tok for tok in _instruction_tokens(text.replace("/", " "))
+        if tok not in {"a", "an", "the"}
+    ]
+    return set(tokens[:limit])
 
 
 def _primary_object_tokens(text: str) -> set[str]:
@@ -202,13 +214,14 @@ def _primary_object_tokens(text: str) -> set[str]:
 
 def _instruction_specificity(text: str) -> int:
     tokens = set(_instruction_tokens(text.replace("/", " ")))
+    action_tokens = _instruction_action_head_tokens(text)
     if tokens & _FILLER_TOKENS:
         return -3
-    strong = len(tokens & _STRONG_ACTION_TOKENS)
-    mixing = len(tokens & _MIXING_ACTION_TOKENS)
-    generic = len(tokens & _GENERIC_ACTION_TOKENS)
-    prep_ingredient = len(tokens & _PREP_INGREDIENT_ACTION_TOKENS)
-    prep = len(tokens & _PREP_ACTION_TOKENS)
+    strong = len(action_tokens & _STRONG_ACTION_TOKENS)
+    mixing = len(action_tokens & _MIXING_ACTION_TOKENS)
+    generic = len(action_tokens & _GENERIC_ACTION_TOKENS)
+    prep_ingredient = len(action_tokens & _PREP_INGREDIENT_ACTION_TOKENS)
+    prep = len(action_tokens & _PREP_ACTION_TOKENS)
     if prep:
         return -2
     return strong * 2 + mixing * 2 - generic - prep_ingredient
@@ -216,18 +229,18 @@ def _instruction_specificity(text: str) -> int:
 
 def _instruction_is_generic(text: str) -> bool:
     tokens = set(_instruction_tokens(text.replace("/", " ")))
+    action_tokens = _instruction_action_head_tokens(text)
     if tokens & _FILLER_TOKENS:
         return True
-    if tokens & _PREP_ACTION_TOKENS:
+    if action_tokens & _PREP_ACTION_TOKENS:
         return True
-    strong = len(tokens & _STRONG_ACTION_TOKENS)
-    generic = len(tokens & _GENERIC_ACTION_TOKENS)
+    strong = len(action_tokens & _STRONG_ACTION_TOKENS)
+    generic = len(action_tokens & _GENERIC_ACTION_TOKENS)
     return generic >= max(1, strong)
 
 
 def _instruction_is_prep_like(text: str) -> bool:
-    tokens = set(_instruction_tokens(text.replace("/", " ")))
-    return bool(tokens & _PREP_ACTION_TOKENS)
+    return bool(_instruction_action_head_tokens(text) & _PREP_ACTION_TOKENS)
 
 
 def _instruction_is_bridge_motion(text: str) -> bool:
@@ -307,18 +320,25 @@ def _ingredient_tokens(text: str) -> set[str]:
 
 
 def _instruction_has_recipe_action(text: str) -> bool:
-    tokens = set(_instruction_tokens(text.replace("/", " ")))
-    return bool(tokens & _RECIPE_ACTION_TOKENS)
+    return bool(_instruction_action_head_tokens(text) & _RECIPE_ACTION_TOKENS)
 
 
 def _instruction_has_prep_ingredient_action(text: str) -> bool:
-    tokens = set(_instruction_tokens(text.replace("/", " ")))
-    return bool(tokens & _PREP_INGREDIENT_ACTION_TOKENS)
+    return bool(_instruction_action_head_tokens(text) & _PREP_INGREDIENT_ACTION_TOKENS)
 
 
 def _instruction_has_mixing_action(text: str) -> bool:
-    tokens = set(_instruction_tokens(text.replace("/", " ")))
-    return bool(tokens & _MIXING_ACTION_TOKENS)
+    return bool(_instruction_action_head_tokens(text) & _MIXING_ACTION_TOKENS)
+
+
+def _action_tokens(text: str) -> set[str]:
+    tokens = _instruction_action_head_tokens(text)
+    return tokens & (
+        _RECIPE_ACTION_TOKENS
+        | _PREP_INGREDIENT_ACTION_TOKENS
+        | _MIXING_ACTION_TOKENS
+        | _STRONG_ACTION_TOKENS
+    )
 
 
 def _segment_duration_sec(segment: dict, fps: float) -> float:
@@ -352,6 +372,7 @@ def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
     left_ingredient_tokens = _ingredient_tokens(left["instruction"])
     right_ingredient_tokens = _ingredient_tokens(right["instruction"])
     shared_ingredient_tokens = left_ingredient_tokens & right_ingredient_tokens
+    shared_action_tokens = _action_tokens(left["instruction"]) & _action_tokens(right["instruction"])
 
     left_recipe = _instruction_has_recipe_action(left["instruction"])
     right_recipe = _instruction_has_recipe_action(right["instruction"])
@@ -365,6 +386,21 @@ def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
     right_prep = _instruction_is_prep_like(right["instruction"])
     left_filler = _instruction_is_filler_segment(left["instruction"])
     right_filler = _instruction_is_filler_segment(right["instruction"])
+    same_ingredient_prep_to_transfer = bool(shared_ingredient_tokens) and (
+        (left_prep_ingredient and right_recipe) or (right_prep_ingredient and left_recipe)
+    )
+    same_ingredient_same_action_prep = (
+        bool(shared_ingredient_tokens)
+        and bool(shared_action_tokens)
+        and left_prep_ingredient
+        and right_prep_ingredient
+    )
+    distinct_same_ingredient_prep_steps = (
+        bool(shared_ingredient_tokens)
+        and left_prep_ingredient
+        and right_prep_ingredient
+        and not shared_action_tokens
+    )
     distinct_prepped_ingredient_steps = (
         bool(shared_dest_tokens & _COOKING_CONTAINER_TOKENS)
         and left_recipe
@@ -383,9 +419,13 @@ def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
             or right_prep
             or left_filler
             or right_filler
-            or
-            (shared_dest_tokens & _COOKING_CONTAINER_TOKENS and (left_recipe or right_recipe))
-            or (shared_ingredient_tokens and (left_prep_ingredient or right_prep_ingredient))
+            or (
+                shared_dest_tokens & _COOKING_CONTAINER_TOKENS
+                and (left_recipe or right_recipe)
+                and (shared_ingredient_tokens or shared_action_tokens)
+            )
+            or same_ingredient_prep_to_transfer
+            or same_ingredient_same_action_prep
         ):
             return False
 
@@ -393,6 +433,8 @@ def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
     right_duration = _segment_duration_sec(right, fps)
 
     if distinct_prepped_ingredient_steps:
+        return False
+    if distinct_same_ingredient_prep_steps:
         return False
 
     if left_generic and right_generic and not (left_prep or right_prep or left_filler or right_filler):
@@ -402,11 +444,16 @@ def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
     if right_generic and right_duration <= 4.5 and not (right_prep or right_filler):
         return True
     if shared_dest_tokens & _COOKING_CONTAINER_TOKENS and (left_recipe or right_recipe):
+        if shared_ingredient_tokens and min(left_duration, right_duration) <= 8.0:
+            return True
+        if shared_action_tokens and min(left_duration, right_duration) <= 8.0:
+            return True
+        if (left_mixing or right_mixing) and shared_ingredient_tokens and max(left_duration, right_duration) <= 20.0:
+            return True
+    if same_ingredient_prep_to_transfer:
         if min(left_duration, right_duration) <= 8.0:
             return True
-        if (left_mixing or right_mixing) and max(left_duration, right_duration) <= 20.0:
-            return True
-    if shared_ingredient_tokens and (left_prep_ingredient or right_prep_ingredient):
+    if same_ingredient_same_action_prep:
         if min(left_duration, right_duration) <= 8.0:
             return True
     if similarity >= 0.6 and min(left_duration, right_duration) <= 6.5:
@@ -439,9 +486,17 @@ def merge_task_level_segments(segments: List[dict], fps: float) -> List[dict]:
         else:
             merged.append(current)
 
+    return cleanup_auxiliary_segments(merged, fps)
+
+
+def cleanup_auxiliary_segments(segments: List[dict], fps: float) -> List[dict]:
+    """Absorb bridge/prep filler spans without semantic task merging."""
+    if not segments:
+        return []
+
     bridge_cleaned: List[dict] = []
     pending_bridge: Optional[dict] = None
-    for segment in merged:
+    for segment in segments:
         current = dict(segment)
         if _instruction_is_bridge_motion(current["instruction"]) or _instruction_is_filler_segment(current["instruction"]):
             if pending_bridge is None:
@@ -504,12 +559,128 @@ def merge_task_level_segments(segments: List[dict], fps: float) -> List[dict]:
                 float(pending_prep.get("confidence", 0.0)),
             )
 
-    final_segments = prep_cleaned or bridge_cleaned or merged
+    final_segments = prep_cleaned or bridge_cleaned or segments
 
     for idx, segment in enumerate(final_segments):
         segment["seg_id"] = idx
 
     return final_segments
+
+
+def _segment_overlap_frames(left: dict, right: dict) -> int:
+    return max(
+        0,
+        min(int(left["end_frame"]), int(right["end_frame"])) - max(int(left["start_frame"]), int(right["start_frame"]))
+    )
+
+
+def _contributors_for_segment(segment: dict, source_segments: List[dict]) -> List[dict]:
+    contributors = []
+    for candidate in source_segments:
+        overlap = _segment_overlap_frames(segment, candidate)
+        if overlap > 0:
+            enriched = dict(candidate)
+            enriched["_overlap_frames"] = overlap
+            contributors.append(enriched)
+    return contributors
+
+
+def _is_specific_instruction(text: str) -> bool:
+    return not (
+        _instruction_is_generic(text)
+        or _instruction_is_prep_like(text)
+        or _instruction_is_filler_segment(text)
+    )
+
+
+def _merged_segment_looks_overcollapsed(
+    segment: dict,
+    source_segments: List[dict],
+    fps: float,
+    median_source_duration_sec: float,
+) -> bool:
+    contributors = _contributors_for_segment(segment, source_segments)
+    if len(contributors) < 3:
+        return False
+
+    distinct_specific = {
+        item["instruction"].strip().lower()
+        for item in contributors
+        if _is_specific_instruction(item["instruction"])
+    }
+    if len(distinct_specific) < 2:
+        return False
+
+    duration_sec = _segment_duration_sec(segment, fps)
+    return duration_sec >= max(10.0, median_source_duration_sec * 1.8)
+
+
+def _should_fallback_to_light_cleanup(
+    light_segments: List[dict],
+    merged_segments: List[dict],
+    fps: float,
+    min_segments: int,
+    collapse_ratio: float,
+) -> bool:
+    if len(light_segments) < min_segments:
+        return False
+    if not merged_segments:
+        return False
+    if len(merged_segments) >= max(1, int(np.ceil(len(light_segments) * collapse_ratio))):
+        return False
+
+    source_durations = [_segment_duration_sec(segment, fps) for segment in light_segments]
+    median_source_duration_sec = float(np.median(source_durations)) if source_durations else 0.0
+    return any(
+        _merged_segment_looks_overcollapsed(segment, light_segments, fps, median_source_duration_sec)
+        for segment in merged_segments
+    )
+
+
+def _score_instruction_candidate(segment: dict, candidate: dict, current_instruction: str) -> float:
+    overlap = float(candidate.get("_overlap_frames", 0))
+    text = candidate["instruction"]
+    score = overlap
+    score += float(_instruction_specificity(text)) * 24.0
+    if text == current_instruction:
+        score += 18.0
+    if _instruction_is_generic(text):
+        score -= 12.0
+    if _instruction_is_prep_like(text):
+        score -= 16.0
+    if _instruction_is_filler_segment(text):
+        score -= 24.0
+    return score
+
+
+def refine_segment_instructions(final_segments: List[dict], source_segments: List[dict]) -> List[dict]:
+    """Refine final labels from contributing pre-merge segment labels."""
+    refined: List[dict] = []
+    for segment in final_segments:
+        current = dict(segment)
+        contributors = _contributors_for_segment(current, source_segments)
+        if not contributors:
+            refined.append(current)
+            continue
+
+        best = max(
+            contributors,
+            key=lambda candidate: _score_instruction_candidate(current, candidate, current["instruction"]),
+        )
+        current_is_weak = not _is_specific_instruction(current["instruction"])
+        best_is_specific = _is_specific_instruction(best["instruction"])
+        overlap_ratio = (
+            float(best["_overlap_frames"]) / max(1.0, float(current["end_frame"] - current["start_frame"]))
+        )
+
+        if best_is_specific and (current_is_weak or overlap_ratio >= 0.45):
+            current["instruction"] = best["instruction"]
+
+        refined.append(current)
+
+    for idx, segment in enumerate(refined):
+        segment["seg_id"] = idx
+    return refined
 
 
 def build_segments_via_cuts(
@@ -518,7 +689,11 @@ def build_segments_via_cuts(
     by_wid: dict,
     fps: float,
     nframes: int,
-    frames_per_window: int = 16
+    frames_per_window: int = 16,
+    adaptive_merge_guard: bool = True,
+    adaptive_merge_min_segments: int = 8,
+    adaptive_merge_collapse_ratio: float = 0.6,
+    refine_final_instructions: bool = True,
 ) -> dict:
     """Build final segments from window results."""
     if nframes == 0:
@@ -526,8 +701,6 @@ def build_segments_via_cuts(
     
     if fps < 1e-6:
         fps = 30.0
-    
-    from collections import Counter
     
     raw_cuts = []
     instruction_timeline = [[] for _ in range(nframes)]
@@ -617,7 +790,7 @@ def build_segments_via_cuts(
     final_cut_points = sorted(list(set(final_cut_points)))
     
     # Build segments
-    final_output = []
+    raw_segments = []
     seg_id = 0
     
     for i in range(len(final_cut_points) - 1):
@@ -642,7 +815,7 @@ def build_segments_via_cuts(
         
         if candidates:
             best_inst = Counter(candidates).most_common(1)[0][0]
-            final_output.append({
+            raw_segments.append({
                 "seg_id": seg_id,
                 "start_frame": s,
                 "end_frame": e,
@@ -651,10 +824,28 @@ def build_segments_via_cuts(
             })
             seg_id += 1
 
-    final_output = merge_task_level_segments(final_output, fps)
+    light_segments = cleanup_auxiliary_segments(raw_segments, fps)
+    merged_segments = merge_task_level_segments(raw_segments, fps)
+    use_light_fallback = adaptive_merge_guard and _should_fallback_to_light_cleanup(
+        light_segments,
+        merged_segments,
+        fps,
+        min_segments=adaptive_merge_min_segments,
+        collapse_ratio=adaptive_merge_collapse_ratio,
+    )
+    final_output = light_segments if use_light_fallback else merged_segments
+
+    if refine_final_instructions:
+        final_output = refine_segment_instructions(final_output, light_segments)
     
     return {
         "sample_id": sample_id,
         "nframes": nframes,
-        "segments": final_output
+        "segments": final_output,
+        "diagnostics": {
+            "light_segment_count": len(light_segments),
+            "merged_segment_count": len(merged_segments),
+            "selected_segment_count": len(final_output),
+            "selection_policy": "light_cleanup_fallback" if use_light_fallback else "semantic_merge",
+        },
     }

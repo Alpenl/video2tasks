@@ -120,6 +120,22 @@ class WindowingConfig(BaseModel):
     target_width: int = Field(default=720, description="Target frame width")
     target_height: int = Field(default=480, description="Target frame height")
     png_compression: int = Field(default=0, description="PNG compression level (0-9)")
+    adaptive_merge_guard: bool = Field(
+        default=True,
+        description="Fallback to a lighter cleanup pass when semantic merging collapses segments too aggressively",
+    )
+    adaptive_merge_min_segments: int = Field(
+        default=8,
+        description="Minimum pre-merge segment count before adaptive merge guard can trigger",
+    )
+    adaptive_merge_collapse_ratio: float = Field(
+        default=0.6,
+        description="Trigger fallback when merged segment count drops below this fraction of the light-cleaned count",
+    )
+    refine_final_instructions: bool = Field(
+        default=True,
+        description="Refine final segment instructions from contributing sub-segment instructions",
+    )
 
 
 class ProgressConfig(BaseModel):
