@@ -22,6 +22,7 @@ def test_config_accepts_gemini_backend() -> None:
     assert cfg.windowing.adaptive_merge_guard is True
     assert cfg.windowing.adaptive_merge_min_segments == 8
     assert cfg.windowing.adaptive_merge_collapse_ratio == 0.6
+    assert cfg.windowing.boundary_support_threshold == 0.9
     assert cfg.windowing.refine_final_instructions is True
 
 

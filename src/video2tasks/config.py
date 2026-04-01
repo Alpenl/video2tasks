@@ -132,6 +132,10 @@ class WindowingConfig(BaseModel):
         default=0.6,
         description="Trigger fallback when merged segment count drops below this fraction of the light-cleaned count",
     )
+    boundary_support_threshold: float = Field(
+        default=0.9,
+        description="Treat clustered cut support at or above this value as a strong boundary when adaptive local merge decisions are available",
+    )
     refine_final_instructions: bool = Field(
         default=True,
         description="Refine final segment instructions from contributing sub-segment instructions",

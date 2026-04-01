@@ -347,7 +347,29 @@ def _segment_duration_sec(segment: dict, fps: float) -> float:
     return max(0.0, (segment["end_frame"] - segment["start_frame"]) / fps)
 
 
+def _boundary_support_between(left: dict, right: dict) -> Tuple[float, bool]:
+    supports = []
+    has_support = False
+    for segment, key in ((left, "boundary_support_after"), (right, "boundary_support_before")):
+        if key in segment:
+            has_support = True
+            try:
+                supports.append(max(0.0, float(segment.get(key, 0.0))))
+            except (TypeError, ValueError):
+                supports.append(0.0)
+    return (max(supports) if supports else 0.0), has_support
+
+
 def _choose_instruction(left: dict, right: dict, fps: float) -> str:
+    shared_ingredient_tokens = _ingredient_tokens(left["instruction"]) & _ingredient_tokens(right["instruction"])
+    if (
+        shared_ingredient_tokens
+        and _instruction_has_prep_ingredient_action(left["instruction"])
+        and _instruction_has_prep_ingredient_action(right["instruction"])
+        and _action_tokens(left["instruction"]) != _action_tokens(right["instruction"])
+    ):
+        return right["instruction"]
+
     left_specificity = _instruction_specificity(left["instruction"])
     right_specificity = _instruction_specificity(right["instruction"])
     if right_specificity > left_specificity:
@@ -362,7 +384,7 @@ def _choose_instruction(left: dict, right: dict, fps: float) -> str:
     return left["instruction"]
 
 
-def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
+def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support_threshold: float = 0.9) -> bool:
     left_tokens = _primary_object_tokens(left["instruction"])
     right_tokens = _primary_object_tokens(right["instruction"])
     similarity = _token_similarity(left_tokens, right_tokens)
@@ -373,6 +395,8 @@ def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
     right_ingredient_tokens = _ingredient_tokens(right["instruction"])
     shared_ingredient_tokens = left_ingredient_tokens & right_ingredient_tokens
     shared_action_tokens = _action_tokens(left["instruction"]) & _action_tokens(right["instruction"])
+    boundary_support, has_boundary_support = _boundary_support_between(left, right)
+    strong_boundary = has_boundary_support and boundary_support_threshold > 0.0 and boundary_support >= boundary_support_threshold
 
     left_recipe = _instruction_has_recipe_action(left["instruction"])
     right_recipe = _instruction_has_recipe_action(right["instruction"])
@@ -426,6 +450,7 @@ def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
             )
             or same_ingredient_prep_to_transfer
             or same_ingredient_same_action_prep
+            or (distinct_same_ingredient_prep_steps and has_boundary_support and not strong_boundary)
         ):
             return False
 
@@ -435,6 +460,12 @@ def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
     if distinct_prepped_ingredient_steps:
         return False
     if distinct_same_ingredient_prep_steps:
+        if not has_boundary_support:
+            return False
+        if strong_boundary:
+            return False
+        if min(left_duration, right_duration) <= 8.0:
+            return True
         return False
 
     if left_generic and right_generic and not (left_prep or right_prep or left_filler or right_filler):
@@ -461,7 +492,11 @@ def _should_merge_segments(left: dict, right: dict, fps: float) -> bool:
     return False
 
 
-def merge_task_level_segments(segments: List[dict], fps: float) -> List[dict]:
+def merge_task_level_segments(
+    segments: List[dict],
+    fps: float,
+    boundary_support_threshold: float = 0.9,
+) -> List[dict]:
     """Merge over-segmented adjacent spans into task-level segments."""
     if not segments:
         return []
@@ -475,13 +510,17 @@ def merge_task_level_segments(segments: List[dict], fps: float) -> List[dict]:
             continue
 
         previous = merged[-1]
-        if _should_merge_segments(previous, current, fps):
+        if _should_merge_segments(previous, current, fps, boundary_support_threshold=boundary_support_threshold):
             chosen_instruction = _choose_instruction(previous, current, fps)
             previous["end_frame"] = current["end_frame"]
             previous["instruction"] = chosen_instruction
             previous["confidence"] = max(
                 float(previous.get("confidence", 0.0)),
                 float(current.get("confidence", 0.0)),
+            )
+            previous["boundary_support_after"] = current.get(
+                "boundary_support_after",
+                previous.get("boundary_support_after", 0.0),
             )
         else:
             merged.append(current)
@@ -693,6 +732,7 @@ def build_segments_via_cuts(
     adaptive_merge_guard: bool = True,
     adaptive_merge_min_segments: int = 8,
     adaptive_merge_collapse_ratio: float = 0.6,
+    boundary_support_threshold: float = 0.9,
     refine_final_instructions: bool = True,
 ) -> dict:
     """Build final segments from window results."""
@@ -754,6 +794,7 @@ def build_segments_via_cuts(
     
     # Cluster cuts
     final_cut_points = [0]
+    cut_support_by_point: dict[int, float] = {}
     
     if raw_cuts:
         raw_cuts.sort(key=lambda x: x[0])
@@ -771,20 +812,26 @@ def build_segments_via_cuts(
                 cur_frames.append(fid)
                 cur_weights.append(w)
             else:
+                cluster_support = float(sum(cur_weights))
                 if cur_weights and sum(cur_weights) > 1e-9:
                     avg = np.average(cur_frames, weights=cur_weights)
-                    final_cut_points.append(int(avg))
+                    point = int(avg)
                 else:
-                    final_cut_points.append(int(np.mean(cur_frames)))
+                    point = int(np.mean(cur_frames))
+                final_cut_points.append(point)
+                cut_support_by_point[point] = max(cut_support_by_point.get(point, 0.0), cluster_support)
                 cur_frames = [fid]
                 cur_weights = [w]
         
         if cur_frames:
+            cluster_support = float(sum(cur_weights))
             if cur_weights and sum(cur_weights) > 1e-9:
                 avg = np.average(cur_frames, weights=cur_weights)
-                final_cut_points.append(int(avg))
+                point = int(avg)
             else:
-                final_cut_points.append(int(np.mean(cur_frames)))
+                point = int(np.mean(cur_frames))
+            final_cut_points.append(point)
+            cut_support_by_point[point] = max(cut_support_by_point.get(point, 0.0), cluster_support)
     
     final_cut_points.append(nframes)
     final_cut_points = sorted(list(set(final_cut_points)))
@@ -820,12 +867,18 @@ def build_segments_via_cuts(
                 "start_frame": s,
                 "end_frame": e,
                 "instruction": best_inst,
-                "confidence": 1.0
+                "confidence": 1.0,
+                "boundary_support_before": float(cut_support_by_point.get(s, 0.0)),
+                "boundary_support_after": float(cut_support_by_point.get(e, 0.0)),
             })
             seg_id += 1
 
     light_segments = cleanup_auxiliary_segments(raw_segments, fps)
-    merged_segments = merge_task_level_segments(raw_segments, fps)
+    merged_segments = merge_task_level_segments(
+        raw_segments,
+        fps,
+        boundary_support_threshold=boundary_support_threshold,
+    )
     use_light_fallback = adaptive_merge_guard and _should_fallback_to_light_cleanup(
         light_segments,
         merged_segments,

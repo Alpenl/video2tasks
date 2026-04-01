@@ -351,6 +351,7 @@ def create_app(config: Config) -> FastAPI:
                                 adaptive_merge_guard=config.windowing.adaptive_merge_guard,
                                 adaptive_merge_min_segments=config.windowing.adaptive_merge_min_segments,
                                 adaptive_merge_collapse_ratio=config.windowing.adaptive_merge_collapse_ratio,
+                                boundary_support_threshold=config.windowing.boundary_support_threshold,
                                 refine_final_instructions=config.windowing.refine_final_instructions,
                             )
                             

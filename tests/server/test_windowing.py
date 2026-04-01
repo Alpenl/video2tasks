@@ -459,6 +459,38 @@ def test_merge_task_level_segments_does_not_treat_object_name_as_action_token() 
     assert merged[1]["instruction"] == "Place the spring rolls on a baking sheet"
 
 
+def test_merge_task_level_segments_merges_same_ingredient_prep_steps_when_boundary_is_weak() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 326,
+            "instruction": "Peel the ginger",
+            "confidence": 1.0,
+            "boundary_support_after": 0.75,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 326,
+            "end_frame": 519,
+            "instruction": "Grate the peeled ginger",
+            "confidence": 1.0,
+            "boundary_support_before": 0.75,
+        },
+    ]
+
+    merged = merge_task_level_segments(
+        segments,
+        fps=25.0,
+        boundary_support_threshold=0.9,
+    )
+
+    assert len(merged) == 1
+    assert merged[0]["start_frame"] == 0
+    assert merged[0]["end_frame"] == 519
+    assert merged[0]["instruction"] == "Grate the peeled ginger"
+
+
 def test_adaptive_merge_fallback_preserves_light_segments() -> None:
     fps = 30.0
     raw_segments = [
