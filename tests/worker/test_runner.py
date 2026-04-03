@@ -1,4 +1,8 @@
+import base64
 import requests
+from io import BytesIO
+
+from PIL import Image
 
 from video2tasks.config import Config
 from video2tasks.worker.runner import run_worker
@@ -191,7 +195,10 @@ def test_worker_uses_logical_frame_count_for_contact_sheet_prompt(
                 {
                     "data": {
                         "task_id": "demo::sample_roboturk_tower_w0",
-                        "images": ["", ""],
+                        "images": [
+                            base64.b64encode(_png_bytes()).decode("utf-8"),
+                            base64.b64encode(_png_bytes()).decode("utf-8"),
+                        ],
                         "meta": {
                             "subset": "demo",
                             "sample_id": "sample_roboturk_tower",
@@ -402,3 +409,229 @@ def test_worker_uses_boundary_refinement_prompt_for_boundary_refinement_job(
         "contact_sheet_cols": 0,
         "sheet_count": 0,
     }
+
+
+class CountingBackend(DummyBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.infer_calls = 0
+        self.last_image_count = None
+
+    def infer(self, images, prompt):
+        self.infer_calls += 1
+        self.last_image_count = len(images)
+        return super().infer(images, prompt)
+
+
+def _png_bytes() -> bytes:
+    buffer = BytesIO()
+    Image.new("RGB", (8, 8), (255, 0, 0)).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_worker_loads_images_from_paths_and_submits_dispatch_id(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    backend = CountingBackend()
+    image_path = tmp_path / "sheet.png"
+    image_path.write_bytes(_png_bytes())
+    posted = {}
+    get_attempts = {"count": 0}
+
+    def fake_get(url, timeout=None):
+        get_attempts["count"] += 1
+        if get_attempts["count"] == 1:
+            return DummyResponse(
+                200,
+                {
+                    "data": {
+                        "task_id": "demo::sample_roboturk_tower_w0",
+                        "dispatch_id": "d7",
+                        "image_paths": [str(image_path)],
+                        "meta": {
+                            "subset": "demo",
+                            "sample_id": "sample_roboturk_tower",
+                            "logical_frame_count": 16,
+                            "contact_sheet_rows": 4,
+                            "contact_sheet_cols": 4,
+                        },
+                    }
+                },
+            )
+        raise requests.exceptions.ConnectionError("server stopped")
+
+    def fake_post(url, json=None, timeout=None):
+        posted.update(json or {})
+        return DummyResponse(200, {"status": "received"})
+
+    monkeypatch.setattr("video2tasks.worker.runner.create_backend", lambda *args, **kwargs: backend)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.get", fake_get)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.post", fake_post)
+    monkeypatch.setattr("video2tasks.worker.runner.time.sleep", lambda *_args, **_kwargs: None)
+
+    cfg = Config(worker={"backend": "dummy", "server_url": "http://127.0.0.1:8099"})
+
+    run_worker(cfg)
+
+    capsys.readouterr()
+    assert backend.infer_calls == 1
+    assert backend.last_image_count == 1
+    assert posted["dispatch_id"] == "d7"
+
+
+def test_worker_does_not_infer_when_inline_image_decode_fails(
+    monkeypatch,
+    capsys,
+) -> None:
+    backend = CountingBackend()
+    get_attempts = {"count": 0}
+
+    def fake_get(url, timeout=None):
+        get_attempts["count"] += 1
+        if get_attempts["count"] == 1:
+            return DummyResponse(
+                200,
+                {
+                    "data": {
+                        "task_id": "demo::sample_roboturk_tower_w0",
+                        "dispatch_id": "d1",
+                        "images": ["not-valid-base64"],
+                        "meta": {
+                            "subset": "demo",
+                            "sample_id": "sample_roboturk_tower",
+                        },
+                    }
+                },
+            )
+        raise requests.exceptions.ConnectionError("server stopped")
+
+    def fake_post(url, json=None, timeout=None):
+        raise AssertionError("submit_result should not be called when image decode fails")
+
+    monkeypatch.setattr("video2tasks.worker.runner.create_backend", lambda *args, **kwargs: backend)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.get", fake_get)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.post", fake_post)
+    monkeypatch.setattr("video2tasks.worker.runner.time.sleep", lambda *_args, **_kwargs: None)
+
+    cfg = Config(worker={"backend": "dummy", "server_url": "http://127.0.0.1:8099"})
+
+    run_worker(cfg)
+
+    out = capsys.readouterr().out
+    assert backend.infer_calls == 0
+    assert "failed to decode inline images at indices [0]" in out
+
+
+def test_worker_retries_submit_until_server_ack(
+    monkeypatch,
+    capsys,
+) -> None:
+    backend = CountingBackend()
+    get_attempts = {"count": 0}
+    post_attempts = {"count": 0}
+
+    def fake_get(url, timeout=None):
+        get_attempts["count"] += 1
+        if get_attempts["count"] == 1:
+            return DummyResponse(
+                200,
+                {
+                    "data": {
+                        "task_id": "demo::sample_roboturk_tower_w0",
+                        "dispatch_id": "d3",
+                        "images": [],
+                        "meta": {
+                            "subset": "demo",
+                            "sample_id": "sample_roboturk_tower",
+                        },
+                    }
+                },
+            )
+        raise requests.exceptions.ConnectionError("server stopped")
+
+    def fake_post(url, json=None, timeout=None):
+        post_attempts["count"] += 1
+        if post_attempts["count"] == 1:
+            raise requests.exceptions.ConnectionError("temporary network issue")
+        if post_attempts["count"] == 2:
+            return DummyResponse(500, {"status": "error"})
+        return DummyResponse(200, {"status": "received"})
+
+    monkeypatch.setattr("video2tasks.worker.runner.create_backend", lambda *args, **kwargs: backend)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.get", fake_get)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.post", fake_post)
+    monkeypatch.setattr("video2tasks.worker.runner.time.sleep", lambda *_args, **_kwargs: None)
+
+    cfg = Config(worker={"backend": "dummy", "server_url": "http://127.0.0.1:8099"})
+
+    run_worker(cfg)
+
+    out = capsys.readouterr().out
+    assert backend.infer_calls == 1
+    assert post_attempts["count"] == 3
+    assert "[Warn] Submit failed for demo::sample_roboturk_tower_w0" in out
+
+
+class RawPayloadBackend(DummyBackend):
+    name = "gemini"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen_images = None
+
+    def infer(self, images, prompt):
+        self.seen_images = images
+        return super().infer(images, prompt)
+
+
+def test_worker_passes_raw_image_payloads_to_gemini_backend(
+    monkeypatch,
+    tmp_path,
+    capsys,
+) -> None:
+    backend = RawPayloadBackend()
+    image_path = tmp_path / "sheet.png"
+    image_bytes = _png_bytes()
+    image_path.write_bytes(image_bytes)
+    get_attempts = {"count": 0}
+
+    def fake_get(url, timeout=None):
+        get_attempts["count"] += 1
+        if get_attempts["count"] == 1:
+            return DummyResponse(
+                200,
+                {
+                    "data": {
+                        "task_id": "demo::sample_roboturk_tower_w0",
+                        "dispatch_id": "d9",
+                        "image_paths": [str(image_path)],
+                        "meta": {
+                            "subset": "demo",
+                            "sample_id": "sample_roboturk_tower",
+                            "logical_frame_count": 16,
+                            "contact_sheet_rows": 4,
+                            "contact_sheet_cols": 4,
+                        },
+                    }
+                },
+            )
+        raise requests.exceptions.ConnectionError("server stopped")
+
+    def fake_post(url, json=None, timeout=None):
+        return DummyResponse(200, {"status": "received"})
+
+    monkeypatch.setattr("video2tasks.worker.runner.create_backend", lambda *args, **kwargs: backend)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.get", fake_get)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.post", fake_post)
+    monkeypatch.setattr("video2tasks.worker.runner.time.sleep", lambda *_args, **_kwargs: None)
+
+    cfg = Config(worker={"backend": "gemini", "server_url": "http://127.0.0.1:8099", "gemini": {"api_key": "x"}})
+
+    run_worker(cfg)
+
+    capsys.readouterr()
+    assert isinstance(backend.seen_images, list)
+    assert backend.seen_images[0]["mime_type"] == "image/png"
+    assert backend.seen_images[0]["raw_bytes"] == image_bytes

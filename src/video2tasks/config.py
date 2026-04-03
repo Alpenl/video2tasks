@@ -28,6 +28,10 @@ class ServerConfig(BaseModel):
     max_queue: int = Field(default=32, description="Maximum job queue size")
     inflight_timeout_sec: float = Field(default=300.0, description="Timeout for in-flight jobs")
     max_retries_per_job: int = Field(default=5, description="Maximum retries per job")
+    max_empty_retries_per_job: int = Field(
+        default=0,
+        description="Maximum retries after an empty VLM JSON (<= 0 means unlimited)",
+    )
     auto_exit_after_all_done: bool = Field(default=False, description="Auto exit when all done")
 
 
@@ -271,6 +275,10 @@ def _apply_env_overrides(config: Config) -> None:
         config.run.run_id = os.environ["RUN_ID"]
     if "PORT" in os.environ:
         config.server.port = int(os.environ["PORT"])
+    if "MAX_RETRIES_PER_JOB" in os.environ:
+        config.server.max_retries_per_job = int(os.environ["MAX_RETRIES_PER_JOB"])
+    if "MAX_EMPTY_RETRIES_PER_JOB" in os.environ:
+        config.server.max_empty_retries_per_job = int(os.environ["MAX_EMPTY_RETRIES_PER_JOB"])
     if "SERVER_URL" in os.environ:
         config.worker.server_url = os.environ["SERVER_URL"]
     if "MODEL_PATH" in os.environ:

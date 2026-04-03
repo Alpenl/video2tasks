@@ -1,0 +1,60 @@
+# Video2Tasks configuration for Gemini 3 Flash runs
+
+datasets:
+  - root: "./data"
+    subset: "youcook2_single_LQDP3xm8aRk"
+
+run:
+  base_dir: "./runs"
+  run_id: "g3flash"
+
+server:
+  host: "0.0.0.0"
+  port: 8099
+  max_queue: 32
+  inflight_timeout_sec: 300.0
+  max_retries_per_job: 50
+  max_empty_retries_per_job: 0
+  auto_exit_after_all_done: true
+
+worker:
+  server_url: "http://127.0.0.1:8099"
+  backend: "gemini"
+  gemini:
+    api_key: "sk-VrCRs8peG7yDlOZrap08Z5HvhZBO9xDho9l6MZCasphj8wJC"
+    model: "gemini-3-flash-preview"
+    api_mode: "openai_compatible"
+    base_url: "https://api.duckcoding.ai"
+    timeout_sec: 60.0
+    max_output_tokens: 2048
+    jpeg_quality: 85
+
+windowing:
+  window_sec: 12.0
+  step_sec: 6.0
+  frames_per_window: 128
+  boundary_prompt_mode: "freeform"
+  segment_labeling_mode: "inline"
+  enable_refinement_pass: false
+  enable_boundary_refinement: false
+  boundary_refinement_window_sec: 4.0
+  boundary_refinement_frames_per_window: 0
+  boundary_refinement_abstain_merge_max_support: -1.0
+  refinement_frames_per_window: 0
+  target_width: 720
+  target_height: 480
+  png_compression: 0
+  use_contact_sheets: true
+  contact_sheet_rows: 4
+  contact_sheet_cols: 4
+  adaptive_merge_guard: true
+  adaptive_merge_min_segments: 8
+  adaptive_merge_collapse_ratio: 0.6
+  boundary_support_threshold: 0.9
+  refine_final_instructions: true
+
+progress:
+  total_override: 0
+
+logging:
+  level: "DEBUG"

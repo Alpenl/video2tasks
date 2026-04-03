@@ -3,12 +3,14 @@
 import os
 import re
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 from collections import Counter
 import numpy as np
 import cv2
 import base64
 import subprocess
+
+from .task_artifacts import ArtifactBatch, TaskArtifactWriter
 
 
 @dataclass
@@ -143,6 +145,60 @@ def _sample_window_frame_ids(start_frame: int, end_frame: int, frames_per_window
         return []
     idx = np.linspace(start_frame, end_frame, num=frames_per_window).astype(int)
     return np.clip(idx, 0, nframes - 1).tolist()
+
+
+def _cluster_cut_votes(raw_cuts: List[Tuple[int, float]], fps: float) -> Tuple[List[int], Dict[int, float]]:
+    """Cluster nearby cut votes without allowing chain-merges to sprawl across long ranges.
+
+    The boundary detector is intentionally over-segmenting. In dense action regions this can
+    produce a ladder of nearby candidate cuts. A permissive single-link cluster can chain these
+    into one overly wide cluster and shift the chosen boundary far away from the earliest true
+    onset. To preserve recall, keep clusters locally tight and anchor each cluster at its earliest
+    supported frame.
+    """
+    if not raw_cuts:
+        return [], {}
+
+    safe_fps = float(fps) if fps > 1e-6 else 30.0
+    max_link_gap_frames = max(1.0, 1.0 * safe_fps)
+    max_cluster_span_frames = max(max_link_gap_frames, 1.5 * safe_fps)
+
+    sorted_cuts = sorted(raw_cuts, key=lambda item: item[0])
+    clustered_points: List[int] = []
+    cut_support_by_point: Dict[int, float] = {}
+
+    cur_frames: List[int] = []
+    cur_weights: List[float] = []
+
+    def flush_cluster() -> None:
+        if not cur_frames:
+            return
+        point = int(min(cur_frames))
+        cluster_support = float(sum(cur_weights))
+        clustered_points.append(point)
+        cut_support_by_point[point] = max(cut_support_by_point.get(point, 0.0), cluster_support)
+
+    for fid, weight in sorted_cuts:
+        if not cur_frames:
+            cur_frames.append(int(fid))
+            cur_weights.append(float(weight))
+            continue
+
+        prev_fid = cur_frames[-1]
+        cluster_start = cur_frames[0]
+        within_link_gap = (fid - prev_fid) < max_link_gap_frames
+        within_cluster_span = (fid - cluster_start) < max_cluster_span_frames
+        if within_link_gap and within_cluster_span:
+            cur_frames.append(int(fid))
+            cur_weights.append(float(weight))
+            continue
+
+        flush_cluster()
+        cur_frames = [int(fid)]
+        cur_weights = [float(weight)]
+
+    flush_cluster()
+    return clustered_points, cut_support_by_point
 
 
 def sample_segment_frame_ids(
@@ -347,6 +403,31 @@ def apply_boundary_refinement_results(
     return rebuilt
 
 
+def encode_image_720p_png_bytes(
+    img_bgr: np.ndarray,
+    target_w: int = 720,
+    target_h: int = 480,
+    compression: int = 0
+) -> bytes:
+    """Encode image to PNG bytes, resizing if needed."""
+    if img_bgr is None:
+        return b""
+
+    h, w = img_bgr.shape[:2]
+    if h <= 0 or w <= 0:
+        return b""
+
+    if (w != target_w) or (h != target_h):
+        img_bgr = cv2.resize(img_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
+
+    ok, buf = cv2.imencode(
+        ".png",
+        img_bgr,
+        [int(cv2.IMWRITE_PNG_COMPRESSION), int(np.clip(compression, 0, 9))]
+    )
+    return buf.tobytes() if ok else b""
+
+
 def encode_image_720p_png(
     img_bgr: np.ndarray,
     target_w: int = 720,
@@ -354,33 +435,47 @@ def encode_image_720p_png(
     compression: int = 0
 ) -> str:
     """Encode image to base64 PNG, resizing if needed."""
-    if img_bgr is None:
-        return ""
-    
-    h, w = img_bgr.shape[:2]
-    if h <= 0 or w <= 0:
-        return ""
-    
-    if (w != target_w) or (h != target_h):
-        img_bgr = cv2.resize(img_bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
-    
-    ok, buf = cv2.imencode(
-        ".png",
+    payload = encode_image_720p_png_bytes(
         img_bgr,
-        [int(cv2.IMWRITE_PNG_COMPRESSION), int(np.clip(compression, 0, 9))]
+        target_w=target_w,
+        target_h=target_h,
+        compression=compression,
     )
-    
-    return base64.b64encode(buf).decode("utf-8") if ok else ""
+    return base64.b64encode(payload).decode("utf-8") if payload else ""
+
+
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+
+
+def _env_flag_enabled(name: str) -> bool:
+    value = os.getenv(name, "").strip().lower()
+    return value in _TRUTHY_ENV_VALUES
+
+
+def _build_default_task_artifact_writer() -> Optional[TaskArtifactWriter]:
+    if not _env_flag_enabled("VIDEO2TASKS_DUMP_INTERMEDIATE"):
+        return None
+    root_dir = os.getenv("VIDEO2TASKS_TMP_DIR", "tmp").strip() or "tmp"
+    return TaskArtifactWriter(root_dir=root_dir)
 
 
 class FrameExtractor:
     """Extract frames from video file."""
 
-    def __init__(self, mp4_path: str):
+    def __init__(
+        self,
+        mp4_path: str,
+        artifact_writer: Optional[TaskArtifactWriter] = None,
+    ):
         self.mp4_path = mp4_path
         self.cap = cv2.VideoCapture(mp4_path)
         if not self.cap.isOpened():
             raise RuntimeError(f"Cannot open video: {mp4_path}")
+
+        self.artifact_writer = artifact_writer or _build_default_task_artifact_writer()
+        self.last_artifact_batch: Optional[ArtifactBatch] = None
+        self._artifact_sequence = 0
+        self._auto_sample_id = os.path.splitext(os.path.basename(self.mp4_path))[0] or "sample"
 
     def close(self) -> None:
         """Release video capture."""
@@ -401,7 +496,7 @@ class FrameExtractor:
             return None
         return bgr
 
-    def _build_contact_sheet_b64_via_ffmpeg(
+    def _build_contact_sheet_png_bytes_via_ffmpeg(
         self,
         group_frame_ids: List[int],
         group_start_index: int,
@@ -409,9 +504,9 @@ class FrameExtractor:
         target_h: int,
         rows: int,
         cols: int,
-    ) -> str:
+    ) -> bytes:
         if not group_frame_ids:
-            return ""
+            return b""
 
         cell_w = max(1, int(target_w) // max(1, int(cols)))
         cell_h = max(1, int(target_h) // max(1, int(rows)))
@@ -446,12 +541,29 @@ class FrameExtractor:
             stderr = proc.stderr.decode('utf-8', errors='replace').strip()
             if stderr:
                 print(f"[FrameExtractor] ffmpeg contact sheet failed: {stderr}")
-            return ""
-        if not proc.stdout:
-            return ""
-        return base64.b64encode(proc.stdout).decode('utf-8')
+            return b""
+        return bytes(proc.stdout or b"")
 
-    def _build_contact_sheet_b64_via_cv2(
+    def _build_contact_sheet_b64_via_ffmpeg(
+        self,
+        group_frame_ids: List[int],
+        group_start_index: int,
+        target_w: int,
+        target_h: int,
+        rows: int,
+        cols: int,
+    ) -> str:
+        payload = self._build_contact_sheet_png_bytes_via_ffmpeg(
+            group_frame_ids,
+            group_start_index,
+            target_w,
+            target_h,
+            rows,
+            cols,
+        )
+        return base64.b64encode(payload).decode('utf-8') if payload else ""
+
+    def _build_contact_sheet_png_bytes_via_cv2(
         self,
         group_frame_ids: List[int],
         group_start_index: int,
@@ -460,7 +572,7 @@ class FrameExtractor:
         compression: int,
         rows: int,
         cols: int,
-    ) -> str:
+    ) -> bytes:
         cell_w = max(1, int(target_w) // max(1, int(cols)))
         cell_h = max(1, int(target_h) // max(1, int(rows)))
         sheet_h = cell_h * max(1, int(rows))
@@ -507,7 +619,71 @@ class FrameExtractor:
                 lineType=cv2.LINE_AA,
             )
 
-        return encode_image_720p_png(sheet, target_w, target_h, compression)
+        return encode_image_720p_png_bytes(sheet, target_w, target_h, compression)
+
+    def _build_contact_sheet_b64_via_cv2(
+        self,
+        group_frame_ids: List[int],
+        group_start_index: int,
+        target_w: int,
+        target_h: int,
+        compression: int,
+        rows: int,
+        cols: int,
+    ) -> str:
+        payload = self._build_contact_sheet_png_bytes_via_cv2(
+            group_frame_ids,
+            group_start_index,
+            target_w,
+            target_h,
+            compression,
+            rows,
+            cols,
+        )
+        return base64.b64encode(payload).decode("utf-8") if payload else ""
+
+    def _persist_intermediate_artifacts(
+        self,
+        *,
+        frame_groups: List[List[int]],
+        source_tags: List[str],
+        image_kind: str,
+        metadata: Optional[Dict[str, Any]],
+        image_payloads: Optional[List[bytes]] = None,
+        images_b64: Optional[List[str]] = None,
+    ) -> Optional[ArtifactBatch]:
+        self.last_artifact_batch = None
+        if getattr(self, "artifact_writer", None) is None:
+            return None
+
+        task_metadata: Dict[str, Any] = dict(metadata or {})
+        task_metadata.setdefault("subset", "unspecified")
+        task_metadata.setdefault("sample_id", self._auto_sample_id)
+        task_metadata.setdefault("task_id", f"{self._auto_sample_id}_extract_{self._artifact_sequence:06d}")
+        task_metadata.setdefault("mp4_path", self.mp4_path)
+        task_metadata.setdefault("extract_sequence", self._artifact_sequence)
+
+        if image_payloads is not None:
+            batch = self.artifact_writer.write_images_bytes(
+                metadata=task_metadata,
+                images_bytes=image_payloads,
+                image_kind=image_kind,
+                frame_groups=frame_groups,
+                source_tags=source_tags,
+                extension="png",
+            )
+        else:
+            batch = self.artifact_writer.write_images_b64(
+                metadata=task_metadata,
+                images_b64=images_b64 or [],
+                image_kind=image_kind,
+                frame_groups=frame_groups,
+                source_tags=source_tags,
+                extension="png",
+            )
+        self._artifact_sequence += 1
+        self.last_artifact_batch = batch
+        return batch
 
     def get_many_b64(
         self,
@@ -518,27 +694,50 @@ class FrameExtractor:
         use_contact_sheets: bool = False,
         contact_sheet_rows: int = 4,
         contact_sheet_cols: int = 4,
+        artifact_metadata: Optional[Dict[str, Any]] = None,
+        artifact_image_kind: Optional[str] = None,
+        persist_artifacts: bool = True,
+        return_images: bool = True,
     ) -> List[str]:
         """Extract multiple logical frames either directly or as contact sheets."""
         if not use_contact_sheets:
             sorted_indices = sorted(list(set(frame_ids)))
-            frame_map: dict = {}
+            frame_payload_map: Dict[int, bytes] = {}
 
             for fid in sorted_indices:
                 bgr = self._read_frame_bgr(fid)
-                frame_map[fid] = encode_image_720p_png(
+                frame_payload_map[fid] = encode_image_720p_png_bytes(
                     bgr, target_w, target_h, compression
-                ) if bgr is not None else ""
+                ) if bgr is not None else b""
 
-            return [frame_map.get(fid, "") for fid in frame_ids]
+            image_payloads = [frame_payload_map.get(fid, b"") for fid in frame_ids]
+            images = [
+                base64.b64encode(payload).decode("utf-8") if payload else ""
+                for payload in image_payloads
+            ] if return_images else []
+            if persist_artifacts:
+                frame_groups = [[int(fid)] for fid in frame_ids]
+                source_tags = ["cv2_frame" if frame_payload_map.get(fid, b"") else "missing" for fid in frame_ids]
+                self._persist_intermediate_artifacts(
+                    image_payloads=image_payloads,
+                    frame_groups=frame_groups,
+                    source_tags=source_tags,
+                    image_kind=artifact_image_kind or "frame",
+                    metadata=artifact_metadata,
+                )
+            return images
 
         rows = max(1, int(contact_sheet_rows))
         cols = max(1, int(contact_sheet_cols))
         chunk_size = rows * cols
         images: List[str] = []
-        for group_index, group in enumerate(chunk_frame_ids_for_contact_sheets(frame_ids, chunk_size)):
+        image_payloads: List[bytes] = []
+        frame_groups = chunk_frame_ids_for_contact_sheets(frame_ids, chunk_size)
+        source_tags: List[str] = []
+
+        for group_index, group in enumerate(frame_groups):
             group_start_index = group_index * chunk_size
-            b64 = self._build_contact_sheet_b64_via_ffmpeg(
+            payload = self._build_contact_sheet_png_bytes_via_ffmpeg(
                 group,
                 group_start_index,
                 target_w,
@@ -546,8 +745,9 @@ class FrameExtractor:
                 rows,
                 cols,
             )
-            if not b64:
-                b64 = self._build_contact_sheet_b64_via_cv2(
+            source = "ffmpeg"
+            if not payload:
+                payload = self._build_contact_sheet_png_bytes_via_cv2(
                     group,
                     group_start_index,
                     target_w,
@@ -556,9 +756,50 @@ class FrameExtractor:
                     rows,
                     cols,
                 )
-            images.append(b64)
+                source = "cv2" if payload else "missing"
+            image_payloads.append(payload)
+            source_tags.append(source)
+            if return_images:
+                images.append(base64.b64encode(payload).decode("utf-8") if payload else "")
+
+        if persist_artifacts:
+            self._persist_intermediate_artifacts(
+                image_payloads=image_payloads,
+                frame_groups=frame_groups,
+                source_tags=source_tags,
+                image_kind=artifact_image_kind or "contact_sheet",
+                metadata=artifact_metadata,
+            )
         return images
 
+    def get_many_b64_with_artifacts(
+        self,
+        frame_ids: List[int],
+        target_w: int = 720,
+        target_h: int = 480,
+        compression: int = 0,
+        use_contact_sheets: bool = False,
+        contact_sheet_rows: int = 4,
+        contact_sheet_cols: int = 4,
+        artifact_metadata: Optional[Dict[str, Any]] = None,
+        artifact_image_kind: Optional[str] = None,
+        return_images: bool = True,
+    ) -> Tuple[List[str], Optional[ArtifactBatch]]:
+        """Return encoded images plus persisted artifact batch metadata."""
+        images = self.get_many_b64(
+            frame_ids,
+            target_w=target_w,
+            target_h=target_h,
+            compression=compression,
+            use_contact_sheets=use_contact_sheets,
+            contact_sheet_rows=contact_sheet_rows,
+            contact_sheet_cols=contact_sheet_cols,
+            artifact_metadata=artifact_metadata,
+            artifact_image_kind=artifact_image_kind,
+            persist_artifacts=True,
+            return_images=return_images,
+        )
+        return images, self.last_artifact_batch
 
 _DESTINATION_SPLIT_RE = re.compile(
     r"\b(?:to|onto|into|over|inside|within|toward|towards|from|in|on)\b"
@@ -1958,8 +2199,8 @@ def build_segments_via_cuts(
     instruction_timeline = [[] for _ in range(nframes)]
     center_weights = np.hanning(frames_per_window + 2)[1:-1]
     
-    for wid, w in enumerate(windows):
-        rec = by_wid.get(wid)
+    for w in windows:
+        rec = by_wid.get(w.window_id)
         if not rec:
             continue
         
@@ -2009,41 +2250,9 @@ def build_segments_via_cuts(
     cut_support_by_point: dict[int, float] = {}
     
     if raw_cuts:
-        raw_cuts.sort(key=lambda x: x[0])
-        cluster_gap = max(1.0, 2.5 * fps)
-        cur_frames = []
-        cur_weights = []
-        
-        for fid, w in raw_cuts:
-            if not cur_frames:
-                cur_frames.append(fid)
-                cur_weights.append(w)
-                continue
-            
-            if (fid - cur_frames[-1]) < cluster_gap:
-                cur_frames.append(fid)
-                cur_weights.append(w)
-            else:
-                cluster_support = float(sum(cur_weights))
-                if cur_weights and sum(cur_weights) > 1e-9:
-                    avg = np.average(cur_frames, weights=cur_weights)
-                    point = int(avg)
-                else:
-                    point = int(np.mean(cur_frames))
-                final_cut_points.append(point)
-                cut_support_by_point[point] = max(cut_support_by_point.get(point, 0.0), cluster_support)
-                cur_frames = [fid]
-                cur_weights = [w]
-        
-        if cur_frames:
-            cluster_support = float(sum(cur_weights))
-            if cur_weights and sum(cur_weights) > 1e-9:
-                avg = np.average(cur_frames, weights=cur_weights)
-                point = int(avg)
-            else:
-                point = int(np.mean(cur_frames))
-            final_cut_points.append(point)
-            cut_support_by_point[point] = max(cut_support_by_point.get(point, 0.0), cluster_support)
+        clustered_points, clustered_support = _cluster_cut_votes(raw_cuts, fps)
+        final_cut_points.extend(clustered_points)
+        cut_support_by_point.update(clustered_support)
     
     final_cut_points.append(nframes)
     final_cut_points = sorted(list(set(final_cut_points)))

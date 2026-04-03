@@ -34,6 +34,26 @@ def _encode_jpeg_data_url(img_bgr: np.ndarray, quality: int = 85) -> str:
     return f"data:image/jpeg;base64,{image_b64}"
 
 
+def _extract_raw_image_payload(image: Any) -> tuple[str, bytes]:
+    if not isinstance(image, dict):
+        return "", b""
+
+    raw_bytes = image.get("raw_bytes")
+    mime_type = str(image.get("mime_type", "")).strip()
+    if not isinstance(raw_bytes, (bytes, bytearray)) or not raw_bytes:
+        return "", b""
+    if not mime_type.startswith("image/"):
+        return "", b""
+    return mime_type, bytes(raw_bytes)
+
+
+def _encode_raw_image_data_url(image: Any) -> str:
+    mime_type, raw_bytes = _extract_raw_image_payload(image)
+    if not raw_bytes:
+        return ""
+    return f"data:{mime_type};base64,{base64.b64encode(raw_bytes).decode('utf-8')}"
+
+
 def _normalize_base_url(base_url: str, api_mode: str) -> str:
     cleaned = (base_url or "").strip().rstrip("/")
     if not cleaned:
@@ -351,6 +371,18 @@ class GeminiBackend(VLMBackend):
     def _infer_native(self, images: List[np.ndarray], prompt: str) -> Dict[str, Any]:
         parts: List[Dict[str, Any]] = [{"text": prompt}]
         for image in images:
+            raw_mime_type, raw_bytes = _extract_raw_image_payload(image)
+            if raw_bytes:
+                parts.append(
+                    {
+                        "inlineData": {
+                            "mimeType": raw_mime_type,
+                            "data": base64.b64encode(raw_bytes).decode("utf-8"),
+                        }
+                    }
+                )
+                continue
+
             image_b64 = _encode_jpeg_b64(image, self.jpeg_quality)
             if image_b64:
                 parts.append(
@@ -402,7 +434,9 @@ class GeminiBackend(VLMBackend):
     def _infer_openai_compatible(self, images: List[np.ndarray], prompt: str) -> Dict[str, Any]:
         user_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
         for image in images:
-            image_url = _encode_jpeg_data_url(image, self.jpeg_quality)
+            image_url = _encode_raw_image_data_url(image)
+            if not image_url:
+                image_url = _encode_jpeg_data_url(image, self.jpeg_quality)
             if image_url:
                 user_content.append(
                     {

@@ -1,6 +1,8 @@
+import base64
 from video2tasks.server.windowing import (
     FrameExtractor,
     Window,
+    _cluster_cut_votes,
     apply_boundary_refinement_results,
     apply_deferred_segment_labels,
     build_boundary_refinement_windows,
@@ -19,12 +21,46 @@ from video2tasks.server.windowing import (
 )
 
 
+def _windowing_b64(payload: bytes) -> str:
+    return base64.b64encode(payload).decode("utf-8")
+
+
 def test_chunk_frame_ids_for_contact_sheets_preserves_order() -> None:
     assert chunk_frame_ids_for_contact_sheets(list(range(10)), 4) == [
         [0, 1, 2, 3],
         [4, 5, 6, 7],
         [8, 9],
     ]
+
+
+def test_cluster_cut_votes_limits_chain_merge_span() -> None:
+    points, support = _cluster_cut_votes(
+        [
+            (100, 1.0),
+            (120, 1.0),
+            (145, 1.0),
+            (170, 1.0),
+            (195, 1.0),
+        ],
+        fps=30.0,
+    )
+
+    assert points == [100, 145, 195]
+    assert support == {100: 2.0, 145: 2.0, 195: 1.0}
+
+
+def test_cluster_cut_votes_anchors_to_earliest_supported_frame() -> None:
+    points, support = _cluster_cut_votes(
+        [
+            (200, 0.5),
+            (202, 1.0),
+            (210, 0.25),
+        ],
+        fps=30.0,
+    )
+
+    assert points == [200]
+    assert support == {200: 1.75}
 
 
 def test_frame_extractor_contact_sheets_fall_back_to_cv2_when_ffmpeg_returns_empty(
@@ -37,14 +73,14 @@ def test_frame_extractor_contact_sheets_fall_back_to_cv2_when_ffmpeg_returns_emp
 
     def fake_ffmpeg(self, group, group_start_index, target_w, target_h, rows, cols):
         calls.append(("ffmpeg", list(group), group_start_index, rows, cols))
-        return "" if group_start_index == 0 else "ffmpeg-sheet"
+        return b"" if group_start_index == 0 else b"ffmpeg-sheet"
 
     def fake_cv2(self, group, group_start_index, target_w, target_h, compression, rows, cols):
         calls.append(("cv2", list(group), group_start_index, rows, cols))
-        return f"cv2-sheet-{group_start_index}"
+        return f"cv2-sheet-{group_start_index}".encode("utf-8")
 
-    monkeypatch.setattr(FrameExtractor, "_build_contact_sheet_b64_via_ffmpeg", fake_ffmpeg)
-    monkeypatch.setattr(FrameExtractor, "_build_contact_sheet_b64_via_cv2", fake_cv2)
+    monkeypatch.setattr(FrameExtractor, "_build_contact_sheet_png_bytes_via_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(FrameExtractor, "_build_contact_sheet_png_bytes_via_cv2", fake_cv2)
 
     sheets = extractor.get_many_b64(
         [0, 1, 2, 3, 4],
@@ -53,7 +89,7 @@ def test_frame_extractor_contact_sheets_fall_back_to_cv2_when_ffmpeg_returns_emp
         contact_sheet_cols=2,
     )
 
-    assert sheets == ["cv2-sheet-0", "ffmpeg-sheet"]
+    assert sheets == [_windowing_b64(b"cv2-sheet-0"), _windowing_b64(b"ffmpeg-sheet")]
     assert calls == [
         ("ffmpeg", [0, 1, 2, 3], 0, 2, 2),
         ("cv2", [0, 1, 2, 3], 0, 2, 2),
@@ -1952,3 +1988,37 @@ def test_apply_boundary_refinement_results_keeps_high_support_boundary_when_mode
     assert len(refined) == 2
     assert refined[0]["end_frame"] == 100
     assert refined[1]["start_frame"] == 100
+
+
+def test_build_segments_via_cuts_consumes_nonsequential_window_ids() -> None:
+    refinement_window = Window(
+        window_id=1000000,
+        start_frame=0,
+        end_frame=79,
+        frame_ids=[0, 20, 40, 60],
+    )
+
+    result = build_segments_via_cuts(
+        "demo",
+        [refinement_window],
+        {
+            1000000: {
+                "window_id": 1000000,
+                "vlm_json": {
+                    "transitions": [2],
+                    "instructions": ["Add potatoes", "Stir the pot"],
+                },
+            }
+        },
+        fps=10.0,
+        nframes=80,
+        frames_per_window=4,
+        adaptive_merge_guard=False,
+        refine_final_instructions=False,
+    )
+
+    assert len(result["segments"]) == 2
+    assert result["segments"][0]["start_frame"] == 0
+    assert result["segments"][0]["end_frame"] >= 39
+    assert result["segments"][1]["start_frame"] >= 39
+    assert result["segments"][1]["instruction"] == "Stir the pot"

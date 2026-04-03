@@ -1,3 +1,4 @@
+import base64
 import json
 import types
 
@@ -517,3 +518,101 @@ def test_gemini_backend_falls_back_to_curl_after_repeated_empty_payload(monkeypa
     }
     assert request_calls["count"] == 5
     assert curl_calls["count"] == 1
+
+
+def test_gemini_backend_uses_raw_png_payload_for_native_requests(monkeypatch) -> None:
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return DummyResponse(
+            200,
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json_module.dumps(
+                                        {
+                                            "thought": "Switch at frame 1",
+                                            "transitions": [1],
+                                            "instructions": ["Task A", "Task B"],
+                                        }
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    json_module = json
+    monkeypatch.setattr("video2tasks.vlm.gemini_api.requests.post", fake_post)
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3-flash-preview",
+        base_url="https://generativelanguage.googleapis.com/v1beta",
+    )
+
+    raw_png = b"\x89PNG\r\n\x1a\nraw-png"
+    result = backend.infer(
+        [{"raw_bytes": raw_png, "mime_type": "image/png"}],
+        "Detect switches",
+    )
+
+    assert result["transitions"] == [1]
+    parts = captured["json"]["contents"][0]["parts"]
+    assert parts[1]["inlineData"]["mimeType"] == "image/png"
+    assert base64.b64decode(parts[1]["inlineData"]["data"]) == raw_png
+
+
+def test_gemini_backend_uses_raw_png_payload_for_openai_compatible_requests(monkeypatch) -> None:
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        return DummyResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json_module.dumps(
+                                {
+                                    "thought": "No switch",
+                                    "transitions": [],
+                                    "instructions": ["Task A"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    json_module = json
+    monkeypatch.setattr("video2tasks.vlm.gemini_api.requests.post", fake_post)
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3.1-pro-preview",
+        base_url="https://api.duckcoding.ai",
+        api_mode="openai_compatible",
+    )
+
+    raw_png = b"\x89PNG\r\n\x1a\nraw-png"
+    result = backend.infer(
+        [{"raw_bytes": raw_png, "mime_type": "image/png"}],
+        "Detect switches",
+    )
+
+    assert result["instructions"] == ["Task A"]
+    user_content = captured["json"]["messages"][1]["content"]
+    assert user_content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    encoded = user_content[1]["image_url"]["url"].split(",", 1)[1]
+    assert base64.b64decode(encoded) == raw_png
