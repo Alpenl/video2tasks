@@ -148,54 +148,68 @@ def _sample_window_frame_ids(start_frame: int, end_frame: int, frames_per_window
 
 
 def _cluster_cut_votes(raw_cuts: List[Tuple[int, float]], fps: float) -> Tuple[List[int], Dict[int, float]]:
-    """Cluster nearby cut votes without allowing chain-merges to sprawl across long ranges.
+    """Cluster nearby cut votes while preserving distinct local peaks.
 
-    The boundary detector is intentionally over-segmenting. In dense action regions this can
-    produce a ladder of nearby candidate cuts. A permissive single-link cluster can chain these
-    into one overly wide cluster and shift the chosen boundary far away from the earliest true
-    onset. To preserve recall, keep clusters locally tight and anchor each cluster at its earliest
-    supported frame.
+    The boundary detector is intentionally over-segmenting. Dense action regions can produce
+    multiple candidate cuts inside one broader phase transition. For this pre-merge pass, it is
+    safer to keep distinct local peaks than to collapse them into one representative point.
+
+    The clustering rule is therefore intentionally narrow:
+    - first aggregate votes landing on the exact same frame
+    - then merge only short gaps into a micro-peak
+    - emit one representative per micro-peak
+
+    Inside one micro-peak, prefer the strongest frame (highest vote count, then highest support)
+    and use the earliest frame only as a tie-breaker. This avoids a weak early singleton dragging
+    the cluster representative away from a stronger nearby peak, while still keeping an onset bias
+    inside tightly packed votes.
     """
     if not raw_cuts:
         return [], {}
 
     safe_fps = float(fps) if fps > 1e-6 else 30.0
-    max_link_gap_frames = max(1.0, 1.0 * safe_fps)
-    max_cluster_span_frames = max(max_link_gap_frames, 1.5 * safe_fps)
+    peak_gap_frames = max(2, min(5, int(round(0.2 * safe_fps))))
 
-    sorted_cuts = sorted(raw_cuts, key=lambda item: item[0])
+    aggregated_votes: Dict[int, Dict[str, float]] = {}
+    for fid, weight in raw_cuts:
+        frame = int(fid)
+        bucket = aggregated_votes.setdefault(frame, {"count": 0.0, "support": 0.0})
+        bucket["count"] += 1.0
+        bucket["support"] += float(weight)
+
+    sorted_frames = sorted(aggregated_votes)
     clustered_points: List[int] = []
     cut_support_by_point: Dict[int, float] = {}
 
     cur_frames: List[int] = []
-    cur_weights: List[float] = []
 
     def flush_cluster() -> None:
         if not cur_frames:
             return
-        point = int(min(cur_frames))
-        cluster_support = float(sum(cur_weights))
+        point = min(
+            cur_frames,
+            key=lambda frame: (
+                -aggregated_votes[frame]["count"],
+                -aggregated_votes[frame]["support"],
+                frame,
+            ),
+        )
+        cluster_support = float(sum(aggregated_votes[frame]["support"] for frame in cur_frames))
         clustered_points.append(point)
         cut_support_by_point[point] = max(cut_support_by_point.get(point, 0.0), cluster_support)
 
-    for fid, weight in sorted_cuts:
+    for fid in sorted_frames:
         if not cur_frames:
             cur_frames.append(int(fid))
-            cur_weights.append(float(weight))
             continue
 
         prev_fid = cur_frames[-1]
-        cluster_start = cur_frames[0]
-        within_link_gap = (fid - prev_fid) < max_link_gap_frames
-        within_cluster_span = (fid - cluster_start) < max_cluster_span_frames
-        if within_link_gap and within_cluster_span:
+        if (fid - prev_fid) <= peak_gap_frames:
             cur_frames.append(int(fid))
-            cur_weights.append(float(weight))
             continue
 
         flush_cluster()
         cur_frames = [int(fid)]
-        cur_weights = [float(weight)]
 
     flush_cluster()
     return clustered_points, cut_support_by_point
@@ -2262,15 +2276,53 @@ def build_segments_via_cuts(
         # for a boundary. Require corroboration from overlapping windows before
         # promoting an interior cut into the final segmentation.
         min_cluster_support = max(1.0, float(np.max(center_weights))) + 1e-6
-        final_cut_points = (
-            [0]
-            + [
-                point
-                for point in final_cut_points[1:-1]
-                if float(cut_support_by_point.get(point, 0.0)) >= min_cluster_support
-            ]
-            + [nframes]
-        )
+        corroboration_gap_frames = max(1, int(round(fps)))
+        interior_points = sorted(int(point) for point in final_cut_points[1:-1])
+        corroborated_support_by_point: dict[int, float] = {}
+        corroborated_points: List[int] = []
+
+        for point in interior_points:
+            neighborhood_support = float(
+                sum(
+                    float(cut_support_by_point.get(other, 0.0))
+                    for other in interior_points
+                    if abs(other - point) <= corroboration_gap_frames
+                )
+            )
+            if neighborhood_support >= min_cluster_support:
+                corroborated_points.append(point)
+                corroborated_support_by_point[point] = neighborhood_support
+
+        merged_probe_points: List[int] = []
+        if corroborated_points:
+            cur_probe_cluster: List[int] = []
+
+            def flush_probe_cluster() -> None:
+                if not cur_probe_cluster:
+                    return
+                representative = min(
+                    cur_probe_cluster,
+                    key=lambda point: (
+                        -corroborated_support_by_point.get(point, 0.0),
+                        point,
+                    ),
+                )
+                merged_probe_points.append(representative)
+
+            for point in sorted(set(corroborated_points)):
+                if not cur_probe_cluster or (point - cur_probe_cluster[-1]) <= corroboration_gap_frames:
+                    cur_probe_cluster.append(point)
+                    continue
+                flush_probe_cluster()
+                cur_probe_cluster = [point]
+
+            flush_probe_cluster()
+
+        final_cut_points = [0] + merged_probe_points + [nframes]
+        cut_support_by_point = {
+            point: float(corroborated_support_by_point.get(point, cut_support_by_point.get(point, 0.0)))
+            for point in merged_probe_points
+        }
     
     # Build segments
     raw_segments = []

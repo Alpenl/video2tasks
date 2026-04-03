@@ -33,7 +33,7 @@ def test_chunk_frame_ids_for_contact_sheets_preserves_order() -> None:
     ]
 
 
-def test_cluster_cut_votes_limits_chain_merge_span() -> None:
+def test_cluster_cut_votes_preserves_distinct_local_peaks() -> None:
     points, support = _cluster_cut_votes(
         [
             (100, 1.0),
@@ -45,22 +45,36 @@ def test_cluster_cut_votes_limits_chain_merge_span() -> None:
         fps=30.0,
     )
 
-    assert points == [100, 145, 195]
-    assert support == {100: 2.0, 145: 2.0, 195: 1.0}
+    assert points == [100, 120, 145, 170, 195]
+    assert support == {100: 1.0, 120: 1.0, 145: 1.0, 170: 1.0, 195: 1.0}
 
 
-def test_cluster_cut_votes_anchors_to_earliest_supported_frame() -> None:
+def test_cluster_cut_votes_selects_strongest_frame_within_micro_peak() -> None:
     points, support = _cluster_cut_votes(
         [
             (200, 0.5),
             (202, 1.0),
-            (210, 0.25),
+            (204, 0.25),
+            (212, 0.75),
         ],
         fps=30.0,
     )
 
-    assert points == [200]
-    assert support == {200: 1.75}
+    assert points == [202, 212]
+    assert support == {202: 1.75, 212: 0.75}
+
+
+def test_cluster_cut_votes_keeps_two_candidates_when_gap_exceeds_micro_peak_width() -> None:
+    points, support = _cluster_cut_votes(
+        [
+            (1089, 0.99),
+            (1111, 0.08),
+        ],
+        fps=30.0,
+    )
+
+    assert points == [1089, 1111]
+    assert support == {1089: 0.99, 1111: 0.08}
 
 
 def test_frame_extractor_contact_sheets_fall_back_to_cv2_when_ffmpeg_returns_empty(
