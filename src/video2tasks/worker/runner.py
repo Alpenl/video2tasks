@@ -19,7 +19,7 @@ from ..prompt import (
     prompt_switch_detection,
 )
 
-MAX_LOCAL_RETRIES = 2
+MAX_LOCAL_RETRIES = 4
 MAX_CONNECTION_RETRIES = 30
 MAX_SHUTDOWN_RETRIES = 3
 
@@ -196,6 +196,10 @@ def run_worker(config: Config) -> None:
                         f"[Warn] {task_id} Empty VLM JSON "
                         f"(attempt {attempt + 1}/{MAX_LOCAL_RETRIES})"
                     )
+                    if attempt + 1 < MAX_LOCAL_RETRIES:
+                        delay_s = float(min(2 * (attempt + 1), 8))
+                        print(f"[Worker] Sleeping {delay_s:.1f}s before local retry")
+                        time.sleep(delay_s)
                 
                 if _is_empty_vlm_json(vlm_json):
                     print(f"[Fail] {task_id} Returning empty to trigger server retry")

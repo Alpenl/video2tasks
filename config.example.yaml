@@ -18,13 +18,13 @@ server:
   port: 8099
   max_queue: 32
   inflight_timeout_sec: 300.0
-  max_retries_per_job: 5
+  max_retries_per_job: 50
   auto_exit_after_all_done: false
 
 # Worker configuration
 worker:
   server_url: "http://127.0.0.1:8099"
-  backend: "dummy"  # Options: "dummy", "qwen3vl", "remote_api", "openai"
+  backend: "dummy"  # Options: "dummy", "qwen3vl", "remote_api", "openai", "gemini"
   
   # Qwen3VL-specific settings (only used when backend: qwen3vl)
   qwen3vl:
@@ -51,14 +51,28 @@ worker:
     max_output_tokens: 512
     jpeg_quality: 85
 
+  # Gemini-compatible API settings (only used when backend: gemini)
+  # api_key can also be provided via GEMINI_API_KEY
+  gemini:
+    api_key: ""
+    model: "gemini-3.1-pro-preview"
+    api_mode: "openai_compatible"
+    base_url: "https://api.duckcoding.ai"
+    timeout_sec: 60.0
+    max_output_tokens: 2048
+    jpeg_quality: 85
+
 # Windowing configuration
 windowing:
   window_sec: 12.0        # Window duration in seconds
   step_sec: 6.0           # Step size between windows
-  frames_per_window: 24   # Number of frames to sample per window
+  frames_per_window: 128  # Number of logical frames to sample per window
   target_width: 720      # Target frame width
   target_height: 480     # Target frame height
   png_compression: 0     # PNG compression level (0-9)
+  use_contact_sheets: true   # Pack multiple logical frames into each uploaded image
+  contact_sheet_rows: 4      # 4 rows per uploaded contact sheet
+  contact_sheet_cols: 4      # 4 columns per uploaded contact sheet
 
 # Progress configuration
 progress:

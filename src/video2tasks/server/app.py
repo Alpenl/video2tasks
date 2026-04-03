@@ -69,6 +69,21 @@ def parse_datasets(config: Config) -> List[DatasetCtx]:
     return ctxs
 
 
+def _requeue_empty_result(
+    job_queue: List[Dict[str, Any]],
+    retry_counts: Dict[str, int],
+    task_id: str,
+    job: Optional[Dict[str, Any]],
+) -> int:
+    if not job:
+        return 0
+
+    retry_counts[task_id] = retry_counts.get(task_id, 0) + 1
+    attempt = retry_counts[task_id]
+    job_queue.append(job)
+    return attempt
+
+
 def create_app(config: Config) -> FastAPI:
     """Create and configure FastAPI application."""
     app = FastAPI(title="Video2Tasks Server")
@@ -170,13 +185,12 @@ def create_app(config: Config) -> FastAPI:
         if not res.vlm_json:
             if job_info:
                 with queue_lock:
-                    retry_counts[tid] = retry_counts.get(tid, 0) + 1
-                    if retry_counts[tid] <= config.server.max_retries_per_job:
-                        job_queue.insert(0, job_info["job"])
-                        print(f"[Warn] Task {tid} empty, re-queueing (attempt {retry_counts[tid]})")
-                    else:
-                        print(f"[Err] Task {tid} failed max retries, dropping")
+                    attempt = _requeue_empty_result(job_queue, retry_counts, tid, job_info["job"])
+                    print(f"[Warn] Task {tid} empty, re-queueing to tail (attempt {attempt})")
             return {"status": "retry_triggered"}
+
+        with queue_lock:
+            retry_counts.pop(tid, None)
         
         subset = str(res.meta.get("subset", dataset_ctxs[0].subset if dataset_ctxs else "default"))
         sid = str(res.meta.get("sample_id", "unknown"))

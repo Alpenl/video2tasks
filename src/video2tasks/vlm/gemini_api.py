@@ -4,6 +4,7 @@ import json
 import os
 import time
 import subprocess
+from urllib.parse import urlsplit, urlunsplit
 
 import cv2
 import numpy as np
@@ -31,6 +32,19 @@ def _encode_jpeg_data_url(img_bgr: np.ndarray, quality: int = 85) -> str:
     if not image_b64:
         return ""
     return f"data:image/jpeg;base64,{image_b64}"
+
+
+def _normalize_base_url(base_url: str, api_mode: str) -> str:
+    cleaned = (base_url or "").strip().rstrip("/")
+    if not cleaned:
+        return cleaned
+
+    parts = urlsplit(cleaned)
+    path = parts.path.rstrip("/")
+    if not path:
+        path = "/v1" if api_mode == "openai_compatible" else "/v1beta"
+
+    return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment)).rstrip("/")
 
 
 def _extract_json(text: str) -> Dict[str, Any]:
@@ -203,6 +217,14 @@ def _post_json_via_curl(url: str, headers: Dict[str, str], payload: Dict[str, An
     return status_code, body
 
 
+def _parse_structured_response_text(response_text: str, extractor) -> Dict[str, Any]:
+    try:
+        data = json.loads(response_text)
+    except json.JSONDecodeError:
+        data = {}
+    return _normalize_vlm_json(extractor(data))
+
+
 def _collect_openai_text_candidates(value: Any, candidates: List[str]) -> None:
     if isinstance(value, str):
         candidates.append(value)
@@ -263,7 +285,7 @@ class GeminiBackend(VLMBackend):
 
         self.model = model
         self.api_mode = api_mode
-        self.base_url = base_url.rstrip("/")
+        self.base_url = _normalize_base_url(base_url, api_mode)
         self.timeout_sec = float(timeout_sec)
         self.max_output_tokens = int(max_output_tokens)
         self.jpeg_quality = int(jpeg_quality)
@@ -285,19 +307,14 @@ class GeminiBackend(VLMBackend):
         payload: Dict[str, Any],
         extractor,
     ) -> Dict[str, Any]:
-        max_payload_attempts = 3
+        max_payload_attempts = 5
         for attempt in range(1, max_payload_attempts + 1):
             status_code, response_text = _post_json(url, headers, payload, self.timeout_sec)
             if status_code != 200:
                 print(f"[Gemini] Error: status={status_code}")
                 return {}
 
-            try:
-                data = json.loads(response_text)
-            except json.JSONDecodeError:
-                data = {}
-
-            parsed = _normalize_vlm_json(extractor(data))
+            parsed = _parse_structured_response_text(response_text, extractor)
             if parsed:
                 return parsed
 
@@ -306,6 +323,26 @@ class GeminiBackend(VLMBackend):
                 print(
                     f"[Gemini] Empty structured payload; sleeping {delay_s:.1f}s "
                     f"before retry {attempt + 1}/{max_payload_attempts}"
+                )
+                time.sleep(delay_s)
+
+        max_curl_payload_attempts = 2
+        print("[Gemini] Falling back to curl after repeated empty structured payload")
+        for attempt in range(1, max_curl_payload_attempts + 1):
+            status_code, response_text = _post_json_via_curl(url, headers, payload, self.timeout_sec)
+            if status_code != 200:
+                print(f"[Gemini] curl fallback error: status={status_code}")
+                return {}
+
+            parsed = _parse_structured_response_text(response_text, extractor)
+            if parsed:
+                return parsed
+
+            if attempt < max_curl_payload_attempts:
+                delay_s = float(min(2 * attempt, 8))
+                print(
+                    f"[Gemini] curl fallback still empty; sleeping {delay_s:.1f}s "
+                    f"before retry {attempt + 1}/{max_curl_payload_attempts}"
                 )
                 time.sleep(delay_s)
 
@@ -352,6 +389,7 @@ class GeminiBackend(VLMBackend):
         headers = {
             "Content-Type": "application/json",
             "x-goog-api-key": self.api_key,
+            "Connection": "close",
         }
 
         return self._request_with_payload_retries(
@@ -399,6 +437,7 @@ class GeminiBackend(VLMBackend):
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "Connection": "close",
         }
 
         return self._request_with_payload_retries(

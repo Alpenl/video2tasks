@@ -170,6 +170,97 @@ def test_gemini_backend_supports_openai_compatible_chat_endpoint(monkeypatch) ->
     assert user_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
 
 
+def test_gemini_backend_normalizes_bare_openai_compatible_base_url(monkeypatch) -> None:
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        return DummyResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json_module.dumps(
+                                {
+                                    "thought": "No switch",
+                                    "transitions": [],
+                                    "instructions": ["Task A"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    json_module = json
+    monkeypatch.setattr("video2tasks.vlm.gemini_api.requests.post", fake_post)
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3.1-pro-preview",
+        base_url="https://api.duckcoding.ai",
+        api_mode="openai_compatible",
+        timeout_sec=10.0,
+        max_output_tokens=123,
+    )
+
+    backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
+
+    assert captured["url"] == "https://api.duckcoding.ai/v1/chat/completions"
+
+
+def test_gemini_backend_normalizes_bare_native_base_url(monkeypatch) -> None:
+    captured = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["url"] = url
+        return DummyResponse(
+            200,
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": json_module.dumps(
+                                        {
+                                            "thought": "Switch at frame 2",
+                                            "transitions": [2],
+                                            "instructions": ["Task A", "Task B"],
+                                        }
+                                    )
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+        )
+
+    json_module = json
+    monkeypatch.setattr("video2tasks.vlm.gemini_api.requests.post", fake_post)
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3-flash-preview",
+        base_url="https://generativelanguage.googleapis.com",
+        api_mode="native",
+        timeout_sec=15.0,
+        max_output_tokens=256,
+    )
+
+    backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
+
+    assert captured["url"] == (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-3-flash-preview:generateContent"
+    )
+
+
 def test_gemini_openai_compatible_falls_back_to_reasoning_content(monkeypatch) -> None:
     json_module = json
 
@@ -367,3 +458,62 @@ def test_gemini_backend_retries_openai_compatible_after_empty_payload(monkeypatc
         "instructions": ["Task A", "Task B"],
     }
     assert calls["count"] == 2
+
+
+def test_gemini_backend_falls_back_to_curl_after_repeated_empty_payload(monkeypatch) -> None:
+    json_module = json
+    request_calls = {"count": 0}
+    curl_calls = {"count": 0}
+
+    def fake_post_json(url, headers, payload, timeout_sec):
+        request_calls["count"] += 1
+        return 200, json_module.dumps({"choices": [{"message": {"content": ""}}]})
+
+    def fake_post_json_via_curl(url, headers, payload, timeout_sec):
+        curl_calls["count"] += 1
+        return 200, json_module.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json_module.dumps(
+                                {
+                                    "thought": "Recovered via curl fallback",
+                                    "transitions": [4],
+                                    "instructions": ["Task A", "Task B"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr(gemini_api_module, "_post_json", fake_post_json)
+    monkeypatch.setattr(gemini_api_module, "_post_json_via_curl", fake_post_json_via_curl)
+    monkeypatch.setattr(
+        gemini_api_module,
+        "time",
+        types.SimpleNamespace(sleep=lambda _sec: None),
+        raising=False,
+    )
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3.1-pro-preview",
+        base_url="https://api.duckcoding.ai",
+        api_mode="openai_compatible",
+        timeout_sec=10.0,
+        max_output_tokens=2048,
+    )
+
+    result = backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
+
+    assert result == {
+        "thought": "Recovered via curl fallback",
+        "transitions": [4],
+        "instructions": ["Task A", "Task B"],
+    }
+    assert request_calls["count"] == 5
+    assert curl_calls["count"] == 1

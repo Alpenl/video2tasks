@@ -21,7 +21,7 @@ env/
 # Logs
 *.log
 logs/
-
+bak/
 # Video/Data artifacts
 *.mp4
 *.avi
