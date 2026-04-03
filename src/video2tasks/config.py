@@ -100,6 +100,7 @@ class GeminiConfig(BaseModel):
 
 class WorkerConfig(BaseModel):
     """Worker configuration."""
+    count: int = Field(default=7, ge=1, description="Number of worker processes")
     server_url: str = Field(default="http://127.0.0.1:8099", description="Server URL")
     backend: str = Field(default="dummy", description="VLM backend type")
     qwen3vl: Qwen3VLConfig = Field(default_factory=Qwen3VLConfig)
@@ -281,6 +282,8 @@ def _apply_env_overrides(config: Config) -> None:
         config.server.max_empty_retries_per_job = int(os.environ["MAX_EMPTY_RETRIES_PER_JOB"])
     if "SERVER_URL" in os.environ:
         config.worker.server_url = os.environ["SERVER_URL"]
+    if "WORKER_COUNT" in os.environ:
+        config.worker.count = int(os.environ["WORKER_COUNT"])
     if "MODEL_PATH" in os.environ:
         config.worker.qwen3vl.model_path = os.environ["MODEL_PATH"]
     if "BACKEND" in os.environ:

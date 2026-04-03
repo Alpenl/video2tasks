@@ -46,6 +46,20 @@ def test_config_reads_openai_values_from_environment(monkeypatch) -> None:
     assert cfg.worker.openai.timeout_sec == 42.0
 
 
+def test_worker_count_defaults_to_seven() -> None:
+    cfg = Config()
+
+    assert cfg.worker.count == 7
+
+
+def test_config_reads_worker_count_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("WORKER_COUNT", "3")
+
+    cfg = Config.from_env()
+
+    assert cfg.worker.count == 3
+
+
 def test_config_reads_gemini_values_from_environment(monkeypatch) -> None:
     monkeypatch.setenv("BACKEND", "gemini")
     monkeypatch.setenv("GEMINI_API_KEY", "gem-test")

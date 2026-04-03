@@ -259,6 +259,13 @@ vim config.yaml  # or your preferred editor
 
 ### Running
 
+**One command (recommended) - Start server + configured workers:**
+```bash
+v2t-cluster --config config.yaml
+```
+
+`worker.count` controls how many worker processes are launched (default: `7`).
+
 **Terminal 1 - Start the Server:**
 ```bash
 v2t-server --config config.yaml
@@ -282,7 +289,7 @@ See [`config.example.yaml`](config.example.yaml) for all available options:
 | `datasets` | Video dataset paths and subsets |
 | `run` | Output directory configuration |
 | `server` | Host, port, and queue settings |
-| `worker` | VLM backend selection and model paths |
+| `worker` | Worker count, VLM backend selection and model paths |
 | `windowing` | Frame sampling parameters |
 
 ---
@@ -295,6 +302,7 @@ Lightweight backend for testing and Windows/CPU environments. Returns mock resul
 
 ```yaml
 worker:
+  count: 7
   backend: dummy
 ```
 
