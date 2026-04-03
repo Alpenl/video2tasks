@@ -13,7 +13,11 @@ from PIL import Image
 
 from ..config import Config
 from ..vlm import create_backend
-from ..prompt import prompt_switch_detection
+from ..prompt import (
+    prompt_boundary_refinement,
+    prompt_segment_instruction,
+    prompt_switch_detection,
+)
 
 MAX_LOCAL_RETRIES = 2
 MAX_CONNECTION_RETRIES = 30
@@ -136,6 +140,11 @@ def run_worker(config: Config) -> None:
                     time.sleep(1)
                     continue
                 task_id = job.get("task_id", "unknown")
+                meta = job.get("meta", {})
+                job_type = str(meta.get("job_type", "window_boundary"))
+                logical_frame_count = len(meta.get("frame_ids", [])) or len(job.get("images", []))
+                contact_sheet_rows = int(meta.get("contact_sheet_rows", 0) or 0)
+                contact_sheet_cols = int(meta.get("contact_sheet_cols", 0) or 0)
                 
                 # Decode images
                 images_b64 = job.get("images", [])
@@ -149,7 +158,28 @@ def run_worker(config: Config) -> None:
                         images.append(np.zeros((224, 224, 3), dtype=np.uint8))
                 
                 # Run inference with proper prompt (local retry on empty output)
-                prompt = prompt_switch_detection(len(images))
+                if job_type == "segment_label":
+                    prompt = prompt_segment_instruction(
+                        logical_frame_count,
+                        contact_sheet_rows=contact_sheet_rows,
+                        contact_sheet_cols=contact_sheet_cols,
+                        sheet_count=(len(images) if contact_sheet_rows > 0 and contact_sheet_cols > 0 else 0),
+                    )
+                elif job_type == "boundary_refinement":
+                    prompt = prompt_boundary_refinement(
+                        logical_frame_count,
+                        contact_sheet_rows=contact_sheet_rows,
+                        contact_sheet_cols=contact_sheet_cols,
+                        sheet_count=(len(images) if contact_sheet_rows > 0 and contact_sheet_cols > 0 else 0),
+                    )
+                else:
+                    prompt = prompt_switch_detection(
+                        logical_frame_count,
+                        mode=config.windowing.boundary_prompt_mode,
+                        contact_sheet_rows=contact_sheet_rows,
+                        contact_sheet_cols=contact_sheet_cols,
+                        sheet_count=(len(images) if contact_sheet_rows > 0 and contact_sheet_cols > 0 else 0),
+                    )
                 vlm_json: Dict[str, Any] = {}
                 
                 for attempt in range(MAX_LOCAL_RETRIES):
@@ -170,7 +200,9 @@ def run_worker(config: Config) -> None:
                 if _is_empty_vlm_json(vlm_json):
                     print(f"[Fail] {task_id} Returning empty to trigger server retry")
                 else:
-                    print(f"[Done] {task_id} ({len(images)}f) -> Cuts: {vlm_json.get('transitions', [])}")
+                    print(
+                        f"[Done] {task_id} ({logical_frame_count}logical/{len(images)}img) -> Cuts: {vlm_json.get('transitions', [])}"
+                    )
                 
                 # Submit result
                 requests.post(

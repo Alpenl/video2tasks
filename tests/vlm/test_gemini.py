@@ -1,8 +1,11 @@
 import json
+import types
 
 import numpy as np
+import requests
 
 from video2tasks.vlm.factory import create_backend
+import video2tasks.vlm.gemini_api as gemini_api_module
 
 
 class DummyResponse:
@@ -51,7 +54,7 @@ def test_gemini_backend_posts_images_and_parses_structured_response(monkeypatch)
     backend = create_backend(
         "gemini",
         api_key="gem-test",
-        model="gemini-2.5-flash-lite",
+        model="gemini-3-flash-preview",
         base_url="https://generativelanguage.googleapis.com/v1beta",
         timeout_sec=15.0,
         max_output_tokens=256,
@@ -73,7 +76,7 @@ def test_gemini_backend_posts_images_and_parses_structured_response(monkeypatch)
     }
     assert captured["url"] == (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        "gemini-2.5-flash-lite:generateContent"
+        "gemini-3-flash-preview:generateContent"
     )
     assert captured["headers"]["x-goog-api-key"] == "gem-test"
     assert captured["timeout"] == 15.0
@@ -99,7 +102,7 @@ def test_gemini_backend_returns_empty_dict_on_unparseable_response(monkeypatch) 
     backend = create_backend(
         "gemini",
         api_key="gem-test",
-        model="gemini-2.5-flash-lite",
+        model="gemini-3-flash-preview",
     )
 
     result = backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
@@ -140,7 +143,7 @@ def test_gemini_backend_supports_openai_compatible_chat_endpoint(monkeypatch) ->
     backend = create_backend(
         "gemini",
         api_key="gem-test",
-        model="gemini-2.5-flash-lite",
+        model="gemini-3-flash-preview",
         base_url="https://api.laozhang.ai/v1",
         api_mode="openai_compatible",
         timeout_sec=10.0,
@@ -157,7 +160,7 @@ def test_gemini_backend_supports_openai_compatible_chat_endpoint(monkeypatch) ->
     }
     assert captured["url"] == "https://api.laozhang.ai/v1/chat/completions"
     assert captured["headers"]["Authorization"] == "Bearer gem-test"
-    assert captured["json"]["model"] == "gemini-2.5-flash-lite"
+    assert captured["json"]["model"] == "gemini-3-flash-preview"
     assert captured["json"]["max_tokens"] == 123
     assert captured["json"]["messages"][0]["role"] == "system"
     assert "JSON" in captured["json"]["messages"][0]["content"]
@@ -165,6 +168,51 @@ def test_gemini_backend_supports_openai_compatible_chat_endpoint(monkeypatch) ->
     assert user_content[0] == {"type": "text", "text": "Detect switches"}
     assert user_content[1]["type"] == "image_url"
     assert user_content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,")
+
+
+def test_gemini_openai_compatible_falls_back_to_reasoning_content(monkeypatch) -> None:
+    json_module = json
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return DummyResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "",
+                            "reasoning_content": json_module.dumps(
+                                {
+                                    "thought": "Recovered from reasoning",
+                                    "transitions": [3],
+                                    "instructions": ["Task A", "Task B"],
+                                }
+                            ),
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr("video2tasks.vlm.gemini_api.requests.post", fake_post)
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3.1-pro-preview",
+        base_url="https://api.duckcoding.ai/v1",
+        api_mode="openai_compatible",
+        timeout_sec=10.0,
+        max_output_tokens=256,
+    )
+
+    result = backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
+
+    assert result == {
+        "thought": "Recovered from reasoning",
+        "transitions": [3],
+        "instructions": ["Task A", "Task B"],
+    }
 
 
 def test_gemini_backend_wraps_single_instruction_string(monkeypatch) -> None:
@@ -195,7 +243,7 @@ def test_gemini_backend_wraps_single_instruction_string(monkeypatch) -> None:
     backend = create_backend(
         "gemini",
         api_key="gem-test",
-        model="gemini-2.5-flash-lite",
+        model="gemini-3-flash-preview",
         base_url="https://api.laozhang.ai/v1",
         api_mode="openai_compatible",
         timeout_sec=10.0,
@@ -209,3 +257,113 @@ def test_gemini_backend_wraps_single_instruction_string(monkeypatch) -> None:
         "transitions": [],
         "instructions": ["Task A"],
     }
+
+
+def test_gemini_backend_retries_openai_compatible_after_request_exception(monkeypatch) -> None:
+    calls = {"count": 0}
+    json_module = json
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise requests.exceptions.SSLError("EOF during TLS read")
+        return DummyResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json_module.dumps(
+                                {
+                                    "thought": "Recovered on retry",
+                                    "transitions": [],
+                                    "instructions": ["Task A"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr("video2tasks.vlm.gemini_api.requests.post", fake_post)
+    monkeypatch.setattr(
+        gemini_api_module,
+        "time",
+        types.SimpleNamespace(sleep=lambda _sec: None),
+        raising=False,
+    )
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3-flash-preview",
+        base_url="https://www.duckcoding.ai/v1",
+        api_mode="openai_compatible",
+        timeout_sec=10.0,
+        max_output_tokens=2048,
+    )
+
+    result = backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
+
+    assert result == {
+        "thought": "Recovered on retry",
+        "transitions": [],
+        "instructions": ["Task A"],
+    }
+    assert calls["count"] == 2
+
+
+def test_gemini_backend_retries_openai_compatible_after_empty_payload(monkeypatch) -> None:
+    calls = {"count": 0}
+    json_module = json
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            return DummyResponse(200, {"choices": [{"message": {"content": "```json\n{\n"}}]})
+        return DummyResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json_module.dumps(
+                                {
+                                    "thought": "Recovered after empty payload",
+                                    "transitions": [3],
+                                    "instructions": ["Task A", "Task B"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr("video2tasks.vlm.gemini_api.requests.post", fake_post)
+    monkeypatch.setattr(
+        gemini_api_module,
+        "time",
+        types.SimpleNamespace(sleep=lambda _sec: None),
+        raising=False,
+    )
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3-flash-preview",
+        base_url="https://www.duckcoding.ai/v1",
+        api_mode="openai_compatible",
+        timeout_sec=10.0,
+        max_output_tokens=2048,
+    )
+
+    result = backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
+
+    assert result == {
+        "thought": "Recovered after empty payload",
+        "transitions": [3],
+        "instructions": ["Task A", "Task B"],
+    }
+    assert calls["count"] == 2

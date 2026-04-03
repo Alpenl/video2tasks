@@ -117,9 +117,83 @@ class WindowingConfig(BaseModel):
     window_sec: float = Field(default=12.0, description="Window duration in seconds")
     step_sec: float = Field(default=6.0, description="Step size in seconds")
     frames_per_window: int = Field(default=24, description="Frames per window")
+    boundary_prompt_mode: str = Field(
+        default="freeform",
+        description="Boundary prompting mode: whole-window freeform output or center-focused local boundary judgment",
+    )
+    segment_labeling_mode: str = Field(
+        default="inline",
+        description="Final segment labeling mode: keep inline window-derived labels or defer to a second labeling pass after boundaries are finalized",
+    )
+    enable_refinement_pass: bool = Field(
+        default=False,
+        description="Run a selective second pass on ambiguous windows using shorter refinement subwindows",
+    )
+    enable_boundary_refinement: bool = Field(
+        default=False,
+        description="Run a local second pass around provisional boundaries to refine their positions",
+    )
+    boundary_refinement_window_sec: float = Field(
+        default=4.0,
+        description="Short clip duration in seconds for local boundary refinement",
+    )
+    boundary_refinement_frames_per_window: int = Field(
+        default=0,
+        description="Frames per local boundary refinement clip (0 = reuse frames_per_window)",
+    )
+    boundary_refinement_abstain_merge_max_support: float = Field(
+        default=-1.0,
+        description="If >= 0, allow boundary refinement abstentions to merge adjacent segments only when the coarse boundary support is at or below this value",
+    )
+    refinement_frames_per_window: int = Field(
+        default=0,
+        description="Frames per refinement window (0 = reuse frames_per_window)",
+    )
     target_width: int = Field(default=720, description="Target frame width")
     target_height: int = Field(default=480, description="Target frame height")
     png_compression: int = Field(default=0, description="PNG compression level (0-9)")
+    use_contact_sheets: bool = Field(
+        default=False,
+        description="Pack multiple logical frames into each uploaded image before VLM inference",
+    )
+    contact_sheet_rows: int = Field(default=4, description="Rows per uploaded contact sheet")
+    contact_sheet_cols: int = Field(default=4, description="Columns per uploaded contact sheet")
+    adaptive_merge_guard: bool = Field(
+        default=True,
+        description="Fallback to a lighter cleanup pass when semantic merging collapses segments too aggressively",
+    )
+    adaptive_merge_min_segments: int = Field(
+        default=8,
+        description="Minimum pre-merge segment count before adaptive merge guard can trigger",
+    )
+    adaptive_merge_collapse_ratio: float = Field(
+        default=0.6,
+        description="Trigger fallback when merged segment count drops below this fraction of the light-cleaned count",
+    )
+    boundary_support_threshold: float = Field(
+        default=0.9,
+        description="Treat clustered cut support at or above this value as a strong boundary when adaptive local merge decisions are available",
+    )
+    refine_final_instructions: bool = Field(
+        default=True,
+        description="Refine final segment instructions from contributing sub-segment instructions",
+    )
+
+    @field_validator("boundary_prompt_mode")
+    @classmethod
+    def validate_boundary_prompt_mode(cls, v: str) -> str:
+        allowed = ["freeform", "center_scan", "multi_probe_scan", "candidate_scan"]
+        if v not in allowed:
+            raise ValueError(f"boundary_prompt_mode must be one of {allowed}, got {v}")
+        return v
+
+    @field_validator("segment_labeling_mode")
+    @classmethod
+    def validate_segment_labeling_mode(cls, v: str) -> str:
+        allowed = ["inline", "deferred"]
+        if v not in allowed:
+            raise ValueError(f"segment_labeling_mode must be one of {allowed}, got {v}")
+        return v
 
 
 class ProgressConfig(BaseModel):
@@ -161,73 +235,15 @@ class Config(BaseModel):
         with open(path, "r", encoding="utf-8") as f:
             data = yaml.safe_load(f)
         
-        return cls(**data)
+        config = cls(**data)
+        _apply_env_overrides(config)
+        return config
     
     @classmethod
     def from_env(cls) -> "Config":
         """Load configuration from environment variables."""
         config = cls()
-        
-        # Override with env vars if present
-        if "DATASETS" in os.environ:
-            config.datasets = _parse_datasets_env(os.environ["DATASETS"])
-        if "RUN_BASE" in os.environ:
-            config.run.base_dir = os.environ["RUN_BASE"]
-        if "RUN_ID" in os.environ:
-            config.run.run_id = os.environ["RUN_ID"]
-        if "PORT" in os.environ:
-            config.server.port = int(os.environ["PORT"])
-        if "SERVER_URL" in os.environ:
-            config.worker.server_url = os.environ["SERVER_URL"]
-        if "MODEL_PATH" in os.environ:
-            config.worker.qwen3vl.model_path = os.environ["MODEL_PATH"]
-        if "BACKEND" in os.environ:
-            config.worker.backend = os.environ["BACKEND"]
-        if "REMOTE_API_URL" in os.environ:
-            config.worker.remote_api.api_url = os.environ["REMOTE_API_URL"]
-        if "REMOTE_API_KEY" in os.environ:
-            config.worker.remote_api.api_key = os.environ["REMOTE_API_KEY"]
-        if "REMOTE_API_TIMEOUT" in os.environ:
-            config.worker.remote_api.timeout_sec = float(os.environ["REMOTE_API_TIMEOUT"])
-        if "REMOTE_API_HEADERS" in os.environ:
-            headers_raw = os.environ["REMOTE_API_HEADERS"]
-            headers = json.loads(headers_raw)
-            if not isinstance(headers, dict):
-                raise ValueError("REMOTE_API_HEADERS must be a JSON object")
-            config.worker.remote_api.headers = headers
-        if "OPENAI_API_KEY" in os.environ:
-            config.worker.openai.api_key = os.environ["OPENAI_API_KEY"]
-        if "OPENAI_MODEL" in os.environ:
-            config.worker.openai.model = os.environ["OPENAI_MODEL"]
-        if "OPENAI_BASE_URL" in os.environ:
-            config.worker.openai.base_url = os.environ["OPENAI_BASE_URL"]
-        if "OPENAI_TIMEOUT" in os.environ:
-            config.worker.openai.timeout_sec = float(os.environ["OPENAI_TIMEOUT"])
-        if "OPENAI_ORGANIZATION" in os.environ:
-            config.worker.openai.organization = os.environ["OPENAI_ORGANIZATION"]
-        if "OPENAI_PROJECT" in os.environ:
-            config.worker.openai.project = os.environ["OPENAI_PROJECT"]
-        if "OPENAI_REASONING_EFFORT" in os.environ:
-            config.worker.openai.reasoning_effort = os.environ["OPENAI_REASONING_EFFORT"]
-        if "OPENAI_MAX_OUTPUT_TOKENS" in os.environ:
-            config.worker.openai.max_output_tokens = int(os.environ["OPENAI_MAX_OUTPUT_TOKENS"])
-        if "OPENAI_JPEG_QUALITY" in os.environ:
-            config.worker.openai.jpeg_quality = int(os.environ["OPENAI_JPEG_QUALITY"])
-        if "GEMINI_API_KEY" in os.environ:
-            config.worker.gemini.api_key = os.environ["GEMINI_API_KEY"]
-        if "GEMINI_MODEL" in os.environ:
-            config.worker.gemini.model = os.environ["GEMINI_MODEL"]
-        if "GEMINI_API_MODE" in os.environ:
-            config.worker.gemini.api_mode = os.environ["GEMINI_API_MODE"]
-        if "GEMINI_BASE_URL" in os.environ:
-            config.worker.gemini.base_url = os.environ["GEMINI_BASE_URL"]
-        if "GEMINI_TIMEOUT" in os.environ:
-            config.worker.gemini.timeout_sec = float(os.environ["GEMINI_TIMEOUT"])
-        if "GEMINI_MAX_OUTPUT_TOKENS" in os.environ:
-            config.worker.gemini.max_output_tokens = int(os.environ["GEMINI_MAX_OUTPUT_TOKENS"])
-        if "GEMINI_JPEG_QUALITY" in os.environ:
-            config.worker.gemini.jpeg_quality = int(os.environ["GEMINI_JPEG_QUALITY"])
-        
+        _apply_env_overrides(config)
         return config
     
     @classmethod
@@ -243,6 +259,69 @@ class Config(BaseModel):
         
         # Fall back to environment variables
         return cls.from_env()
+
+
+def _apply_env_overrides(config: Config) -> None:
+    """Apply environment variable overrides onto an existing config."""
+    if "DATASETS" in os.environ:
+        config.datasets = _parse_datasets_env(os.environ["DATASETS"])
+    if "RUN_BASE" in os.environ:
+        config.run.base_dir = os.environ["RUN_BASE"]
+    if "RUN_ID" in os.environ:
+        config.run.run_id = os.environ["RUN_ID"]
+    if "PORT" in os.environ:
+        config.server.port = int(os.environ["PORT"])
+    if "SERVER_URL" in os.environ:
+        config.worker.server_url = os.environ["SERVER_URL"]
+    if "MODEL_PATH" in os.environ:
+        config.worker.qwen3vl.model_path = os.environ["MODEL_PATH"]
+    if "BACKEND" in os.environ:
+        config.worker.backend = os.environ["BACKEND"]
+    if "REMOTE_API_URL" in os.environ:
+        config.worker.remote_api.api_url = os.environ["REMOTE_API_URL"]
+    if "REMOTE_API_KEY" in os.environ:
+        config.worker.remote_api.api_key = os.environ["REMOTE_API_KEY"]
+    if "REMOTE_API_TIMEOUT" in os.environ:
+        config.worker.remote_api.timeout_sec = float(os.environ["REMOTE_API_TIMEOUT"])
+    if "REMOTE_API_HEADERS" in os.environ:
+        headers_raw = os.environ["REMOTE_API_HEADERS"]
+        headers = json.loads(headers_raw)
+        if not isinstance(headers, dict):
+            raise ValueError("REMOTE_API_HEADERS must be a JSON object")
+        config.worker.remote_api.headers = headers
+    if "OPENAI_API_KEY" in os.environ:
+        config.worker.openai.api_key = os.environ["OPENAI_API_KEY"]
+    if "OPENAI_MODEL" in os.environ:
+        config.worker.openai.model = os.environ["OPENAI_MODEL"]
+    if "OPENAI_BASE_URL" in os.environ:
+        config.worker.openai.base_url = os.environ["OPENAI_BASE_URL"]
+    if "OPENAI_TIMEOUT" in os.environ:
+        config.worker.openai.timeout_sec = float(os.environ["OPENAI_TIMEOUT"])
+    if "OPENAI_ORGANIZATION" in os.environ:
+        config.worker.openai.organization = os.environ["OPENAI_ORGANIZATION"]
+    if "OPENAI_PROJECT" in os.environ:
+        config.worker.openai.project = os.environ["OPENAI_PROJECT"]
+    if "OPENAI_REASONING_EFFORT" in os.environ:
+        config.worker.openai.reasoning_effort = os.environ["OPENAI_REASONING_EFFORT"]
+    if "OPENAI_MAX_OUTPUT_TOKENS" in os.environ:
+        config.worker.openai.max_output_tokens = int(os.environ["OPENAI_MAX_OUTPUT_TOKENS"])
+    if "OPENAI_JPEG_QUALITY" in os.environ:
+        config.worker.openai.jpeg_quality = int(os.environ["OPENAI_JPEG_QUALITY"])
+    if "GEMINI_API_KEY" in os.environ:
+        config.worker.gemini.api_key = os.environ["GEMINI_API_KEY"]
+    if "GEMINI_MODEL" in os.environ:
+        config.worker.gemini.model = os.environ["GEMINI_MODEL"]
+    if "GEMINI_API_MODE" in os.environ:
+        config.worker.gemini.api_mode = os.environ["GEMINI_API_MODE"]
+    gemini_base_url = os.environ.get("GEMINI_BASE_URL") or os.environ.get("GOOGLE_GEMINI_BASE_URL")
+    if gemini_base_url:
+        config.worker.gemini.base_url = gemini_base_url
+    if "GEMINI_TIMEOUT" in os.environ:
+        config.worker.gemini.timeout_sec = float(os.environ["GEMINI_TIMEOUT"])
+    if "GEMINI_MAX_OUTPUT_TOKENS" in os.environ:
+        config.worker.gemini.max_output_tokens = int(os.environ["GEMINI_MAX_OUTPUT_TOKENS"])
+    if "GEMINI_JPEG_QUALITY" in os.environ:
+        config.worker.gemini.jpeg_quality = int(os.environ["GEMINI_JPEG_QUALITY"])
 
 
 def _parse_datasets_env(spec: str) -> List[DatasetConfig]:

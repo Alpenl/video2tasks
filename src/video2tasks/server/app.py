@@ -16,7 +16,10 @@ import uvicorn
 from ..config import Config, DatasetConfig
 from .windowing import (
     read_video_info, build_windows, FrameExtractor,
-    build_segments_via_cuts, Window
+    apply_boundary_refinement_results, apply_deferred_segment_labels,
+    build_boundary_refinement_windows, build_segments_via_cuts,
+    build_refinement_windows, build_window_prompt_metadata, Window,
+    sample_segment_frame_ids,
 )
 
 
@@ -101,9 +104,49 @@ def create_app(config: Config) -> FastAPI:
     
     def segments_path(samples_dir: str, sample_id: str) -> str:
         return str(Path(sample_out_dir(samples_dir, sample_id)) / "segments.json")
+
+    def segment_labels_jsonl_path(samples_dir: str, sample_id: str) -> str:
+        return str(Path(sample_out_dir(samples_dir, sample_id)) / "segment_labels.jsonl")
+
+    def boundary_refinements_jsonl_path(samples_dir: str, sample_id: str) -> str:
+        return str(Path(sample_out_dir(samples_dir, sample_id)) / "boundary_refinements.jsonl")
     
     def done_marker_path(samples_dir: str, sample_id: str) -> str:
         return str(Path(sample_out_dir(samples_dir, sample_id)) / ".DONE")
+
+    def load_segment_label_results(samples_dir: str, sample_id: str) -> Dict[int, Dict[str, Any]]:
+        path = Path(segment_labels_jsonl_path(samples_dir, sample_id))
+        results: Dict[int, Dict[str, Any]] = {}
+        if not path.exists():
+            return results
+
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    segment_id = int(record["segment_id"])
+                    vlm_json = record["vlm_json"]
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+                if isinstance(vlm_json, dict):
+                    results[segment_id] = vlm_json
+        return results
+
+    def load_boundary_refinement_results(samples_dir: str, sample_id: str) -> Dict[int, Dict[str, Any]]:
+        path = Path(boundary_refinements_jsonl_path(samples_dir, sample_id))
+        results: Dict[int, Dict[str, Any]] = {}
+        if not path.exists():
+            return results
+
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    boundary_id = int(record["boundary_id"])
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+                results[boundary_id] = record
+        return results
     
     @app.get("/get_job")
     def get_job() -> Dict[str, Any]:
@@ -144,6 +187,30 @@ def create_app(config: Config) -> FastAPI:
             samples_dir = str(Path(config.run.base_dir) / subset / config.run.run_id / "samples")
             Path(samples_dir).mkdir(parents=True, exist_ok=True)
         
+        job_type = str(res.meta.get("job_type", "window_boundary"))
+        if job_type == "segment_label":
+            segment_id = int(res.meta.get("segment_id", -1))
+            rec = {"task_id": tid, "segment_id": segment_id, "vlm_json": res.vlm_json}
+            sample_key = f"{subset}::{sid}"
+            with get_sample_lock(sample_key):
+                with open(segment_labels_jsonl_path(samples_dir, sid), "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            return {"status": "received"}
+        if job_type == "boundary_refinement":
+            boundary_id = int(res.meta.get("boundary_id", -1))
+            rec = {
+                "task_id": tid,
+                "boundary_id": boundary_id,
+                "coarse_boundary_frame": int(res.meta.get("coarse_boundary_frame", -1)),
+                "frame_ids": [int(frame_id) for frame_id in res.meta.get("frame_ids", [])],
+                "vlm_json": res.vlm_json,
+            }
+            sample_key = f"{subset}::{sid}"
+            with get_sample_lock(sample_key):
+                with open(boundary_refinements_jsonl_path(samples_dir, sid), "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            return {"status": "received"}
+
         rec = {"task_id": tid, "window_id": w_id, "vlm_json": res.vlm_json}
         
         sample_key = f"{subset}::{sid}"
@@ -295,13 +362,24 @@ def create_app(config: Config) -> FastAPI:
                                         w.frame_ids,
                                         config.windowing.target_width,
                                         config.windowing.target_height,
-                                        config.windowing.png_compression
+                                        config.windowing.png_compression,
+                                        use_contact_sheets=config.windowing.use_contact_sheets,
+                                        contact_sheet_rows=config.windowing.contact_sheet_rows,
+                                        contact_sheet_cols=config.windowing.contact_sheet_cols,
                                     ),
                                     "meta": {
                                         "subset": ctx.subset,
                                         "sample_id": sid,
-                                        "window_id": w.window_id,
-                                        "frame_ids": w.frame_ids
+                                        **build_window_prompt_metadata(w, fps, nframes),
+                                        "use_contact_sheets": config.windowing.use_contact_sheets,
+                                        "contact_sheet_rows": (
+                                            config.windowing.contact_sheet_rows
+                                            if config.windowing.use_contact_sheets else 0
+                                        ),
+                                        "contact_sheet_cols": (
+                                            config.windowing.contact_sheet_cols
+                                            if config.windowing.use_contact_sheets else 0
+                                        ),
                                     }
                                 }
                                 
@@ -343,12 +421,270 @@ def create_app(config: Config) -> FastAPI:
                                         pass
                         
                         if len(by_wid) >= len(windows):
+                            refinement_windows: List[Window] = []
+                            if config.windowing.enable_refinement_pass:
+                                refinement_frames = (
+                                    config.windowing.refinement_frames_per_window
+                                    or config.windowing.frames_per_window
+                                )
+                                refinement_windows = build_refinement_windows(
+                                    windows,
+                                    by_wid,
+                                    fps,
+                                    nframes,
+                                    refinement_frames,
+                                )
+                                if refinement_windows:
+                                    missing_refinement = [
+                                        refinement_window
+                                        for refinement_window in refinement_windows
+                                        if refinement_window.window_id not in by_wid
+                                    ]
+                                    if missing_refinement:
+                                        with FrameExtractor(mp4) as extractor:
+                                            cnt = 0
+
+                                            for refinement_window in missing_refinement:
+                                                tid = f"{ctx.subset}::{sid}_rw{refinement_window.window_id}"
+                                                active = False
+                                                with queue_lock:
+                                                    if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
+                                                        active = True
+
+                                                if active:
+                                                    continue
+
+                                                job = {
+                                                    "task_id": tid,
+                                                    "images": extractor.get_many_b64(
+                                                        refinement_window.frame_ids,
+                                                        config.windowing.target_width,
+                                                        config.windowing.target_height,
+                                                        config.windowing.png_compression,
+                                                        use_contact_sheets=config.windowing.use_contact_sheets,
+                                                        contact_sheet_rows=config.windowing.contact_sheet_rows,
+                                                        contact_sheet_cols=config.windowing.contact_sheet_cols,
+                                                    ),
+                                                    "meta": {
+                                                        "subset": ctx.subset,
+                                                        "sample_id": sid,
+                                                        **build_window_prompt_metadata(refinement_window, fps, nframes),
+                                                        "use_contact_sheets": config.windowing.use_contact_sheets,
+                                                        "contact_sheet_rows": (
+                                                            config.windowing.contact_sheet_rows
+                                                            if config.windowing.use_contact_sheets else 0
+                                                        ),
+                                                        "contact_sheet_cols": (
+                                                            config.windowing.contact_sheet_cols
+                                                            if config.windowing.use_contact_sheets else 0
+                                                        ),
+                                                    },
+                                                }
+
+                                                with queue_lock:
+                                                    job_queue.append(job)
+
+                                                cnt += 1
+                                                if cnt > 20:
+                                                    break
+
+                                        if cnt > 0:
+                                            time.sleep(0.05)
+                                            continue
+
+                                    if len(by_wid) < len(windows) + len(refinement_windows):
+                                        time.sleep(0.05)
+                                        continue
+
                             print(f"[Finalize] {ctx.subset}/{sid}...")
-                            
-                            final_res = build_segments_via_cuts(
-                                sid, windows, by_wid, fps, nframes,
-                                config.windowing.frames_per_window
+
+                            provisional_res = build_segments_via_cuts(
+                                sid, windows + refinement_windows, by_wid, fps, nframes,
+                                config.windowing.frames_per_window,
+                                boundary_prompt_mode=config.windowing.boundary_prompt_mode,
+                                adaptive_merge_guard=config.windowing.adaptive_merge_guard,
+                                adaptive_merge_min_segments=config.windowing.adaptive_merge_min_segments,
+                                adaptive_merge_collapse_ratio=config.windowing.adaptive_merge_collapse_ratio,
+                                boundary_support_threshold=config.windowing.boundary_support_threshold,
+                                refine_final_instructions=config.windowing.refine_final_instructions,
                             )
+
+                            final_res = provisional_res
+                            if config.windowing.enable_boundary_refinement:
+                                boundary_results = load_boundary_refinement_results(ctx.samples_dir, sid)
+                                boundary_refinement_frames = (
+                                    config.windowing.boundary_refinement_frames_per_window
+                                    or config.windowing.frames_per_window
+                                )
+                                boundary_refinement_windows = build_boundary_refinement_windows(
+                                    provisional_res.get("segments", []),
+                                    fps,
+                                    nframes,
+                                    config.windowing.boundary_refinement_window_sec,
+                                    boundary_refinement_frames,
+                                )
+                                missing_boundaries = [
+                                    boundary_window
+                                    for boundary_window in boundary_refinement_windows
+                                    if boundary_window.boundary_id not in boundary_results
+                                ]
+
+                                if missing_boundaries:
+                                    with FrameExtractor(mp4) as extractor:
+                                        cnt = 0
+                                        for boundary_window in missing_boundaries:
+                                            boundary_id = int(boundary_window.boundary_id)
+                                            tid = f"{ctx.subset}::{sid}_b{boundary_id}"
+                                            active = False
+                                            with queue_lock:
+                                                if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
+                                                    active = True
+
+                                            if active:
+                                                continue
+
+                                            job = {
+                                                "task_id": tid,
+                                                "images": extractor.get_many_b64(
+                                                    boundary_window.frame_ids,
+                                                    config.windowing.target_width,
+                                                    config.windowing.target_height,
+                                                    config.windowing.png_compression,
+                                                    use_contact_sheets=config.windowing.use_contact_sheets,
+                                                    contact_sheet_rows=config.windowing.contact_sheet_rows,
+                                                    contact_sheet_cols=config.windowing.contact_sheet_cols,
+                                                ),
+                                                "meta": {
+                                                    "subset": ctx.subset,
+                                                    "sample_id": sid,
+                                                    "job_type": "boundary_refinement",
+                                                    "boundary_id": boundary_id,
+                                                    "coarse_boundary_frame": int(boundary_window.coarse_boundary_frame),
+                                                    "frame_ids": [int(frame_id) for frame_id in boundary_window.frame_ids],
+                                                    "window_start_frame": int(boundary_window.start_frame),
+                                                    "window_end_frame": int(boundary_window.end_frame),
+                                                    "use_contact_sheets": config.windowing.use_contact_sheets,
+                                                    "contact_sheet_rows": (
+                                                        config.windowing.contact_sheet_rows
+                                                        if config.windowing.use_contact_sheets else 0
+                                                    ),
+                                                    "contact_sheet_cols": (
+                                                        config.windowing.contact_sheet_cols
+                                                        if config.windowing.use_contact_sheets else 0
+                                                    ),
+                                                },
+                                            }
+
+                                            with queue_lock:
+                                                job_queue.append(job)
+
+                                            cnt += 1
+                                            if cnt > 20:
+                                                break
+
+                                    if cnt > 0:
+                                        time.sleep(0.05)
+                                        continue
+
+                                    time.sleep(0.05)
+                                    continue
+
+                                final_res = dict(provisional_res)
+                                final_res["segments"] = apply_boundary_refinement_results(
+                                    provisional_res.get("segments", []),
+                                    boundary_results,
+                                    fps=fps,
+                                    abstain_merge_max_support=(
+                                        config.windowing.boundary_refinement_abstain_merge_max_support
+                                    ),
+                                )
+                                diagnostics = dict(final_res.get("diagnostics", {}))
+                                diagnostics["boundary_refinement_enabled"] = True
+                                diagnostics["boundary_refinement_count"] = len(boundary_results)
+                                final_res["diagnostics"] = diagnostics
+
+                            if config.windowing.segment_labeling_mode == "deferred":
+                                label_results = load_segment_label_results(ctx.samples_dir, sid)
+                                missing_segments = [
+                                    segment
+                                    for segment in final_res.get("segments", [])
+                                    if int(segment.get("seg_id", -1)) not in label_results
+                                ]
+
+                                if missing_segments:
+                                    with FrameExtractor(mp4) as extractor:
+                                        cnt = 0
+                                        for segment in missing_segments:
+                                            seg_id = int(segment.get("seg_id", -1))
+                                            tid = f"{ctx.subset}::{sid}_seg{seg_id}"
+                                            active = False
+                                            with queue_lock:
+                                                if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
+                                                    active = True
+
+                                            if active:
+                                                continue
+
+                                            frame_ids = sample_segment_frame_ids(
+                                                int(segment["start_frame"]),
+                                                int(segment["end_frame"]),
+                                                config.windowing.frames_per_window,
+                                                nframes,
+                                            )
+                                            job = {
+                                                "task_id": tid,
+                                                "images": extractor.get_many_b64(
+                                                    frame_ids,
+                                                    config.windowing.target_width,
+                                                    config.windowing.target_height,
+                                                    config.windowing.png_compression,
+                                                    use_contact_sheets=config.windowing.use_contact_sheets,
+                                                    contact_sheet_rows=config.windowing.contact_sheet_rows,
+                                                    contact_sheet_cols=config.windowing.contact_sheet_cols,
+                                                ),
+                                                "meta": {
+                                                    "subset": ctx.subset,
+                                                    "sample_id": sid,
+                                                    "job_type": "segment_label",
+                                                    "segment_id": seg_id,
+                                                    "segment_start_frame": int(segment["start_frame"]),
+                                                    "segment_end_frame": int(segment["end_frame"]),
+                                                    "frame_ids": [int(frame_id) for frame_id in frame_ids],
+                                                    "use_contact_sheets": config.windowing.use_contact_sheets,
+                                                    "contact_sheet_rows": (
+                                                        config.windowing.contact_sheet_rows
+                                                        if config.windowing.use_contact_sheets else 0
+                                                    ),
+                                                    "contact_sheet_cols": (
+                                                        config.windowing.contact_sheet_cols
+                                                        if config.windowing.use_contact_sheets else 0
+                                                    ),
+                                                },
+                                            }
+
+                                            with queue_lock:
+                                                job_queue.append(job)
+
+                                            cnt += 1
+                                            if cnt > 20:
+                                                break
+
+                                    if cnt > 0:
+                                        time.sleep(0.05)
+                                        continue
+
+                                    time.sleep(0.05)
+                                    continue
+
+                                final_res = dict(final_res)
+                                final_res["segments"] = apply_deferred_segment_labels(
+                                    final_res.get("segments", []),
+                                    label_results,
+                                )
+                                diagnostics = dict(final_res.get("diagnostics", {}))
+                                diagnostics["segment_labeling_mode"] = "deferred"
+                                diagnostics["segment_label_count"] = len(label_results)
+                                final_res["diagnostics"] = diagnostics
                             
                             with open(segments_path(ctx.samples_dir, sid), "w", encoding="utf-8") as f:
                                 json.dump(final_res, f, indent=2, ensure_ascii=False)

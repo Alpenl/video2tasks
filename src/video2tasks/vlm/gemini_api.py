@@ -2,6 +2,8 @@ from typing import Any, Dict, List
 import base64
 import json
 import os
+import time
+import subprocess
 
 import cv2
 import numpy as np
@@ -108,6 +110,120 @@ def _extract_response_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     return {}
 
 
+def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_sec: float) -> tuple[int, str]:
+    retryable_statuses = {408, 409, 425, 429, 500, 502, 503, 504}
+    max_attempts = 4
+    last_status_code = 0
+    last_response_text = ""
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(
+                url,
+                json=payload,
+                headers=headers,
+                timeout=timeout_sec,
+            )
+            response_text = getattr(response, "text", None)
+            if not isinstance(response_text, str):
+                try:
+                    response_text = json.dumps(response.json(), ensure_ascii=False)
+                except Exception:
+                    response_text = ""
+
+            last_status_code = response.status_code
+            last_response_text = response_text
+            if response.status_code == 200 or response.status_code not in retryable_statuses:
+                return response.status_code, response_text
+
+            if attempt < max_attempts:
+                delay_s = float(min(2 * attempt, 8))
+                print(
+                    f"[Gemini] Retryable status={response.status_code}; "
+                    f"sleeping {delay_s:.1f}s before retry {attempt + 1}/{max_attempts}"
+                )
+                time.sleep(delay_s)
+                continue
+            return response.status_code, response_text
+        except requests.RequestException as exc:
+            if attempt < max_attempts:
+                delay_s = float(min(2 * attempt, 8))
+                print(
+                    f"[Gemini] requests failed (attempt {attempt}/{max_attempts}), "
+                    f"retrying in {delay_s:.1f}s: {exc}"
+                )
+                time.sleep(delay_s)
+                continue
+            print(f"[Gemini] requests failed, falling back to curl: {exc}")
+            return _post_json_via_curl(url, headers, payload, timeout_sec)
+
+    return last_status_code, last_response_text
+
+
+def _post_json_via_curl(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_sec: float) -> tuple[int, str]:
+    cmd = [
+        "curl",
+        "-sS",
+        "--http1.1",
+        "-X",
+        "POST",
+        url,
+        "--connect-timeout",
+        str(min(float(timeout_sec), 10.0)),
+        "--max-time",
+        str(float(timeout_sec)),
+        "--data-binary",
+        "@-",
+        "-w",
+        "\n%{http_code}",
+    ]
+    for key, value in headers.items():
+        cmd.extend(["-H", f"{key}: {value}"])
+
+    proc = subprocess.run(
+        cmd,
+        input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        capture_output=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        stderr = proc.stderr.decode("utf-8", errors="replace").strip()
+        if stderr:
+            print(f"[Gemini] curl fallback failed: {stderr}")
+        return 0, ""
+
+    stdout = proc.stdout.decode("utf-8", errors="replace")
+    if "\n" not in stdout:
+        return 0, stdout
+    body, status_text = stdout.rsplit("\n", 1)
+    try:
+        status_code = int(status_text.strip())
+    except ValueError:
+        return 0, stdout
+    return status_code, body
+
+
+def _collect_openai_text_candidates(value: Any, candidates: List[str]) -> None:
+    if isinstance(value, str):
+        candidates.append(value)
+        return
+    if isinstance(value, list):
+        for item in value:
+            _collect_openai_text_candidates(item, candidates)
+        return
+    if not isinstance(value, dict):
+        return
+
+    text_value = value.get("text")
+    if isinstance(text_value, dict):
+        _collect_openai_text_candidates(text_value.get("value"), candidates)
+    else:
+        _collect_openai_text_candidates(text_value, candidates)
+
+    for key in ("content", "reasoning_content", "arguments"):
+        _collect_openai_text_candidates(value.get(key), candidates)
+
+
 def _extract_openai_compatible_payload(data: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(data, dict):
         return {}
@@ -118,22 +234,14 @@ def _extract_openai_compatible_payload(data: Dict[str, Any]) -> Dict[str, Any]:
         message = choice.get("message", {})
         if not isinstance(message, dict):
             continue
-        content = message.get("content")
-        if isinstance(content, str):
-            parsed = _extract_json(content)
+
+        text_candidates: List[str] = []
+        _collect_openai_text_candidates(message, text_candidates)
+
+        for candidate in text_candidates:
+            parsed = _extract_json(candidate)
             if parsed:
                 return parsed
-            continue
-        if not isinstance(content, list):
-            continue
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            text = item.get("text")
-            if isinstance(text, str):
-                parsed = _extract_json(text)
-                if parsed:
-                    return parsed
 
     return {}
 
@@ -168,6 +276,40 @@ class GeminiBackend(VLMBackend):
         if self.api_mode == "openai_compatible":
             return self._infer_openai_compatible(images, prompt)
         return self._infer_native(images, prompt)
+
+
+    def _request_with_payload_retries(
+        self,
+        url: str,
+        headers: Dict[str, str],
+        payload: Dict[str, Any],
+        extractor,
+    ) -> Dict[str, Any]:
+        max_payload_attempts = 3
+        for attempt in range(1, max_payload_attempts + 1):
+            status_code, response_text = _post_json(url, headers, payload, self.timeout_sec)
+            if status_code != 200:
+                print(f"[Gemini] Error: status={status_code}")
+                return {}
+
+            try:
+                data = json.loads(response_text)
+            except json.JSONDecodeError:
+                data = {}
+
+            parsed = _normalize_vlm_json(extractor(data))
+            if parsed:
+                return parsed
+
+            if attempt < max_payload_attempts:
+                delay_s = float(min(2 * attempt, 8))
+                print(
+                    f"[Gemini] Empty structured payload; sleeping {delay_s:.1f}s "
+                    f"before retry {attempt + 1}/{max_payload_attempts}"
+                )
+                time.sleep(delay_s)
+
+        return {}
 
     def _infer_native(self, images: List[np.ndarray], prompt: str) -> Dict[str, Any]:
         parts: List[Dict[str, Any]] = [{"text": prompt}]
@@ -212,22 +354,12 @@ class GeminiBackend(VLMBackend):
             "x-goog-api-key": self.api_key,
         }
 
-        response = requests.post(
+        return self._request_with_payload_retries(
             f"{self.base_url}/models/{self.model}:generateContent",
-            json=payload,
-            headers=headers,
-            timeout=self.timeout_sec,
+            headers,
+            payload,
+            _extract_response_payload,
         )
-        if response.status_code != 200:
-            print(f"[Gemini] Error: status={response.status_code}")
-            return {}
-
-        try:
-            data = response.json()
-        except json.JSONDecodeError:
-            return {}
-
-        return _normalize_vlm_json(_extract_response_payload(data))
 
     def _infer_openai_compatible(self, images: List[np.ndarray], prompt: str) -> Dict[str, Any]:
         user_content: List[Dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -251,7 +383,9 @@ class GeminiBackend(VLMBackend):
                     "content": (
                         "Return JSON only with keys thought, transitions, and "
                         "instructions. transitions must be integer frame indexes. "
-                        "instructions must be an array of strings."
+                        "instructions must be an array of strings. "
+                        "The thought field must be one short sentence under 20 words. "
+                        "Do not use markdown fences."
                     ),
                 },
                 {
@@ -267,19 +401,9 @@ class GeminiBackend(VLMBackend):
             "Content-Type": "application/json",
         }
 
-        response = requests.post(
+        return self._request_with_payload_retries(
             f"{self.base_url}/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=self.timeout_sec,
+            headers,
+            payload,
+            _extract_openai_compatible_payload,
         )
-        if response.status_code != 200:
-            print(f"[Gemini] Error: status={response.status_code}")
-            return {}
-
-        try:
-            data = response.json()
-        except json.JSONDecodeError:
-            return {}
-
-        return _normalize_vlm_json(_extract_openai_compatible_payload(data))
