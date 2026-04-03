@@ -49,6 +49,13 @@ checkpoints/
 # Config (user-specific)
 config.yaml
 config.yml
+config.compare-official-*.yaml
+config.hg-*.yaml
+config.tmp*.yaml
+
+# Local benchmark / experiment artifacts
+data/
+exports/
 
 # OS
 .DS_Store

@@ -56,6 +56,7 @@ dev = [
 v2t-server = "video2tasks.cli.server:main"
 v2t-worker = "video2tasks.cli.worker:main"
 v2t-validate = "video2tasks.cli.validate_config:main"
+v2t-score-official-boundaries = "video2tasks.cli.score_official_boundaries:main"
 
 [project.urls]
 Homepage = "https://github.com/ly-geming/video2tasks"
