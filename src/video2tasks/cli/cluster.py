@@ -5,6 +5,7 @@ import time
 from pathlib import Path
 
 import click
+from pydantic import ValidationError
 
 from ..config import Config
 from ..server.app import run_server
@@ -12,17 +13,10 @@ from ..worker.runner import run_worker
 
 
 def _load_config(config: Path | None) -> Config:
-    if config:
-        return Config.from_yaml(config)
-
-    default = Path("config.yaml")
-    if default.exists():
-        return Config.from_yaml(default)
-
-    raise click.UsageError(
-        "No configuration file specified and config.yaml not found.\n"
-        "Use --config to specify a config file or copy config.example.yaml to config.yaml"
-    )
+    try:
+        return Config.load(config)
+    except (FileNotFoundError, ValidationError, ValueError) as exc:
+        raise click.UsageError(str(exc)) from exc
 
 
 @click.command()

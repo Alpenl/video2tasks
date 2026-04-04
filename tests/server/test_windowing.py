@@ -765,7 +765,8 @@ def test_merge_task_level_segments_merges_roll_out_dough_steps_when_boundary_is_
     assert merged[0]["instruction"] == "Roll out the dough with a rolling pin"
 
 
-def test_merge_task_level_segments_merges_dough_roll_continuation_despite_strong_boundary() -> None:
+
+def test_merge_task_level_segments_keeps_dough_roll_continuation_separate_when_boundary_is_strong() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -791,13 +792,14 @@ def test_merge_task_level_segments_merges_dough_roll_continuation_despite_strong
         boundary_support_threshold=0.9,
     )
 
-    assert len(merged) == 1
-    assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 660
-    assert merged[0]["instruction"] == "Roll out the dough with a rolling pin"
+    assert len(merged) == 2
+    assert merged[0]["end_frame"] == 180
+    assert merged[1]["start_frame"] == 180
+    assert merged[1]["instruction"] == "Roll out the dough with a rolling pin"
 
 
-def test_merge_task_level_segments_merges_same_container_add_steps_when_boundary_is_weak() -> None:
+
+def test_merge_task_level_segments_keeps_same_container_add_steps_separate_when_boundary_is_strong() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -823,10 +825,10 @@ def test_merge_task_level_segments_merges_same_container_add_steps_when_boundary
         boundary_support_threshold=0.9,
     )
 
-    assert len(merged) == 1
-    assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 780
-    assert merged[0]["instruction"] == "Add chopped garlic to the bowl"
+    assert len(merged) == 2
+    assert merged[0]["end_frame"] == 390
+    assert merged[1]["start_frame"] == 390
+    assert merged[1]["instruction"] == "Add chopped garlic to the bowl"
 
 
 def test_merge_task_level_segments_keeps_distinct_pot_add_sequences_separate_even_with_weak_boundary() -> None:
@@ -1108,7 +1110,7 @@ def test_merge_task_level_segments_merges_additive_only_seasoning_into_same_bowl
     assert merged[0]["instruction"] == "Toss the lettuce in the glass bowl"
 
 
-def test_merge_task_level_segments_merges_pre_cook_pot_loading_run_but_keeps_following_cook_phase() -> None:
+def test_merge_task_level_segments_keeps_pre_cook_pot_loading_steps_separate_when_boundaries_are_strong() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -1152,12 +1154,10 @@ def test_merge_task_level_segments_merges_pre_cook_pot_loading_run_but_keeps_fol
         boundary_support_threshold=0.9,
     )
 
-    assert len(merged) == 2
-    assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 693
-    assert merged[1]["start_frame"] == 693
-    assert merged[1]["end_frame"] == 940
-    assert merged[1]["instruction"] == "Cook the peas and herbs in the pot"
+    assert len(merged) == 4
+    assert [segment["end_frame"] for segment in merged[:-1]] == [205, 318, 693]
+    assert [segment["start_frame"] for segment in merged[1:]] == [205, 318, 693]
+    assert merged[-1]["instruction"] == "Cook the peas and herbs in the pot"
 
 
 def test_merge_task_level_segments_keeps_generic_spice_loading_steps_separate_in_pot() -> None:
@@ -1191,7 +1191,7 @@ def test_merge_task_level_segments_keeps_generic_spice_loading_steps_separate_in
     assert merged[1]["instruction"] == "Add the diced ingredients to the pot"
 
 
-def test_merge_task_level_segments_merges_same_pot_masher_continuation_but_keeps_next_phase_shift() -> None:
+def test_merge_task_level_segments_keeps_same_pot_masher_steps_separate_when_boundaries_are_strong() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -1235,14 +1235,13 @@ def test_merge_task_level_segments_merges_same_pot_masher_continuation_but_keeps
         boundary_support_threshold=0.9,
     )
 
-    assert len(merged) == 2
-    assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 1708
-    assert merged[1]["start_frame"] == 1708
-    assert merged[1]["instruction"] == "Stir the peas in the pot"
+    assert len(merged) == 4
+    assert [segment["end_frame"] for segment in merged[:-1]] == [332, 992, 1708]
+    assert [segment["start_frame"] for segment in merged[1:]] == [332, 992, 1708]
+    assert merged[-1]["instruction"] == "Stir the peas in the pot"
 
 
-def test_merge_task_level_segments_merges_same_ingredient_finish_chain_with_butter_and_mash() -> None:
+def test_merge_task_level_segments_keeps_same_ingredient_finish_chain_separate_when_boundaries_are_strong() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -1277,13 +1276,13 @@ def test_merge_task_level_segments_merges_same_ingredient_finish_chain_with_butt
         boundary_support_threshold=0.9,
     )
 
-    assert len(merged) == 1
-    assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 804
-    assert merged[0]["instruction"] == "Mash the peas in the pot with the potato masher"
+    assert len(merged) == 3
+    assert [segment["end_frame"] for segment in merged[:-1]] == [315, 540]
+    assert [segment["start_frame"] for segment in merged[1:]] == [315, 540]
+    assert merged[-1]["instruction"] == "Mash the peas in the pot with the potato masher"
 
 
-def test_merge_task_level_segments_merges_plated_mashed_potato_finish_chain() -> None:
+def test_merge_task_level_segments_keeps_plated_finish_chain_separate_when_boundaries_are_strong() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -1327,12 +1326,12 @@ def test_merge_task_level_segments_merges_plated_mashed_potato_finish_chain() ->
         boundary_support_threshold=0.9,
     )
 
-    assert len(merged) == 1
-    assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 703
+    assert len(merged) == 4
+    assert [segment["end_frame"] for segment in merged[:-1]] == [144, 386, 609]
+    assert [segment["start_frame"] for segment in merged[1:]] == [144, 386, 609]
 
 
-def test_merge_task_level_segments_merges_wrapper_fill_then_roll_into_single_assembly_step() -> None:
+def test_merge_task_level_segments_keeps_wrapper_fill_and_roll_separate_when_boundary_is_strong() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -1358,13 +1357,13 @@ def test_merge_task_level_segments_merges_wrapper_fill_then_roll_into_single_ass
         boundary_support_threshold=0.9,
     )
 
-    assert len(merged) == 1
-    assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 2037
-    assert merged[0]["instruction"] == "Roll the spring roll"
+    assert len(merged) == 2
+    assert merged[0]["end_frame"] == 575
+    assert merged[1]["start_frame"] == 575
+    assert merged[1]["instruction"] == "Roll the spring roll"
 
 
-def test_merge_task_level_segments_merges_wrapper_fill_then_pleat_into_single_assembly_step() -> None:
+def test_merge_task_level_segments_keeps_wrapper_fill_and_pleat_separate_when_boundary_is_strong() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -1390,13 +1389,13 @@ def test_merge_task_level_segments_merges_wrapper_fill_then_pleat_into_single_as
         boundary_support_threshold=0.9,
     )
 
-    assert len(merged) == 1
-    assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 1193
-    assert merged[0]["instruction"] == "Pleat the edges of the dumpling wrapper"
+    assert len(merged) == 2
+    assert merged[0]["end_frame"] == 784
+    assert merged[1]["start_frame"] == 784
+    assert merged[1]["instruction"] == "Pleat the edges of the dumpling wrapper"
 
 
-def test_merge_task_level_segments_merges_dumpling_assembly_then_pleat_into_single_step() -> None:
+def test_merge_task_level_segments_keeps_dumpling_assembly_and_pleat_separate_when_boundary_is_strong() -> None:
     segments = [
         {
             "seg_id": 0,
@@ -1422,10 +1421,11 @@ def test_merge_task_level_segments_merges_dumpling_assembly_then_pleat_into_sing
         boundary_support_threshold=0.9,
     )
 
-    assert len(merged) == 1
-    assert merged[0]["start_frame"] == 0
-    assert merged[0]["end_frame"] == 1193
-    assert merged[0]["instruction"] == "Pleat the edges of the dumpling wrapper"
+    assert len(merged) == 2
+    assert merged[0]["end_frame"] == 784
+    assert merged[1]["start_frame"] == 784
+    assert merged[1]["instruction"] == "Pleat the edges of the dumpling wrapper"
+
 
 
 def test_merge_task_level_segments_keeps_wrapper_transfer_and_frying_separate() -> None:
@@ -1522,7 +1522,7 @@ def test_split_long_raw_segments_on_instruction_drift_splits_long_heated_add_seq
     assert split_segments[1]["instruction"] == "Add chopped tomatoes to the pot"
 
 
-def test_split_long_raw_segments_on_instruction_drift_keeps_long_bowl_assembly_together() -> None:
+def test_split_long_raw_segments_on_instruction_drift_splits_long_bowl_add_steps_on_focus_change() -> None:
     raw_segments = [
         {
             "seg_id": 0,
@@ -1545,13 +1545,16 @@ def test_split_long_raw_segments_on_instruction_drift_keeps_long_bowl_assembly_t
         fps=25.0,
     )
 
-    assert len(split_segments) == 1
+    assert len(split_segments) == 2
     assert split_segments[0]["start_frame"] == 0
-    assert split_segments[0]["end_frame"] == 900
-    assert split_segments[0]["instruction"] == "Add ingredients into the bowl"
+    assert split_segments[0]["end_frame"] == 450
+    assert split_segments[0]["instruction"] == "Add chopped scallions to the bowl"
+    assert split_segments[1]["start_frame"] == 450
+    assert split_segments[1]["end_frame"] == 900
+    assert split_segments[1]["instruction"] == "Add minced garlic to the bowl"
 
 
-def test_split_long_raw_segments_on_instruction_drift_keeps_bowl_add_and_mix_assembly_together() -> None:
+def test_split_long_raw_segments_on_instruction_drift_splits_bowl_add_and_mix_on_action_change() -> None:
     raw_segments = [
         {
             "seg_id": 0,
@@ -1574,10 +1577,45 @@ def test_split_long_raw_segments_on_instruction_drift_keeps_bowl_add_and_mix_ass
         fps=25.0,
     )
 
-    assert len(split_segments) == 1
+    assert len(split_segments) == 2
     assert split_segments[0]["start_frame"] == 0
-    assert split_segments[0]["end_frame"] == 900
-    assert split_segments[0]["instruction"] == "Prepare the salad in the bowl"
+    assert split_segments[0]["end_frame"] == 450
+    assert split_segments[0]["instruction"] == "Add minced garlic to the bowl"
+    assert split_segments[1]["start_frame"] == 450
+    assert split_segments[1]["end_frame"] == 900
+    assert split_segments[1]["instruction"] == "Toss the salad in the bowl"
+
+
+def test_split_long_raw_segments_on_instruction_drift_splits_non_container_workflow_on_action_change() -> None:
+    raw_segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 900,
+            "instruction": "Handle the device",
+            "confidence": 1.0,
+            "boundary_support_before": 0.0,
+            "boundary_support_after": 0.0,
+        }
+    ]
+    instruction_timeline = (
+        [["Open the laptop lid"] for _ in range(450)]
+        + [["Type on the keyboard"] for _ in range(450)]
+    )
+
+    split_segments = split_long_raw_segments_on_instruction_drift(
+        raw_segments,
+        instruction_timeline,
+        fps=25.0,
+    )
+
+    assert len(split_segments) == 2
+    assert split_segments[0]["start_frame"] == 0
+    assert split_segments[0]["end_frame"] == 450
+    assert split_segments[0]["instruction"] == "Open the laptop lid"
+    assert split_segments[1]["start_frame"] == 450
+    assert split_segments[1]["end_frame"] == 900
+    assert split_segments[1]["instruction"] == "Type on the keyboard"
 
 
 def test_split_long_raw_segments_on_instruction_drift_splits_sauce_phase_from_sausage_return() -> None:
@@ -2004,6 +2042,48 @@ def test_apply_boundary_refinement_results_keeps_high_support_boundary_when_mode
     assert refined[1]["start_frame"] == 100
 
 
+def test_apply_boundary_refinement_results_keeps_low_support_boundary_without_explicit_same_task_signal() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 100,
+            "instruction": "Add spices to the pot",
+            "confidence": 1.0,
+            "boundary_support_after": 0.0,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 100,
+            "end_frame": 220,
+            "instruction": "Stir the ingredients in the pot",
+            "confidence": 1.0,
+            "boundary_support_before": 0.0,
+        },
+    ]
+    refinement_results = {
+        0: {
+            "boundary_id": 0,
+            "frame_ids": [60, 70, 80, 90, 95, 100, 105, 110, 120, 130, 140, 150],
+            "vlm_json": {
+                "transitions": [],
+                "instructions": ["Add spices to the pot", "Stir the ingredients in the pot"],
+            },
+        }
+    }
+
+    refined = apply_boundary_refinement_results(
+        segments,
+        refinement_results,
+        fps=25.0,
+        abstain_merge_max_support=0.0,
+    )
+
+    assert len(refined) == 2
+    assert refined[0]["end_frame"] == 100
+    assert refined[1]["start_frame"] == 100
+
+
 def test_build_segments_via_cuts_consumes_nonsequential_window_ids() -> None:
     refinement_window = Window(
         window_id=1000000,
@@ -2036,3 +2116,180 @@ def test_build_segments_via_cuts_consumes_nonsequential_window_ids() -> None:
     assert result["segments"][0]["end_frame"] >= 39
     assert result["segments"][1]["start_frame"] >= 39
     assert result["segments"][1]["instruction"] == "Stir the pot"
+
+
+def test_merge_task_level_segments_keeps_strong_boundary_between_similar_short_steps() -> None:
+    segments = [
+        {
+            "seg_id": 0,
+            "start_frame": 0,
+            "end_frame": 45,
+            "instruction": "First pour dark liquid into the pot",
+            "confidence": 1.0,
+            "boundary_support_after": 1.1,
+        },
+        {
+            "seg_id": 1,
+            "start_frame": 45,
+            "end_frame": 90,
+            "instruction": "Second pour dark liquid into the pot",
+            "confidence": 1.0,
+            "boundary_support_before": 1.1,
+        },
+    ]
+
+    merged = merge_task_level_segments(segments, fps=30.0, boundary_support_threshold=0.9)
+
+    assert len(merged) == 2
+    assert merged[0]["end_frame"] == 45
+    assert merged[1]["start_frame"] == 45
+
+
+def test_build_segments_via_cuts_preserves_short_segments_for_recall() -> None:
+    windows = [Window(window_id=0, start_frame=0, end_frame=9, frame_ids=list(range(10)))]
+    by_wid = {
+        0: {
+            "window_id": 0,
+            "vlm_json": {
+                "thought": "Two fast changes",
+                "transitions": [1, 2],
+                "instructions": ["First step", "Second step", "Third step"],
+            },
+        }
+    }
+
+    result = build_segments_via_cuts(
+        "sample",
+        windows,
+        by_wid,
+        fps=30.0,
+        nframes=10,
+        frames_per_window=10,
+        refine_final_instructions=False,
+    )
+
+    segments = result["segments"]
+    assert [segment["end_frame"] for segment in segments[:-1]] == [1, 2]
+    assert result["diagnostics"]["selected_segment_count"] == 3
+
+
+def test_build_segments_via_cuts_defaults_to_light_recall_output() -> None:
+    windows = [Window(window_id=0, start_frame=0, end_frame=7, frame_ids=list(range(8)))]
+    by_wid = {
+        0: {
+            "window_id": 0,
+            "vlm_json": {
+                "thought": "Two neighboring add steps",
+                "transitions": [4],
+                "instructions": [
+                    "Add salt to the bowl",
+                    "Add pepper to the bowl",
+                ],
+            },
+        }
+    }
+
+    result = build_segments_via_cuts(
+        "sample",
+        windows,
+        by_wid,
+        fps=30.0,
+        nframes=8,
+        frames_per_window=8,
+        refine_final_instructions=False,
+    )
+
+    assert len(result["segments"]) == 2
+    assert result["diagnostics"]["selection_policy"] == "light_cleanup_default_recall"
+
+
+
+def test_build_segments_via_cuts_does_not_leak_right_label_into_left_segment() -> None:
+    windows = [Window(window_id=0, start_frame=0, end_frame=7, frame_ids=list(range(8)))]
+    by_wid = {
+        0: {
+            "window_id": 0,
+            "vlm_json": {
+                "thought": "Only the right side is labeled",
+                "transitions": [4],
+                "instructions": ["unknown", "Stir the pot"],
+            },
+        }
+    }
+
+    result = build_segments_via_cuts(
+        "sample",
+        windows,
+        by_wid,
+        fps=30.0,
+        nframes=8,
+        frames_per_window=8,
+        refine_final_instructions=False,
+    )
+
+    assert len(result["segments"]) == 2
+    assert result["segments"][0]["end_frame"] == 4
+    assert result["segments"][0]["instruction"] == "Unknown task step"
+    assert result["segments"][1]["instruction"] == "Stir the pot"
+
+
+
+def test_build_segments_via_cuts_preserves_boundaries_when_all_labels_are_unknown() -> None:
+    windows = [Window(window_id=0, start_frame=0, end_frame=7, frame_ids=list(range(8)))]
+    by_wid = {
+        0: {
+            "window_id": 0,
+            "vlm_json": {
+                "thought": "A boundary exists but labels are unknown",
+                "transitions": [4],
+                "instructions": ["unknown", "unknown"],
+            },
+        }
+    }
+
+    result = build_segments_via_cuts(
+        "sample",
+        windows,
+        by_wid,
+        fps=30.0,
+        nframes=8,
+        frames_per_window=8,
+        refine_final_instructions=False,
+    )
+
+    assert len(result["segments"]) == 2
+    assert [segment["end_frame"] for segment in result["segments"][:-1]] == [4]
+    assert all(segment["instruction"] == "Unknown task step" for segment in result["segments"])
+
+
+def test_build_segments_via_cuts_keeps_recovered_micro_boundary_in_final_output() -> None:
+    windows = [Window(window_id=0, start_frame=0, end_frame=9, frame_ids=list(range(10)))]
+    by_wid = {
+        0: {
+            "window_id": 0,
+            "vlm_json": {
+                "thought": "Two short additions before stirring",
+                "transitions": [1, 2],
+                "instructions": [
+                    "Add salt to the bowl",
+                    "Add pepper to the bowl",
+                    "Stir the bowl",
+                ],
+            },
+        }
+    }
+
+    result = build_segments_via_cuts(
+        "sample",
+        windows,
+        by_wid,
+        fps=30.0,
+        nframes=10,
+        frames_per_window=10,
+        refine_final_instructions=False,
+    )
+
+    segments = result["segments"]
+    assert [segment["end_frame"] for segment in segments[:-1]] == [1, 2]
+    assert result["diagnostics"]["selection_policy"] == "light_cleanup_micro_boundary_guard"
+    assert result["diagnostics"]["recovered_micro_boundary_points"] == [1]

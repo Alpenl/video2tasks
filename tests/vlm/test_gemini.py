@@ -616,3 +616,79 @@ def test_gemini_backend_uses_raw_png_payload_for_openai_compatible_requests(monk
     assert user_content[1]["image_url"]["url"].startswith("data:image/png;base64,")
     encoded = user_content[1]["image_url"]["url"].split(",", 1)[1]
     assert base64.b64decode(encoded) == raw_png
+
+
+def test_gemini_backend_rejects_empty_instruction_list(monkeypatch) -> None:
+    json_module = json
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return DummyResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json_module.dumps(
+                                {
+                                    "thought": "Bad payload",
+                                    "transitions": [],
+                                    "instructions": [],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr("video2tasks.vlm.gemini_api.requests.post", fake_post)
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3-flash-preview",
+        base_url="https://api.duckcoding.ai",
+        api_mode="openai_compatible",
+    )
+
+    result = backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
+
+    assert result == {}
+
+
+def test_gemini_backend_rejects_mismatched_instruction_count(monkeypatch) -> None:
+    json_module = json
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return DummyResponse(
+            200,
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json_module.dumps(
+                                {
+                                    "thought": "Bad payload",
+                                    "transitions": [1, 3],
+                                    "instructions": ["Only one instruction"],
+                                }
+                            )
+                        }
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr("video2tasks.vlm.gemini_api.requests.post", fake_post)
+
+    backend = create_backend(
+        "gemini",
+        api_key="gem-test",
+        model="gemini-3-flash-preview",
+        base_url="https://api.duckcoding.ai",
+        api_mode="openai_compatible",
+    )
+
+    result = backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
+
+    assert result == {}

@@ -635,3 +635,63 @@ def test_worker_passes_raw_image_payloads_to_gemini_backend(
     assert isinstance(backend.seen_images, list)
     assert backend.seen_images[0]["mime_type"] == "image/png"
     assert backend.seen_images[0]["raw_bytes"] == image_bytes
+
+
+class InvalidPayloadBackend(DummyBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.infer_calls = 0
+
+    def infer(self, images, prompt):
+        self.infer_calls += 1
+        return {
+            "thought": "bad payload",
+            "transitions": [1],
+            "instructions": ["Only one instruction"],
+        }
+
+
+def test_worker_retries_invalid_structured_payload_and_submits_empty_json(
+    monkeypatch,
+    capsys,
+) -> None:
+    backend = InvalidPayloadBackend()
+    submitted = {}
+    get_attempts = {"count": 0}
+
+    def fake_get(url, timeout=None):
+        get_attempts["count"] += 1
+        if get_attempts["count"] == 1:
+            return DummyResponse(
+                200,
+                {
+                    "data": {
+                        "task_id": "demo::sample_roboturk_tower_w0",
+                        "images": [],
+                        "meta": {
+                            "subset": "demo",
+                            "sample_id": "sample_roboturk_tower",
+                            "logical_frame_count": 4,
+                        },
+                    }
+                },
+            )
+        raise requests.exceptions.ConnectionError("server stopped")
+
+    def fake_post(url, json=None, timeout=None):
+        submitted["payload"] = json
+        return DummyResponse(200, {"status": "ok"})
+
+    monkeypatch.setattr("video2tasks.worker.runner.create_backend", lambda *args, **kwargs: backend)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.get", fake_get)
+    monkeypatch.setattr("video2tasks.worker.runner.requests.post", fake_post)
+    monkeypatch.setattr("video2tasks.worker.runner.time.sleep", lambda *_args, **_kwargs: None)
+
+    cfg = Config(worker={"backend": "dummy", "server_url": "http://127.0.0.1:8099"})
+
+    run_worker(cfg)
+
+    out = capsys.readouterr().out
+    assert backend.infer_calls == 4
+    assert submitted["payload"]["vlm_json"] == {}
+    assert "Empty or invalid VLM JSON" in out

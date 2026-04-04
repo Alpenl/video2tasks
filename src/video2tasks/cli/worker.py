@@ -1,6 +1,7 @@
 """Worker CLI entrypoint."""
 
 import click
+from pydantic import ValidationError
 from pathlib import Path
 from ..config import Config
 from ..worker.runner import run_worker
@@ -12,21 +13,13 @@ from ..worker.runner import run_worker
     type=click.Path(exists=True, path_type=Path),
     help="Path to configuration file"
 )
-def main(config: Path) -> None:
+def main(config: Path | None) -> None:
     """Start the Video2Tasks worker."""
-    if config:
-        cfg = Config.from_yaml(config)
-    else:
-        # Try default config.yaml
-        default = Path("config.yaml")
-        if default.exists():
-            cfg = Config.from_yaml(default)
-        else:
-            raise click.UsageError(
-                "No configuration file specified and config.yaml not found.\n"
-                "Use --config to specify a config file or copy config.example.yaml to config.yaml"
-            )
-    
+    try:
+        cfg = Config.load(config)
+    except (FileNotFoundError, ValidationError, ValueError) as exc:
+        raise click.UsageError(str(exc)) from exc
+
     run_worker(cfg)
 
 

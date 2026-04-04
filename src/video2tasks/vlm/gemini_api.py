@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 import requests
 
-from .base import VLMBackend
+from .base import VLMBackend, normalize_task_window_result
 
 
 def _encode_jpeg_b64(img_bgr: np.ndarray, quality: int = 85) -> str:
@@ -86,36 +86,6 @@ def _extract_json(text: str) -> Dict[str, Any]:
             return {}
 
     return {}
-
-
-def _normalize_vlm_json(data: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(data, dict) or "instructions" not in data:
-        return {}
-
-    transitions: List[int] = []
-    for item in data.get("transitions", []):
-        try:
-            transitions.append(int(item))
-        except (TypeError, ValueError):
-            return {}
-
-    instructions = data.get("instructions", [])
-    if isinstance(instructions, str):
-        instructions = [instructions]
-    if not isinstance(instructions, list) or any(not isinstance(v, str) for v in instructions):
-        return {}
-
-    thought = data.get("thought", "")
-    if thought is None:
-        thought = ""
-    if not isinstance(thought, str):
-        thought = str(thought)
-
-    return {
-        "thought": thought,
-        "transitions": transitions,
-        "instructions": instructions,
-    }
 
 
 def _extract_response_payload(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -242,7 +212,7 @@ def _parse_structured_response_text(response_text: str, extractor) -> Dict[str, 
         data = json.loads(response_text)
     except json.JSONDecodeError:
         data = {}
-    return _normalize_vlm_json(extractor(data))
+    return normalize_task_window_result(extractor(data))
 
 
 def _collect_openai_text_candidates(value: Any, candidates: List[str]) -> None:

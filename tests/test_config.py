@@ -181,3 +181,10 @@ def test_config_accepts_boundary_refinement_settings() -> None:
 def test_config_rejects_unknown_segment_labeling_mode() -> None:
     with pytest.raises(ValueError, match="segment_labeling_mode"):
         Config(windowing={"segment_labeling_mode": "unknown_mode"})
+
+
+def test_config_rejects_invalid_backend_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("BACKEND", "not_a_backend")
+
+    with pytest.raises(ValueError, match="backend"):
+        Config.from_env()

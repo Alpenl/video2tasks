@@ -5,7 +5,14 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from video2tasks.config import Config
-from video2tasks.server.app import _requeue_empty_result, create_app
+from video2tasks.server.app import (
+    _count_failed_samples,
+    _final_exit_code,
+    _normalize_loaded_boundary_refinement_vlm_json,
+    _normalize_loaded_window_vlm_json,
+    _requeue_empty_result,
+    create_app,
+)
 
 
 def _make_app(tmp_path):
@@ -132,3 +139,116 @@ def test_submit_result_exhausts_empty_retry_budget_and_records_terminal_empty(tm
     assert record["dispatch_id"] == "d3"
     assert record["terminal_error"] == "empty_retry_exhausted"
     assert record["vlm_json"] == {}
+
+
+def test_submit_result_retries_invalid_structured_payload_and_records_terminal_empty(tmp_path) -> None:
+    config = Config(
+        run={"base_dir": str(tmp_path), "run_id": "testrun"},
+        server={"auto_exit_after_all_done": False, "max_empty_retries_per_job": 1},
+    )
+    app = create_app(config)
+    client = TestClient(app)
+
+    task_id = "demo::sample_w0"
+    meta = {
+        "subset": "demo",
+        "sample_id": "sample",
+        "window_id": 0,
+        "job_type": "window_boundary",
+        "logical_frame_count": 4,
+    }
+    base_job = {"task_id": task_id, "meta": meta}
+
+    app.state.inflight[task_id] = {"job": base_job, "ts": time.time(), "dispatch_id": "d1"}
+    attempt1 = client.post(
+        "/submit_result",
+        json={
+            "task_id": task_id,
+            "dispatch_id": "d1",
+            "vlm_json": {"transitions": [1], "instructions": ["Only one instruction"]},
+            "meta": meta,
+        },
+    )
+    assert attempt1.json()["status"] == "retry_triggered"
+
+    requeued_job = app.state.job_queue.pop(0)
+    app.state.inflight[task_id] = {"job": requeued_job, "ts": time.time(), "dispatch_id": "d2"}
+    attempt2 = client.post(
+        "/submit_result",
+        json={
+            "task_id": task_id,
+            "dispatch_id": "d2",
+            "vlm_json": {"transitions": [1], "instructions": ["Only one instruction"]},
+            "meta": meta,
+        },
+    )
+    assert attempt2.json()["status"] == "empty_retry_exhausted"
+
+    windows_path = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample" / "windows.jsonl"
+    record = json.loads(windows_path.read_text(encoding="utf-8").strip())
+    assert record["terminal_error"] == "empty_retry_exhausted"
+
+
+def test_timeout_exhaustion_records_terminal_error(tmp_path) -> None:
+    config = Config(
+        run={"base_dir": str(tmp_path), "run_id": "testrun"},
+        server={
+            "auto_exit_after_all_done": False,
+            "inflight_timeout_sec": 0.01,
+            "max_retries_per_job": 1,
+        },
+    )
+    app = create_app(config)
+
+    task_id = "demo::sample_w0"
+    meta = {
+        "subset": "demo",
+        "sample_id": "sample",
+        "window_id": 0,
+        "job_type": "window_boundary",
+    }
+    base_job = {"task_id": task_id, "meta": meta}
+
+    app.state.inflight[task_id] = {"job": base_job, "ts": time.time() - 1.0, "dispatch_id": "d1"}
+    time.sleep(1.2)
+    assert len(app.state.job_queue) == 1
+
+    requeued_job = app.state.job_queue.pop(0)
+    app.state.inflight[task_id] = {"job": requeued_job, "ts": time.time() - 1.0, "dispatch_id": "d2"}
+    time.sleep(1.2)
+
+    windows_path = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample" / "windows.jsonl"
+    record = json.loads(windows_path.read_text(encoding="utf-8").strip())
+    assert record["dispatch_id"] == "d2"
+    assert record["terminal_error"] == "timeout_retry_exhausted"
+    assert app.state.completed_dispatch_ids[task_id] == "d2"
+    assert len(app.state.job_queue) == 0
+
+
+def test_normalize_loaded_window_vlm_json_rejects_transition_beyond_logical_frame_count() -> None:
+    record = {
+        "meta": {"logical_frame_count": 4},
+        "vlm_json": {"transitions": [99], "instructions": ["Add potatoes", "Stir the pot"]},
+    }
+
+    assert _normalize_loaded_window_vlm_json(record) == {}
+
+
+def test_normalize_loaded_boundary_refinement_vlm_json_rejects_transition_outside_middle_candidates() -> None:
+    record = {
+        "frame_ids": list(range(8)),
+        "vlm_json": {"transitions": [0], "instructions": ["Add potatoes", "Stir the pot"]},
+    }
+
+    assert _normalize_loaded_boundary_refinement_vlm_json(record) == {}
+
+
+def test_final_exit_code_returns_nonzero_when_any_sample_failed() -> None:
+    states = {
+        "demo": {"sample_status": {"done": 3, "failed": 4}},
+        "demo2": {"sample_status": {"pending": 0}},
+    }
+
+    assert _count_failed_samples(states) == 1
+    assert _final_exit_code(states) == 1
+    assert _final_exit_code({"demo": {"sample_status": {"done": 3}}}) == 0

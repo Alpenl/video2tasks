@@ -14,7 +14,9 @@ from PIL import Image
 
 from ..config import Config
 from ..vlm import create_backend
+from ..vlm.base import normalize_task_window_result
 from ..prompt import (
+    boundary_refinement_candidate_positions,
     prompt_boundary_refinement,
     prompt_segment_instruction,
     prompt_switch_detection,
@@ -57,7 +59,7 @@ def _decode_image_bytes_to_numpy(img_bytes: bytes) -> Optional[np.ndarray]:
 
     try:
         img = Image.open(BytesIO(img_bytes)).convert("RGB")
-        rgb_array = np.array(img)
+        rgb_array = np.asarray(img)
         return rgb_array[:, :, ::-1]
     except Exception:
         return None
@@ -332,18 +334,28 @@ def run_worker(config: Config) -> None:
                     )
                 vlm_json: Dict[str, Any] = {}
 
+                max_transition_index = max(0, logical_frame_count - 1) if logical_frame_count > 0 else None
+                allowed_transition_indices = None
+                if job_type == "boundary_refinement" and logical_frame_count > 0:
+                    allowed_transition_indices = boundary_refinement_candidate_positions(logical_frame_count)
+
                 for attempt in range(MAX_LOCAL_RETRIES):
                     try:
-                        vlm_json = backend.infer(images, prompt)
+                        raw_vlm_json = backend.infer(images, prompt)
                     except Exception as exc:
                         print(f"[Err] Inference failed: {exc}")
-                        vlm_json = {}
+                        raw_vlm_json = {}
 
+                    vlm_json = normalize_task_window_result(
+                        raw_vlm_json,
+                        max_transition_index=max_transition_index,
+                        allowed_transition_indices=allowed_transition_indices,
+                    )
                     if not _is_empty_vlm_json(vlm_json):
                         break
 
                     print(
-                        f"[Warn] {task_id} Empty VLM JSON "
+                        f"[Warn] {task_id} Empty or invalid VLM JSON "
                         f"(attempt {attempt + 1}/{MAX_LOCAL_RETRIES})"
                     )
                     if attempt + 1 < MAX_LOCAL_RETRIES:

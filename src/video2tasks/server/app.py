@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 import uvicorn
 
 from ..config import Config, DatasetConfig
+from ..prompt import boundary_refinement_candidate_positions
 from .windowing import (
     read_video_info, build_windows, FrameExtractor,
     apply_boundary_refinement_results, apply_deferred_segment_labels,
@@ -22,6 +23,7 @@ from .windowing import (
     sample_segment_frame_ids,
 )
 from .task_artifacts import TaskArtifactWriter
+from ..vlm.base import normalize_task_window_result
 
 
 class SubmitModel(BaseModel):
@@ -90,6 +92,65 @@ def _requeue_empty_result(
     return attempt, True
 
 
+def _logical_frame_count_from_meta(meta: Dict[str, Any]) -> Optional[int]:
+    if not isinstance(meta, dict):
+        return None
+
+    try:
+        logical_frame_count = int(meta.get("logical_frame_count") or 0)
+    except (TypeError, ValueError):
+        logical_frame_count = 0
+    if logical_frame_count > 0:
+        return logical_frame_count
+
+    frame_ids = meta.get("frame_ids", [])
+    if isinstance(frame_ids, list) and frame_ids:
+        return len(frame_ids)
+    return None
+
+
+def _normalize_loaded_window_vlm_json(record: Dict[str, Any]) -> Dict[str, Any]:
+    logical_frame_count = _logical_frame_count_from_meta(record.get("meta", {}))
+    max_transition_index = (logical_frame_count - 1) if logical_frame_count and logical_frame_count > 0 else None
+    return normalize_task_window_result(
+        record.get("vlm_json", {}),
+        max_transition_index=max_transition_index,
+    )
+
+
+def _normalize_loaded_boundary_refinement_vlm_json(record: Dict[str, Any]) -> Dict[str, Any]:
+    frame_ids = record.get("frame_ids", [])
+    if isinstance(frame_ids, list) and frame_ids:
+        logical_frame_count = len(frame_ids)
+    else:
+        logical_frame_count = _logical_frame_count_from_meta(record.get("meta", {}))
+
+    max_transition_index = (logical_frame_count - 1) if logical_frame_count and logical_frame_count > 0 else None
+    allowed_transition_indices = (
+        boundary_refinement_candidate_positions(logical_frame_count)
+        if logical_frame_count and logical_frame_count > 0
+        else None
+    )
+    return normalize_task_window_result(
+        record.get("vlm_json", {}),
+        max_transition_index=max_transition_index,
+        allowed_transition_indices=allowed_transition_indices,
+    )
+
+
+def _count_failed_samples(states: Dict[str, Dict[str, Any]]) -> int:
+    return sum(
+        1
+        for state in states.values()
+        for status in dict(state.get("sample_status", {})).values()
+        if int(status) == 4
+    )
+
+
+def _final_exit_code(states: Dict[str, Dict[str, Any]]) -> int:
+    return 1 if _count_failed_samples(states) > 0 else 0
+
+
 def create_app(config: Config) -> FastAPI:
     """Create and configure FastAPI application."""
     app = FastAPI(title="Video2Tasks Server")
@@ -140,39 +201,82 @@ def create_app(config: Config) -> FastAPI:
     def done_marker_path(samples_dir: str, sample_id: str) -> str:
         return str(Path(sample_out_dir(samples_dir, sample_id)) / ".DONE")
 
-    def load_segment_label_results(samples_dir: str, sample_id: str) -> Dict[int, Dict[str, Any]]:
-        path = Path(segment_labels_jsonl_path(samples_dir, sample_id))
+    def failed_marker_path(samples_dir: str, sample_id: str) -> str:
+        return str(Path(sample_out_dir(samples_dir, sample_id)) / ".FAILED")
+
+    def failure_report_path(samples_dir: str, sample_id: str) -> str:
+        return str(Path(sample_out_dir(samples_dir, sample_id)) / "failure.json")
+
+    def _load_indexed_result_records(path: Path, index_key: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
         results: Dict[int, Dict[str, Any]] = {}
+        failures: Dict[int, Dict[str, Any]] = {}
         if not path.exists():
-            return results
+            return results, failures
 
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 try:
                     record = json.loads(line)
-                    segment_id = int(record["segment_id"])
-                    vlm_json = record["vlm_json"]
+                    index = int(record[index_key])
                 except (json.JSONDecodeError, KeyError, TypeError, ValueError):
                     continue
-                if isinstance(vlm_json, dict):
-                    results[segment_id] = vlm_json
-        return results
 
-    def load_boundary_refinement_results(samples_dir: str, sample_id: str) -> Dict[int, Dict[str, Any]]:
-        path = Path(boundary_refinements_jsonl_path(samples_dir, sample_id))
+                terminal_error = str(record.get("terminal_error", "")).strip()
+                if terminal_error:
+                    failures[index] = record
+                    results.pop(index, None)
+                    continue
+
+                results[index] = record
+                failures.pop(index, None)
+
+        return results, failures
+
+    def load_window_results(samples_dir: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+        records, failures = _load_indexed_result_records(
+            Path(windows_jsonl_path(samples_dir, sample_id)),
+            "window_id",
+        )
         results: Dict[int, Dict[str, Any]] = {}
-        if not path.exists():
-            return results
+        for window_id, record in records.items():
+            vlm_json = _normalize_loaded_window_vlm_json(record)
+            if not vlm_json:
+                failures[window_id] = {**record, "terminal_error": "invalid_vlm_json"}
+                continue
+            normalized_record = dict(record)
+            normalized_record["vlm_json"] = vlm_json
+            results[window_id] = normalized_record
+        return results, failures
 
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    record = json.loads(line)
-                    boundary_id = int(record["boundary_id"])
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                    continue
-                results[boundary_id] = record
-        return results
+    def load_segment_label_results(samples_dir: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+        records, failures = _load_indexed_result_records(
+            Path(segment_labels_jsonl_path(samples_dir, sample_id)),
+            "segment_id",
+        )
+        results: Dict[int, Dict[str, Any]] = {}
+        for segment_id, record in records.items():
+            vlm_json = normalize_task_window_result(record.get("vlm_json", {}))
+            if not vlm_json:
+                failures[segment_id] = {**record, "terminal_error": "invalid_vlm_json"}
+                continue
+            results[segment_id] = vlm_json
+        return results, failures
+
+    def load_boundary_refinement_results(samples_dir: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+        records, failures = _load_indexed_result_records(
+            Path(boundary_refinements_jsonl_path(samples_dir, sample_id)),
+            "boundary_id",
+        )
+        results: Dict[int, Dict[str, Any]] = {}
+        for boundary_id, record in records.items():
+            vlm_json = _normalize_loaded_boundary_refinement_vlm_json(record)
+            if not vlm_json:
+                failures[boundary_id] = {**record, "terminal_error": "invalid_vlm_json"}
+                continue
+            normalized_record = dict(record)
+            normalized_record["vlm_json"] = vlm_json
+            results[boundary_id] = normalized_record
+        return results, failures
 
     def _resolve_samples_dir(subset: str) -> str:
         samples_dir = samples_dir_by_subset.get(subset)
@@ -202,6 +306,9 @@ def create_app(config: Config) -> FastAPI:
             "dispatch_id": dispatch_id,
             "vlm_json": vlm_json,
         }
+        logical_frame_count = int(meta.get("logical_frame_count", 0) or 0)
+        if logical_frame_count > 0:
+            common_fields["logical_frame_count"] = logical_frame_count
         if terminal_error:
             common_fields["terminal_error"] = terminal_error
 
@@ -230,6 +337,50 @@ def create_app(config: Config) -> FastAPI:
                 "window_id": meta.get("window_id"),
             }
             _append_jsonl_record(windows_jsonl_path(samples_dir, sid), rec)
+
+    def _persist_sample_failure(
+        subset: str,
+        sample_id: str,
+        reason: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        samples_dir = _resolve_samples_dir(subset)
+        sample_key = f"{subset}::{sample_id}"
+        payload = {
+            "subset": subset,
+            "sample_id": sample_id,
+            "reason": reason,
+            "details": details or {},
+        }
+
+        with get_sample_lock(sample_key):
+            for stale_path in (segments_path(samples_dir, sample_id), done_marker_path(samples_dir, sample_id)):
+                try:
+                    Path(stale_path).unlink()
+                except FileNotFoundError:
+                    pass
+            Path(failed_marker_path(samples_dir, sample_id)).touch()
+            with open(failure_report_path(samples_dir, sample_id), "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+
+    def _mark_task_terminal_failure(
+        task_id: str,
+        dispatch_id: str,
+        meta: Dict[str, Any],
+        terminal_error: str,
+    ) -> None:
+        with queue_lock:
+            if dispatch_id:
+                completed_dispatch_ids[task_id] = dispatch_id
+            timeout_retry_counts.pop(task_id, None)
+            empty_retry_counts.pop(task_id, None)
+        _persist_result_record(
+            task_id,
+            dispatch_id,
+            {},
+            meta,
+            terminal_error=terminal_error,
+        )
 
     def _build_job_payload(
         extractor: FrameExtractor,
@@ -313,7 +464,18 @@ def create_app(config: Config) -> FastAPI:
         result_meta.update(dict(res.meta))
         result_meta["dispatch_id"] = dispatch_id
 
-        if not res.vlm_json:
+        logical_frame_count = int(result_meta.get("logical_frame_count") or 0)
+        if logical_frame_count <= 0:
+            frame_ids = result_meta.get("frame_ids", [])
+            if isinstance(frame_ids, list) and frame_ids:
+                logical_frame_count = len(frame_ids)
+        max_transition_index = max(0, logical_frame_count - 1) if logical_frame_count > 0 else None
+        normalized_vlm_json = normalize_task_window_result(
+            res.vlm_json,
+            max_transition_index=max_transition_index,
+        )
+
+        if not normalized_vlm_json:
             with queue_lock:
                 attempt, requeued = _requeue_empty_result(
                     job_queue,
@@ -326,25 +488,20 @@ def create_app(config: Config) -> FastAPI:
                 limit_label = "inf" if limit <= 0 else str(limit)
                 if requeued:
                     print(
-                        f"[Warn] Task {tid} empty, re-queueing to tail "
+                        f"[Warn] Task {tid} empty or invalid, re-queueing to tail "
                         f"(empty attempt {attempt}/{limit_label})"
                     )
                     return {"status": "retry_triggered"}
 
-                completed_dispatch_ids[tid] = dispatch_id
-                timeout_retry_counts.pop(tid, None)
-                empty_retry_counts.pop(tid, None)
-
             print(
-                f"[Err] Task {tid} empty retry budget exhausted "
+                f"[Err] Task {tid} empty or invalid retry budget exhausted "
                 f"(empty attempt {attempt}/{limit_label}); recording terminal empty result"
             )
-            _persist_result_record(
+            _mark_task_terminal_failure(
                 tid,
                 dispatch_id,
-                {},
                 result_meta,
-                terminal_error="empty_retry_exhausted",
+                "empty_retry_exhausted",
             )
             return {"status": "empty_retry_exhausted"}
 
@@ -353,7 +510,7 @@ def create_app(config: Config) -> FastAPI:
             timeout_retry_counts.pop(tid, None)
             empty_retry_counts.pop(tid, None)
 
-        _persist_result_record(tid, dispatch_id, res.vlm_json, result_meta)
+        _persist_result_record(tid, dispatch_id, normalized_vlm_json, result_meta)
         return {"status": "received"}
     
     @app.get("/health")
@@ -394,13 +551,16 @@ def create_app(config: Config) -> FastAPI:
         while True:
             # Check inflight timeouts
             now = time.time()
+            exhausted_timeouts: List[tuple[str, str, Dict[str, Any], int, str]] = []
             with queue_lock:
                 expired = [
                     tid for tid, info in inflight.items()
                     if now - info["ts"] > config.server.inflight_timeout_sec
                 ]
                 for tid in expired:
-                    job = inflight.pop(tid)["job"]
+                    inflight_info = inflight.pop(tid)
+                    job = inflight_info["job"]
+                    dispatch_id = str(inflight_info.get("dispatch_id", ""))
                     timeout_retry_counts[tid] = timeout_retry_counts.get(tid, 0) + 1
                     attempt = timeout_retry_counts[tid]
                     limit = config.server.max_retries_per_job
@@ -412,16 +572,33 @@ def create_app(config: Config) -> FastAPI:
                             f"(timeout attempt {attempt}/{limit_label})"
                         )
                     else:
-                        print(
-                            f"[Err] Task {tid} timed out and exhausted retry budget "
-                            f"(timeout attempt {attempt}/{limit_label})"
-                        )
+                        exhausted_timeouts.append((tid, dispatch_id, dict(job.get("meta", {})), attempt, limit_label))
+
+            for tid, dispatch_id, meta, attempt, limit_label in exhausted_timeouts:
+                print(
+                    f"[Err] Task {tid} timed out and exhausted retry budget "
+                    f"(timeout attempt {attempt}/{limit_label}); recording terminal timeout result"
+                )
+                _mark_task_terminal_failure(
+                    tid,
+                    dispatch_id,
+                    {**meta, "dispatch_id": dispatch_id},
+                    "timeout_retry_exhausted",
+                )
             
             # All datasets done
             if dataset_idx >= len(dataset_ctxs):
                 if config.server.auto_exit_after_all_done:
-                    print(f"[All Done] {global_done}/{progress_total}. Exiting.")
-                    os._exit(0)
+                    failed_samples = _count_failed_samples(states)
+                    exit_code = _final_exit_code(states)
+                    if failed_samples:
+                        print(
+                            f"[All Done] {global_done}/{progress_total} succeeded, "
+                            f"{failed_samples} failed. Exiting with code {exit_code}."
+                        )
+                    else:
+                        print(f"[All Done] {global_done}/{progress_total}. Exiting.")
+                    os._exit(exit_code)
                 time.sleep(1.0)
                 continue
             
@@ -454,6 +631,12 @@ def create_app(config: Config) -> FastAPI:
                     st["cur_idx"] += 1
                     time.sleep(0.01)
                     continue
+
+                if Path(failed_marker_path(ctx.samples_dir, sid)).exists():
+                    sample_status[sid] = 4
+                    st["cur_idx"] += 1
+                    time.sleep(0.01)
+                    continue
                 
                 # Find video
                 mp4s = list(s_dir.glob("Frame_*.mp4"))
@@ -477,15 +660,28 @@ def create_app(config: Config) -> FastAPI:
                         )
                         
                         # Load completed windows
-                        done_wids = set()
-                        if Path(w_path).exists():
-                            with open(w_path, "r", encoding="utf-8") as f:
-                                for line in f:
-                                    try:
-                                        done_wids.add(json.loads(line)["window_id"])
-                                    except (json.JSONDecodeError, KeyError) as e:
-                                        print(f"[Warn] Corrupted line in {w_path}: {e}")
-                        
+                        window_results, failed_window_results = load_window_results(ctx.samples_dir, sid)
+                        if failed_window_results:
+                            _persist_sample_failure(
+                                ctx.subset,
+                                sid,
+                                "window_boundary_failed",
+                                {
+                                    "failed_window_ids": sorted(int(wid) for wid in failed_window_results),
+                                    "errors": {
+                                        str(wid): str(record.get("terminal_error", "unknown"))
+                                        for wid, record in sorted(failed_window_results.items())
+                                    },
+                                },
+                            )
+                            sample_status[sid] = 4
+                            st["cur_idx"] += 1
+                            print(f"[Fail] {ctx.subset}/{sid}: terminal window failure before finalize")
+                            time.sleep(0.01)
+                            continue
+
+                        done_wids = set(window_results)
+
                         with FrameExtractor(mp4, artifact_writer=task_artifact_writer) as extractor:
                             cnt = 0
                             
@@ -558,16 +754,26 @@ def create_app(config: Config) -> FastAPI:
                             config.windowing.frames_per_window
                         )
                         
-                        by_wid = {}
-                        if Path(w_path).exists():
-                            with open(w_path, "r", encoding="utf-8") as f:
-                                for line in f:
-                                    try:
-                                        d = json.loads(line)
-                                        by_wid[d["window_id"]] = d
-                                    except (json.JSONDecodeError, KeyError):
-                                        pass
-                        
+                        by_wid, failed_window_results = load_window_results(ctx.samples_dir, sid)
+                        if failed_window_results:
+                            _persist_sample_failure(
+                                ctx.subset,
+                                sid,
+                                "window_boundary_failed",
+                                {
+                                    "failed_window_ids": sorted(int(wid) for wid in failed_window_results),
+                                    "errors": {
+                                        str(wid): str(record.get("terminal_error", "unknown"))
+                                        for wid, record in sorted(failed_window_results.items())
+                                    },
+                                },
+                            )
+                            sample_status[sid] = 4
+                            st["cur_idx"] += 1
+                            print(f"[Fail] {ctx.subset}/{sid}: terminal window failure blocks finalize")
+                            time.sleep(0.01)
+                            continue
+
                         if len(by_wid) >= len(windows):
                             refinement_windows: List[Window] = []
                             if config.windowing.enable_refinement_pass:
@@ -583,6 +789,32 @@ def create_app(config: Config) -> FastAPI:
                                     refinement_frames,
                                 )
                                 if refinement_windows:
+                                    failed_refinement = [
+                                        refinement_window
+                                        for refinement_window in refinement_windows
+                                        if refinement_window.window_id in failed_window_results
+                                    ]
+                                    if failed_refinement:
+                                        _persist_sample_failure(
+                                            ctx.subset,
+                                            sid,
+                                            "refinement_window_failed",
+                                            {
+                                                "failed_window_ids": [int(window.window_id) for window in failed_refinement],
+                                                "errors": {
+                                                    str(window.window_id): str(
+                                                        failed_window_results.get(window.window_id, {}).get("terminal_error", "unknown")
+                                                    )
+                                                    for window in failed_refinement
+                                                },
+                                            },
+                                        )
+                                        sample_status[sid] = 4
+                                        st["cur_idx"] += 1
+                                        print(f"[Fail] {ctx.subset}/{sid}: terminal refinement window failure blocks finalize")
+                                        time.sleep(0.01)
+                                        continue
+
                                     missing_refinement = [
                                         refinement_window
                                         for refinement_window in refinement_windows
@@ -657,10 +889,25 @@ def create_app(config: Config) -> FastAPI:
                                 boundary_support_threshold=config.windowing.boundary_support_threshold,
                                 refine_final_instructions=config.windowing.refine_final_instructions,
                             )
+                            if not provisional_res.get("segments"):
+                                _persist_sample_failure(
+                                    ctx.subset,
+                                    sid,
+                                    "finalize_empty_segments",
+                                    {
+                                        "window_count": len(windows),
+                                        "completed_window_count": len(by_wid),
+                                    },
+                                )
+                                sample_status[sid] = 4
+                                st["cur_idx"] += 1
+                                print(f"[Fail] {ctx.subset}/{sid}: finalize produced no segments")
+                                time.sleep(0.01)
+                                continue
 
                             final_res = provisional_res
                             if config.windowing.enable_boundary_refinement:
-                                boundary_results = load_boundary_refinement_results(ctx.samples_dir, sid)
+                                boundary_results, boundary_failures = load_boundary_refinement_results(ctx.samples_dir, sid)
                                 boundary_refinement_frames = (
                                     config.windowing.boundary_refinement_frames_per_window
                                     or config.windowing.frames_per_window
@@ -676,6 +923,7 @@ def create_app(config: Config) -> FastAPI:
                                     boundary_window
                                     for boundary_window in boundary_refinement_windows
                                     if boundary_window.boundary_id not in boundary_results
+                                    and boundary_window.boundary_id not in boundary_failures
                                 ]
 
                                 if missing_boundaries:
@@ -749,14 +997,19 @@ def create_app(config: Config) -> FastAPI:
                                 diagnostics = dict(final_res.get("diagnostics", {}))
                                 diagnostics["boundary_refinement_enabled"] = True
                                 diagnostics["boundary_refinement_count"] = len(boundary_results)
+                                diagnostics["boundary_refinement_failed_count"] = len(boundary_failures)
+                                diagnostics["boundary_refinement_failed_ids"] = [
+                                    int(boundary_id) for boundary_id in sorted(boundary_failures)
+                                ]
                                 final_res["diagnostics"] = diagnostics
 
                             if config.windowing.segment_labeling_mode == "deferred":
-                                label_results = load_segment_label_results(ctx.samples_dir, sid)
+                                label_results, label_failures = load_segment_label_results(ctx.samples_dir, sid)
                                 missing_segments = [
                                     segment
                                     for segment in final_res.get("segments", [])
                                     if int(segment.get("seg_id", -1)) not in label_results
+                                    and int(segment.get("seg_id", -1)) not in label_failures
                                 ]
 
                                 if missing_segments:
@@ -831,6 +1084,10 @@ def create_app(config: Config) -> FastAPI:
                                 diagnostics = dict(final_res.get("diagnostics", {}))
                                 diagnostics["segment_labeling_mode"] = "deferred"
                                 diagnostics["segment_label_count"] = len(label_results)
+                                diagnostics["segment_label_failed_count"] = len(label_failures)
+                                diagnostics["segment_label_failed_ids"] = [
+                                    int(segment_id) for segment_id in sorted(label_failures)
+                                ]
                                 final_res["diagnostics"] = diagnostics
                             
                             with open(segments_path(ctx.samples_dir, sid), "w", encoding="utf-8") as f:
@@ -838,6 +1095,11 @@ def create_app(config: Config) -> FastAPI:
                             
                             done_path = done_marker_path(ctx.samples_dir, sid)
                             already_done = Path(done_path).exists()
+                            for stale_failure_path in (failed_marker_path(ctx.samples_dir, sid), failure_report_path(ctx.samples_dir, sid)):
+                                try:
+                                    Path(stale_failure_path).unlink()
+                                except FileNotFoundError:
+                                    pass
                             Path(done_path).touch()
                             
                             sample_status[sid] = 3

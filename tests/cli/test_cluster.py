@@ -75,3 +75,30 @@ def test_cluster_cli_uses_worker_count_from_config(monkeypatch, tmp_path: Path) 
     workers = [proc for proc in FakeProcess.created if str(proc.name).startswith("v2t-worker-")]
     assert len(server) == 1
     assert len(workers) == 3
+
+
+def test_cluster_cli_supports_env_only_configuration(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("WORKER_COUNT", "2")
+
+    _reset_fake_process_state()
+    monkeypatch.setattr("video2tasks.cli.cluster.multiprocessing.Process", FakeProcess)
+    monkeypatch.setattr("video2tasks.cli.cluster.time.sleep", lambda _secs: None)
+
+    runner = CliRunner()
+    result = runner.invoke(main, [])
+
+    assert result.exit_code == 0
+    assert len(FakeProcess.created) == 3
+
+
+def test_cluster_cli_wraps_invalid_configuration_as_usage_error(monkeypatch) -> None:
+    def fake_load(_config):
+        raise ValueError("invalid env configuration")
+
+    monkeypatch.setattr("video2tasks.cli.cluster.Config.load", fake_load)
+
+    result = CliRunner().invoke(main, [])
+
+    assert result.exit_code != 0
+    assert "invalid env configuration" in result.output

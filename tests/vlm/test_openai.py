@@ -104,3 +104,42 @@ def test_openai_backend_returns_empty_dict_on_unparseable_response(monkeypatch) 
     result = backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
 
     assert result == {}
+
+
+def test_openai_backend_rejects_mismatched_instruction_count(monkeypatch) -> None:
+    json_module = json
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        return DummyResponse(
+            200,
+            {
+                "output": [
+                    {
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json_module.dumps(
+                                    {
+                                        "thought": "Bad payload",
+                                        "transitions": [1],
+                                        "instructions": ["Only one instruction", "", "Extra"],
+                                    }
+                                ),
+                            }
+                        ]
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr("video2tasks.vlm.openai_api.requests.post", fake_post)
+
+    backend = create_backend(
+        "openai",
+        api_key="sk-test",
+        model="gpt-5.2",
+    )
+
+    result = backend.infer([np.zeros((8, 8, 3), dtype=np.uint8)], "Detect switches")
+
+    assert result == {}

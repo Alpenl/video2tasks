@@ -11,6 +11,7 @@ import base64
 import subprocess
 
 from .task_artifacts import ArtifactBatch, TaskArtifactWriter
+from ..vlm.base import normalize_task_window_result
 
 
 @dataclass
@@ -328,6 +329,19 @@ def build_boundary_refinement_windows(
     return refinement_windows
 
 
+def _refinement_abstention_confirms_same_task(record: dict) -> bool:
+    vlm_json = record.get("vlm_json", {})
+    if not isinstance(vlm_json, dict):
+        return False
+
+    instructions = [
+        str(item).strip()
+        for item in vlm_json.get("instructions", [])
+        if str(item).strip()
+    ]
+    return len(instructions) == 1
+
+
 def apply_boundary_refinement_results(
     segments: List[dict],
     refinement_results: dict,
@@ -367,6 +381,8 @@ def apply_boundary_refinement_results(
 
         if selected_frame is None:
             if abstain_merge_max_support < 0:
+                continue
+            if not _refinement_abstention_confirms_same_task(record):
                 continue
 
             support, _ = _boundary_support_between(segments[idx], segments[idx + 1])
@@ -861,10 +877,10 @@ _FOCUS_NOISE_TOKENS = {
     "adding", "additional", "combined", "finish", "mash", "season", "simmering",
     "smooth", "sprinkle", "stir", "together", "use", "well", "tong",
 }
-_POT_LOADING_CONTEXT_TOKENS = {"butter", "mint", "nutmeg", "salt", "sugar"}
-_HEATED_STAGE_TOKENS = {"boil", "cook", "fill", "filled", "fry", "rinse", "saut", "saute", "simmer", "water"}
-_PROTEIN_TOKENS = {"bacon", "beef", "chicken", "fish", "ham", "hot", "meat", "pork", "sausage", "turkey"}
-_MASH_CONTEXT_TOKENS = {"butter", "liquid", "mash", "masher", "milk", "potato"}
+_STEP_ORDER_TOKENS = {
+    "another", "final", "first", "fourth", "last", "next", "second",
+    "seventh", "sixth", "third", "fifth", "eighth", "ninth", "tenth",
+}
 _GENERIC_ADDITIVE_TOKENS = {
     "butter", "liquid", "oil", "pepper", "salt", "seasoning", "spice",
     "spices", "sugar", "water",
@@ -892,6 +908,18 @@ def _singularize_token(token: str) -> str:
 
 def _instruction_tokens(text: str) -> List[str]:
     return [_singularize_token(tok) for tok in _TOKEN_RE.findall(text.lower())]
+
+
+def _instruction_sequence_markers(text: str) -> set[str]:
+    return set(_instruction_tokens(text.replace("/", " "))) & _STEP_ORDER_TOKENS
+
+
+def _has_distinct_sequence_markers(left_instruction: str, right_instruction: str) -> bool:
+    left_markers = _instruction_sequence_markers(left_instruction)
+    right_markers = _instruction_sequence_markers(right_instruction)
+    if not left_markers and not right_markers:
+        return False
+    return left_markers != right_markers
 
 
 def _instruction_action_head_tokens(text: str, limit: int = 2) -> set[str]:
@@ -1141,143 +1169,6 @@ def _instruction_focus_tokens(text: str) -> set[str]:
     return focus_tokens
 
 
-def _is_pre_cook_pot_loading_pair(left_instruction: str, right_instruction: str) -> bool:
-    shared_pot = _destination_tokens(left_instruction) & _destination_tokens(right_instruction) & {"pot"}
-    if not shared_pot:
-        return False
-
-    left_tokens = set(_instruction_tokens(left_instruction.replace("/", " ")))
-    right_tokens = set(_instruction_tokens(right_instruction.replace("/", " ")))
-    combined_tokens = left_tokens | right_tokens
-    if combined_tokens & _HEATED_STAGE_TOKENS:
-        return False
-    if combined_tokens & _PROTEIN_TOKENS:
-        return False
-    if not (combined_tokens & _POT_LOADING_CONTEXT_TOKENS):
-        return False
-
-    left_actions = _action_families(left_instruction)
-    right_actions = _action_families(right_instruction)
-    if left_actions and not left_actions <= {"add"}:
-        return False
-    if right_actions and not right_actions <= {"add"}:
-        return False
-    return True
-
-
-def _is_same_pot_masher_continuation_pair(left_instruction: str, right_instruction: str) -> bool:
-    shared_pot = _destination_tokens(left_instruction) & _destination_tokens(right_instruction) & {"pot"}
-    if not shared_pot:
-        return False
-
-    left_tokens = set(_instruction_tokens(left_instruction.replace("/", " ")))
-    right_tokens = set(_instruction_tokens(right_instruction.replace("/", " ")))
-    combined_tokens = left_tokens | right_tokens
-    if combined_tokens & _PROTEIN_TOKENS:
-        return False
-    if "pea" in combined_tokens and "potato" in combined_tokens:
-        return False
-    if not combined_tokens & _MASH_CONTEXT_TOKENS:
-        return False
-
-    left_has_mash = bool(left_tokens & {"mash", "masher", "potato"})
-    right_has_mash = bool(right_tokens & {"mash", "masher", "potato"})
-    left_has_liquid_context = bool(left_tokens & {"butter", "liquid", "milk"})
-    right_has_liquid_context = bool(right_tokens & {"butter", "liquid", "milk"})
-    return (
-        (left_has_liquid_context and right_has_mash)
-        or (right_has_liquid_context and left_has_mash)
-        or (left_has_mash and right_has_mash)
-    )
-
-
-def _is_same_ingredient_finish_chain_pair(left_instruction: str, right_instruction: str) -> bool:
-    left_pot = _destination_tokens(left_instruction) & {"pot"}
-    right_pot = _destination_tokens(right_instruction) & {"pot"}
-    if not (left_pot or right_pot):
-        return False
-
-    shared_ingredients = _ingredient_tokens(left_instruction) & _ingredient_tokens(right_instruction)
-    if not shared_ingredients or shared_ingredients & _PROTEIN_TOKENS:
-        return False
-
-    left_tokens = set(_instruction_tokens(left_instruction.replace("/", " ")))
-    right_tokens = set(_instruction_tokens(right_instruction.replace("/", " ")))
-    combined_tokens = left_tokens | right_tokens
-    if not combined_tokens & {"butter", "liquid", "mash", "masher", "milk"}:
-        return False
-
-    left_actions = _action_families(left_instruction)
-    right_actions = _action_families(right_instruction)
-    if left_actions and not left_actions <= {"mix"}:
-        return False
-    if right_actions and not right_actions <= {"mix"}:
-        return False
-    return True
-
-
-def _is_plated_mashed_potato_finish_chain_pair(left_instruction: str, right_instruction: str) -> bool:
-    left_tokens = set(_instruction_tokens(left_instruction.replace("/", " ")))
-    right_tokens = set(_instruction_tokens(right_instruction.replace("/", " ")))
-    combined_tokens = left_tokens | right_tokens
-    if not {"mashed", "potato"} & combined_tokens:
-        return False
-    if not (combined_tokens & {"dish", "plate", "top"} or _destination_tokens(left_instruction) & {"plate"} or _destination_tokens(right_instruction) & {"plate"}):
-        return False
-    if not combined_tokens & {"garnish", "herb", "onion", "puree", "sauce", "sausage"}:
-        return False
-    return True
-
-
-def _instruction_mentions_wrapper(text: str) -> bool:
-    lower = text.lower()
-    if "spring roll" in lower or "egg roll" in lower:
-        return True
-    tokens = set(_instruction_tokens(text.replace("/", " ")))
-    return bool(tokens & {"wrap", "wrapper"})
-
-
-def _is_wrapper_fill_to_roll_pair(left_instruction: str, right_instruction: str) -> bool:
-    left_tokens = set(_instruction_tokens(left_instruction.replace("/", " ")))
-    right_tokens = set(_instruction_tokens(right_instruction.replace("/", " ")))
-    left_head_tokens = _instruction_action_head_tokens(left_instruction)
-    right_head_tokens = _instruction_action_head_tokens(right_instruction)
-    left_wrapper_or_dumpling_assembly = (
-        _instruction_mentions_wrapper(left_instruction)
-        or (
-            bool(left_tokens & {"dumpling", "pierogi", "pierogy"})
-            and bool(left_tokens & {"assemble", "fill", "fold"})
-        )
-    )
-    return (
-        left_wrapper_or_dumpling_assembly
-        and _instruction_mentions_wrapper(right_instruction)
-        and bool((left_head_tokens & {"place", "fill", "spread", "assemble", "fold"}) or (left_tokens & {"assemble"}))
-        and bool((right_head_tokens & {"roll", "fold", "tuck"}) or (right_tokens & {"pleat"}))
-    )
-
-
-def _is_dough_roll_continuation_pair(left_instruction: str, right_instruction: str) -> bool:
-    left_tokens = set(_instruction_tokens(left_instruction.replace("/", " ")))
-    right_tokens = set(_instruction_tokens(right_instruction.replace("/", " ")))
-    if "dough" not in left_tokens or "dough" not in right_tokens:
-        return False
-    if left_tokens & {"cut", "circle", "glass", "cutter"}:
-        return False
-    if right_tokens & {"cut", "circle", "glass", "cutter"}:
-        return False
-
-    left_head_tokens = _instruction_action_head_tokens(left_instruction)
-    right_head_tokens = _instruction_action_head_tokens(right_instruction)
-    return (
-        bool(left_head_tokens & {"flatten", "roll"})
-        and (
-            bool(right_head_tokens & {"roll"})
-            or ("rolling" in right_tokens and "pin" in right_tokens)
-        )
-    )
-
-
 def _action_tokens(text: str) -> set[str]:
     tokens = _instruction_action_head_tokens(text)
     return tokens & (
@@ -1324,13 +1215,6 @@ def _boundary_support_between(left: dict, right: dict) -> Tuple[float, bool]:
 
 
 def _choose_instruction(left: dict, right: dict, fps: float) -> str:
-    if _is_wrapper_fill_to_roll_pair(left["instruction"], right["instruction"]):
-        return right["instruction"]
-    if _is_dough_roll_continuation_pair(left["instruction"], right["instruction"]):
-        return right["instruction"]
-    if _is_same_ingredient_finish_chain_pair(left["instruction"], right["instruction"]):
-        return right["instruction"]
-
     shared_ingredient_tokens = _ingredient_tokens(left["instruction"]) & _ingredient_tokens(right["instruction"])
     if (
         shared_ingredient_tokens
@@ -1370,6 +1254,11 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
     shared_action_tokens = _action_tokens(left["instruction"]) & _action_tokens(right["instruction"])
     shared_action_families = _action_families(left["instruction"]) & _action_families(right["instruction"])
     boundary_support, has_boundary_support = _boundary_support_between(left, right)
+    merge_support_ceiling = (
+        float(boundary_support_threshold)
+        if boundary_support_threshold > 0.0
+        else float(_ACTION_FAMILY_SUPPORT_THRESHOLD)
+    )
     strong_boundary = has_boundary_support and boundary_support_threshold > 0.0 and boundary_support >= boundary_support_threshold
 
     left_recipe = _instruction_has_recipe_action(left["instruction"])
@@ -1425,22 +1314,6 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
         and right_recipe
         and bool(shared_action_families & {"add", "mix"})
     )
-    pre_cook_pot_loading_sequence = _is_pre_cook_pot_loading_pair(
-        left["instruction"],
-        right["instruction"],
-    )
-    same_pot_masher_continuation = _is_same_pot_masher_continuation_pair(
-        left["instruction"],
-        right["instruction"],
-    )
-    same_ingredient_finish_chain = _is_same_ingredient_finish_chain_pair(
-        left["instruction"],
-        right["instruction"],
-    )
-    plated_mashed_potato_finish_chain = _is_plated_mashed_potato_finish_chain_pair(
-        left["instruction"],
-        right["instruction"],
-    )
     generic_phase_to_explicit_ingredient_shift = (
         bool(shared_dest_tokens & {"pot", "pan"})
         and bool(shared_action_families & {"mix", "cook"})
@@ -1495,39 +1368,36 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
             or (right_additive_only and bool(right_destination_focus) and left_mixing and bool(left_focus_tokens))
         )
     )
-    wrapper_fill_to_roll = _is_wrapper_fill_to_roll_pair(left["instruction"], right["instruction"])
-    dough_roll_continuation = _is_dough_roll_continuation_pair(
+    repeated_sequence_markers = _has_distinct_sequence_markers(
         left["instruction"],
         right["instruction"],
     )
 
     if similarity < 0.34:
-        # Adjacent cooking sub-steps often swap ingredients while staying in the same bowl/pot.
+        # Adjacent sub-steps can stay mergeable when there is shared structure,
+        # but recall-first means we should be conservative once the link is weak.
         if not (
             left_prep
             or right_prep
             or left_filler
             or right_filler
-            or pre_cook_pot_loading_sequence
-            or same_pot_masher_continuation
-            or same_ingredient_finish_chain
-            or plated_mashed_potato_finish_chain
             or (
                 same_container_shared_focus_recipe_steps
-                and (not has_boundary_support or boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD)
+                and (not has_boundary_support or boundary_support < merge_support_ceiling)
             )
             or (
                 same_container_generic_focus_bridge
-                and (not has_boundary_support or boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD)
+                and (not has_boundary_support or boundary_support < merge_support_ceiling)
             )
             or (
                 same_container_additive_mix_bridge
-                and (not has_boundary_support or boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD)
+                and (not has_boundary_support or boundary_support < merge_support_ceiling)
             )
             or (
                 shared_dest_tokens & _COOKING_CONTAINER_TOKENS
                 and (left_recipe or right_recipe)
                 and (shared_ingredient_tokens or shared_action_tokens)
+                and not repeated_sequence_markers
             )
             or same_ingredient_prep_to_transfer
             or same_ingredient_same_action_prep
@@ -1536,64 +1406,43 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
                 same_container_same_family_recipe_steps
                 and not heated_distinct_add_sequence
                 and has_boundary_support
-                and boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD
+                and boundary_support < merge_support_ceiling
+                and not repeated_sequence_markers
             )
-            or wrapper_fill_to_roll
-            or dough_roll_continuation
         ):
             return False
 
     left_duration = _segment_duration_sec(left, fps)
     right_duration = _segment_duration_sec(right, fps)
 
+    if strong_boundary:
+        return False
     if distinct_prepped_ingredient_steps:
         return False
     if generic_phase_to_explicit_ingredient_shift:
         return False
     if (
         same_container_shared_focus_recipe_steps
-        and (not has_boundary_support or boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD)
+        and (not has_boundary_support or boundary_support < merge_support_ceiling)
         and max(left_duration, right_duration) <= 18.0
     ):
         return True
     if (
         same_container_generic_focus_bridge
-        and (not has_boundary_support or boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD)
+        and (not has_boundary_support or boundary_support < merge_support_ceiling)
         and min(left_duration, right_duration) <= 4.5
         and max(left_duration, right_duration) <= 14.0
     ):
         return True
     if (
         same_container_additive_mix_bridge
-        and (not has_boundary_support or boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD)
+        and (not has_boundary_support or boundary_support < merge_support_ceiling)
         and min(left_duration, right_duration) <= 12.0
         and max(left_duration, right_duration) <= 18.0
     ):
         return True
-    if (
-        pre_cook_pot_loading_sequence
-        and has_boundary_support
-        and boundary_support <= 1.0
-        and max(left_duration, right_duration) <= 14.0
-    ):
-        return True
-    if (
-        same_pot_masher_continuation
-        and has_boundary_support
-        and boundary_support <= 1.0
-        and max(left_duration, right_duration) <= 35.0
-    ):
-        return True
-    if same_ingredient_finish_chain and max(left_duration, right_duration) <= 20.0:
-        return True
-    if plated_mashed_potato_finish_chain and max(left_duration, right_duration) <= 22.0:
-        return True
     if distinct_same_ingredient_prep_steps:
-        if dough_roll_continuation:
-            return True
         if not has_boundary_support:
-            return False
-        if strong_boundary:
             return False
         if min(left_duration, right_duration) <= 8.0:
             return True
@@ -1605,14 +1454,17 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
         return True
     if right_generic and right_duration <= 4.5 and not (right_prep or right_filler):
         return True
-    if wrapper_fill_to_roll:
-        return True
     if shared_dest_tokens & _COOKING_CONTAINER_TOKENS and (left_recipe or right_recipe):
-        if shared_ingredient_tokens and min(left_duration, right_duration) <= 8.0:
+        if shared_ingredient_tokens and min(left_duration, right_duration) <= 8.0 and not repeated_sequence_markers:
             return True
-        if shared_action_tokens and max(left_duration, right_duration) <= 8.0:
+        if shared_action_tokens and max(left_duration, right_duration) <= 8.0 and not repeated_sequence_markers:
             return True
-        if (left_mixing or right_mixing) and shared_ingredient_tokens and max(left_duration, right_duration) <= 20.0:
+        if (
+            (left_mixing or right_mixing)
+            and shared_ingredient_tokens
+            and max(left_duration, right_duration) <= 20.0
+            and not repeated_sequence_markers
+        ):
             return True
     if same_ingredient_prep_to_transfer:
         if min(left_duration, right_duration) <= 8.0:
@@ -1624,11 +1476,12 @@ def _should_merge_segments(left: dict, right: dict, fps: float, boundary_support
         same_container_same_family_recipe_steps
         and not heated_distinct_add_sequence
         and has_boundary_support
-        and boundary_support < _ACTION_FAMILY_SUPPORT_THRESHOLD
+        and boundary_support < merge_support_ceiling
+        and not repeated_sequence_markers
     ):
         if min(left_duration, right_duration) <= 16.0:
             return True
-    if similarity >= 0.6 and min(left_duration, right_duration) <= 6.5:
+    if similarity >= 0.6 and min(left_duration, right_duration) <= 6.5 and not repeated_sequence_markers:
         return True
     return False
 
@@ -1819,6 +1672,52 @@ def _is_specific_instruction(text: str) -> bool:
     )
 
 
+def _segment_boundary_points(segments: List[dict]) -> List[int]:
+    return [int(segment["end_frame"]) for segment in segments[:-1]]
+
+
+def _strong_boundary_points(segments: List[dict], boundary_support_threshold: float) -> List[int]:
+    if boundary_support_threshold <= 0.0:
+        return []
+
+    points: List[int] = []
+    for segment in segments[:-1]:
+        try:
+            support = float(segment.get("boundary_support_after", 0.0))
+        except (TypeError, ValueError):
+            support = 0.0
+        if support >= boundary_support_threshold:
+            points.append(int(segment["end_frame"]))
+    return points
+
+
+def _missing_boundary_points(
+    protected_points: List[int],
+    merged_segments: List[dict],
+    tolerance_frames: int,
+) -> List[int]:
+    if not protected_points:
+        return []
+
+    candidate_points = _segment_boundary_points(merged_segments)
+    missing: List[int] = []
+    for point in protected_points:
+        if any(abs(int(candidate) - int(point)) <= tolerance_frames for candidate in candidate_points):
+            continue
+        missing.append(int(point))
+    return missing
+
+
+def _missing_strong_boundary_points(
+    light_segments: List[dict],
+    merged_segments: List[dict],
+    boundary_support_threshold: float,
+    tolerance_frames: int,
+) -> List[int]:
+    strong_points = _strong_boundary_points(light_segments, boundary_support_threshold)
+    return _missing_boundary_points(strong_points, merged_segments, tolerance_frames)
+
+
 def _merged_segment_looks_overcollapsed(
     segment: dict,
     source_segments: List[dict],
@@ -2001,32 +1900,21 @@ def _should_split_on_instruction_drift(
     right_instruction: str,
     fallback_containers: Optional[set[str]] = None,
 ) -> bool:
+    del fallback_containers
+
     left_actions = _action_families(left_instruction)
     right_actions = _action_families(right_instruction)
-
-    shared_containers = (
-        _phase_container_tokens(left_instruction, fallback_containers)
-        & _phase_container_tokens(right_instruction, fallback_containers)
-        & _COOKING_CONTAINER_TOKENS
-    )
-    if not shared_containers:
-        return False
-
-    if shared_containers & {"bowl", "processor", "salad"}:
-        if left_actions <= {"add", "mix"} and right_actions <= {"add", "mix"}:
-            return False
-
     if left_actions != right_actions and (left_actions or right_actions):
         return True
 
-    left_ingredients = _ingredient_tokens(left_instruction)
-    right_ingredients = _ingredient_tokens(right_instruction)
-    if (
-        left_actions == right_actions == {"add"}
-        and left_ingredients
-        and right_ingredients
-        and not (left_ingredients & right_ingredients)
-    ):
+    left_focus = _instruction_focus_tokens(left_instruction)
+    right_focus = _instruction_focus_tokens(right_instruction)
+    if left_focus and right_focus and not (left_focus & right_focus):
+        return True
+
+    left_primary = _primary_object_tokens(left_instruction) - _COOKING_CONTAINER_TOKENS
+    right_primary = _primary_object_tokens(right_instruction) - _COOKING_CONTAINER_TOKENS
+    if left_primary and right_primary and not (left_primary & right_primary):
         return True
 
     return False
@@ -2188,6 +2076,67 @@ def split_long_raw_segments_on_instruction_drift(
     return split_segments
 
 
+def _recover_dense_transition_micro_boundaries(
+    windows: List[Window],
+    by_wid: dict,
+    fps: float,
+    nframes: int,
+    existing_cut_points: List[int],
+) -> List[int]:
+    if nframes <= 0:
+        return []
+
+    safe_fps = float(fps) if fps > 1e-6 else 30.0
+    micro_gap_frames = max(1, min(5, int(round(0.15 * safe_fps))))
+    existing_points = {int(point) for point in existing_cut_points}
+    recovered: List[int] = []
+
+    for window in windows:
+        rec = by_wid.get(window.window_id)
+        if not rec:
+            continue
+
+        cur_len = len(window.frame_ids)
+        if cur_len == 0:
+            continue
+
+        vlm = normalize_task_window_result(
+            rec.get("vlm_json", {}),
+            max_transition_index=cur_len - 1,
+        )
+        if not vlm:
+            continue
+
+        transitions = sorted(
+            {
+                int(t_idx)
+                for t_idx in vlm.get("transitions", [])
+                if 0 <= int(t_idx) < cur_len
+            }
+        )
+        instructions = [
+            str(item).strip()
+            for item in vlm.get("instructions", [])
+            if str(item).strip()
+        ]
+        if len(transitions) < 2 or len(instructions) < len(transitions) + 1:
+            continue
+
+        global_points = [int(window.frame_ids[idx]) for idx in transitions]
+        for idx, point in enumerate(global_points):
+            prev_point = global_points[idx - 1] if idx > 0 else None
+            next_point = global_points[idx + 1] if idx + 1 < len(global_points) else None
+            close_prev = prev_point is not None and 0 < (point - prev_point) <= micro_gap_frames
+            close_next = next_point is not None and 0 < (next_point - point) <= micro_gap_frames
+            if not (close_prev or close_next):
+                continue
+            if point <= 0 or point >= nframes or point in existing_points:
+                continue
+            recovered.append(point)
+
+    return sorted(set(recovered))
+
+
 def build_segments_via_cuts(
     sample_id: str,
     windows: List[Window],
@@ -2210,6 +2159,7 @@ def build_segments_via_cuts(
         fps = 30.0
     
     raw_cuts = []
+    raw_cut_support_by_frame: Dict[int, float] = {}
     instruction_timeline = [[] for _ in range(nframes)]
     center_weights = np.hanning(frames_per_window + 2)[1:-1]
     
@@ -2218,14 +2168,21 @@ def build_segments_via_cuts(
         if not rec:
             continue
         
-        vlm = rec.get("vlm_json", {})
-        transitions = vlm.get("transitions", [])
-        instructions = vlm.get("instructions", [])
         f_ids = w.frame_ids
         cur_len = len(f_ids)
-        
+
         if cur_len == 0:
             continue
+
+        vlm = normalize_task_window_result(
+            rec.get("vlm_json", {}),
+            max_transition_index=cur_len - 1,
+        )
+        if not vlm:
+            continue
+
+        transitions = vlm.get("transitions", [])
+        instructions = vlm.get("instructions", [])
         
         # Collect cut points
         for t_idx in transitions:
@@ -2238,6 +2195,7 @@ def build_segments_via_cuts(
                     else:
                         w_val = 1.0 if min(idx, cur_len - 1 - idx) > 2 else 0.5
                     raw_cuts.append((global_fid, float(w_val)))
+                    raw_cut_support_by_frame[global_fid] = raw_cut_support_by_frame.get(global_fid, 0.0) + float(w_val)
             except (ValueError, IndexError):
                 pass
         
@@ -2323,43 +2281,54 @@ def build_segments_via_cuts(
             point: float(corroborated_support_by_point.get(point, cut_support_by_point.get(point, 0.0)))
             for point in merged_probe_points
         }
-    
+
+    recovered_micro_cut_points = _recover_dense_transition_micro_boundaries(
+        windows,
+        by_wid,
+        fps,
+        nframes,
+        final_cut_points,
+    )
+    if recovered_micro_cut_points:
+        final_cut_points = sorted(set(final_cut_points) | set(recovered_micro_cut_points))
+        for point in recovered_micro_cut_points:
+            cut_support_by_point.setdefault(int(point), float(raw_cut_support_by_frame.get(int(point), 0.0)))
+
     # Build segments
     raw_segments = []
     seg_id = 0
     
     for i in range(len(final_cut_points) - 1):
         s, e = int(final_cut_points[i]), int(final_cut_points[i + 1])
-        min_frames = max(1, int(0.8 * fps))
-        
-        if (e - s) < min_frames:
+        if e <= s:
             continue
-        
+
         margin = int((e - s) * 0.2) if e > s else 0
         mid_s, mid_e = s + margin, e - margin
-        
+        mid_start = min(max(s, mid_s), max(s, e - 1))
+        mid_end = min(e, max(mid_start + 1, mid_e))
+
         candidates = []
-        for f in range(mid_s, mid_e + 1):
+        for f in range(mid_start, mid_end):
             if f < nframes:
                 candidates.extend(instruction_timeline[f])
-        
+
         if not candidates:
             for f in range(s, e):
                 if f < nframes:
                     candidates.extend(instruction_timeline[f])
-        
-        if candidates:
-            best_inst = Counter(candidates).most_common(1)[0][0]
-            raw_segments.append({
-                "seg_id": seg_id,
-                "start_frame": s,
-                "end_frame": e,
-                "instruction": best_inst,
-                "confidence": 1.0,
-                "boundary_support_before": float(cut_support_by_point.get(s, 0.0)),
-                "boundary_support_after": float(cut_support_by_point.get(e, 0.0)),
-            })
-            seg_id += 1
+
+        best_inst = Counter(candidates).most_common(1)[0][0] if candidates else "Unknown task step"
+        raw_segments.append({
+            "seg_id": seg_id,
+            "start_frame": s,
+            "end_frame": e,
+            "instruction": best_inst,
+            "confidence": 1.0,
+            "boundary_support_before": float(cut_support_by_point.get(s, 0.0)),
+            "boundary_support_after": float(cut_support_by_point.get(e, 0.0)),
+        })
+        seg_id += 1
 
     raw_segments = split_long_raw_segments_on_instruction_drift(
         raw_segments,
@@ -2368,22 +2337,50 @@ def build_segments_via_cuts(
     )
     light_segments = cleanup_auxiliary_segments(raw_segments, fps)
     merged_segments = merge_task_level_segments(
-        raw_segments,
+        light_segments,
         fps,
         boundary_support_threshold=boundary_support_threshold,
     )
-    use_light_fallback = adaptive_merge_guard and _should_fallback_to_light_cleanup(
+    strong_boundary_tolerance_frames = max(1, min(5, int(round(0.2 * max(fps, 1.0)))))
+    strong_boundary_points = _strong_boundary_points(light_segments, boundary_support_threshold)
+    missing_strong_boundaries_if_merged = _missing_strong_boundary_points(
+        light_segments,
+        merged_segments,
+        boundary_support_threshold,
+        strong_boundary_tolerance_frames,
+    )
+    recovered_micro_boundary_tolerance_frames = 0
+    missing_recovered_micro_boundaries_if_merged = _missing_boundary_points(
+        recovered_micro_cut_points,
+        merged_segments,
+        recovered_micro_boundary_tolerance_frames,
+    )
+    adaptive_light_fallback = adaptive_merge_guard and _should_fallback_to_light_cleanup(
         light_segments,
         merged_segments,
         fps,
         min_segments=adaptive_merge_min_segments,
         collapse_ratio=adaptive_merge_collapse_ratio,
     )
-    final_output = light_segments if use_light_fallback else merged_segments
+    use_light_fallback = (
+        bool(missing_strong_boundaries_if_merged)
+        or bool(missing_recovered_micro_boundaries_if_merged)
+        or adaptive_light_fallback
+    )
+    final_output = light_segments
 
     if refine_final_instructions:
         final_output = refine_segment_instructions(final_output, light_segments)
-    
+
+    if missing_strong_boundaries_if_merged:
+        selection_policy = "light_cleanup_strong_boundary_guard"
+    elif missing_recovered_micro_boundaries_if_merged:
+        selection_policy = "light_cleanup_micro_boundary_guard"
+    elif adaptive_light_fallback:
+        selection_policy = "light_cleanup_fallback"
+    else:
+        selection_policy = "light_cleanup_default_recall"
+
     return {
         "sample_id": sample_id,
         "nframes": nframes,
@@ -2392,6 +2389,13 @@ def build_segments_via_cuts(
             "light_segment_count": len(light_segments),
             "merged_segment_count": len(merged_segments),
             "selected_segment_count": len(final_output),
-            "selection_policy": "light_cleanup_fallback" if use_light_fallback else "semantic_merge",
+            "selection_policy": selection_policy,
+            "strong_boundary_count": len(strong_boundary_points),
+            "strong_boundary_points": strong_boundary_points,
+            "missing_strong_boundaries_if_merged": missing_strong_boundaries_if_merged,
+            "missing_recovered_micro_boundaries_if_merged": missing_recovered_micro_boundaries_if_merged,
+            "strong_boundary_tolerance_frames": strong_boundary_tolerance_frames,
+            "recovered_micro_boundary_count": len(recovered_micro_cut_points),
+            "recovered_micro_boundary_points": recovered_micro_cut_points,
         },
     }

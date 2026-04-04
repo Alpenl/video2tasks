@@ -236,103 +236,122 @@ class Config(BaseModel):
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"Config file not found: {path}")
-        
+
         with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f)
-        
-        config = cls(**data)
-        _apply_env_overrides(config)
-        return config
-    
+            data = yaml.safe_load(f) or {}
+
+        return _build_config_with_env_overrides(cls, data)
+
     @classmethod
     def from_env(cls) -> "Config":
         """Load configuration from environment variables."""
-        config = cls()
-        _apply_env_overrides(config)
-        return config
-    
+        return _build_config_with_env_overrides(cls, {})
+
     @classmethod
     def load(cls, path: Optional[Union[str, Path]] = None) -> "Config":
         """Load configuration with priority: file > env > defaults."""
         if path:
             return cls.from_yaml(path)
-        
-        # Try to find config.yaml in current directory
+
         default_path = Path("config.yaml")
         if default_path.exists():
             return cls.from_yaml(default_path)
-        
-        # Fall back to environment variables
+
         return cls.from_env()
 
 
-def _apply_env_overrides(config: Config) -> None:
-    """Apply environment variable overrides onto an existing config."""
+def _set_nested_value(target: dict, path: List[str], value) -> None:
+    cursor = target
+    for key in path[:-1]:
+        cursor = cursor.setdefault(key, {})
+    cursor[path[-1]] = value
+
+
+def _deep_merge_dicts(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dicts(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _collect_env_override_data() -> dict:
+    override: dict = {}
+
     if "DATASETS" in os.environ:
-        config.datasets = _parse_datasets_env(os.environ["DATASETS"])
+        _set_nested_value(override, ["datasets"], [cfg.model_dump() for cfg in _parse_datasets_env(os.environ["DATASETS"])])
     if "RUN_BASE" in os.environ:
-        config.run.base_dir = os.environ["RUN_BASE"]
+        _set_nested_value(override, ["run", "base_dir"], os.environ["RUN_BASE"])
     if "RUN_ID" in os.environ:
-        config.run.run_id = os.environ["RUN_ID"]
+        _set_nested_value(override, ["run", "run_id"], os.environ["RUN_ID"])
     if "PORT" in os.environ:
-        config.server.port = int(os.environ["PORT"])
+        _set_nested_value(override, ["server", "port"], int(os.environ["PORT"]))
     if "MAX_RETRIES_PER_JOB" in os.environ:
-        config.server.max_retries_per_job = int(os.environ["MAX_RETRIES_PER_JOB"])
+        _set_nested_value(override, ["server", "max_retries_per_job"], int(os.environ["MAX_RETRIES_PER_JOB"]))
     if "MAX_EMPTY_RETRIES_PER_JOB" in os.environ:
-        config.server.max_empty_retries_per_job = int(os.environ["MAX_EMPTY_RETRIES_PER_JOB"])
+        _set_nested_value(override, ["server", "max_empty_retries_per_job"], int(os.environ["MAX_EMPTY_RETRIES_PER_JOB"]))
     if "SERVER_URL" in os.environ:
-        config.worker.server_url = os.environ["SERVER_URL"]
+        _set_nested_value(override, ["worker", "server_url"], os.environ["SERVER_URL"])
     if "WORKER_COUNT" in os.environ:
-        config.worker.count = int(os.environ["WORKER_COUNT"])
+        _set_nested_value(override, ["worker", "count"], int(os.environ["WORKER_COUNT"]))
     if "MODEL_PATH" in os.environ:
-        config.worker.qwen3vl.model_path = os.environ["MODEL_PATH"]
+        _set_nested_value(override, ["worker", "qwen3vl", "model_path"], os.environ["MODEL_PATH"])
     if "BACKEND" in os.environ:
-        config.worker.backend = os.environ["BACKEND"]
+        _set_nested_value(override, ["worker", "backend"], os.environ["BACKEND"])
     if "REMOTE_API_URL" in os.environ:
-        config.worker.remote_api.api_url = os.environ["REMOTE_API_URL"]
+        _set_nested_value(override, ["worker", "remote_api", "api_url"], os.environ["REMOTE_API_URL"])
     if "REMOTE_API_KEY" in os.environ:
-        config.worker.remote_api.api_key = os.environ["REMOTE_API_KEY"]
+        _set_nested_value(override, ["worker", "remote_api", "api_key"], os.environ["REMOTE_API_KEY"])
     if "REMOTE_API_TIMEOUT" in os.environ:
-        config.worker.remote_api.timeout_sec = float(os.environ["REMOTE_API_TIMEOUT"])
+        _set_nested_value(override, ["worker", "remote_api", "timeout_sec"], float(os.environ["REMOTE_API_TIMEOUT"]))
     if "REMOTE_API_HEADERS" in os.environ:
         headers_raw = os.environ["REMOTE_API_HEADERS"]
         headers = json.loads(headers_raw)
         if not isinstance(headers, dict):
             raise ValueError("REMOTE_API_HEADERS must be a JSON object")
-        config.worker.remote_api.headers = headers
+        _set_nested_value(override, ["worker", "remote_api", "headers"], headers)
     if "OPENAI_API_KEY" in os.environ:
-        config.worker.openai.api_key = os.environ["OPENAI_API_KEY"]
+        _set_nested_value(override, ["worker", "openai", "api_key"], os.environ["OPENAI_API_KEY"])
     if "OPENAI_MODEL" in os.environ:
-        config.worker.openai.model = os.environ["OPENAI_MODEL"]
+        _set_nested_value(override, ["worker", "openai", "model"], os.environ["OPENAI_MODEL"])
     if "OPENAI_BASE_URL" in os.environ:
-        config.worker.openai.base_url = os.environ["OPENAI_BASE_URL"]
+        _set_nested_value(override, ["worker", "openai", "base_url"], os.environ["OPENAI_BASE_URL"])
     if "OPENAI_TIMEOUT" in os.environ:
-        config.worker.openai.timeout_sec = float(os.environ["OPENAI_TIMEOUT"])
+        _set_nested_value(override, ["worker", "openai", "timeout_sec"], float(os.environ["OPENAI_TIMEOUT"]))
     if "OPENAI_ORGANIZATION" in os.environ:
-        config.worker.openai.organization = os.environ["OPENAI_ORGANIZATION"]
+        _set_nested_value(override, ["worker", "openai", "organization"], os.environ["OPENAI_ORGANIZATION"])
     if "OPENAI_PROJECT" in os.environ:
-        config.worker.openai.project = os.environ["OPENAI_PROJECT"]
+        _set_nested_value(override, ["worker", "openai", "project"], os.environ["OPENAI_PROJECT"])
     if "OPENAI_REASONING_EFFORT" in os.environ:
-        config.worker.openai.reasoning_effort = os.environ["OPENAI_REASONING_EFFORT"]
+        _set_nested_value(override, ["worker", "openai", "reasoning_effort"], os.environ["OPENAI_REASONING_EFFORT"])
     if "OPENAI_MAX_OUTPUT_TOKENS" in os.environ:
-        config.worker.openai.max_output_tokens = int(os.environ["OPENAI_MAX_OUTPUT_TOKENS"])
+        _set_nested_value(override, ["worker", "openai", "max_output_tokens"], int(os.environ["OPENAI_MAX_OUTPUT_TOKENS"]))
     if "OPENAI_JPEG_QUALITY" in os.environ:
-        config.worker.openai.jpeg_quality = int(os.environ["OPENAI_JPEG_QUALITY"])
+        _set_nested_value(override, ["worker", "openai", "jpeg_quality"], int(os.environ["OPENAI_JPEG_QUALITY"]))
     if "GEMINI_API_KEY" in os.environ:
-        config.worker.gemini.api_key = os.environ["GEMINI_API_KEY"]
+        _set_nested_value(override, ["worker", "gemini", "api_key"], os.environ["GEMINI_API_KEY"])
     if "GEMINI_MODEL" in os.environ:
-        config.worker.gemini.model = os.environ["GEMINI_MODEL"]
+        _set_nested_value(override, ["worker", "gemini", "model"], os.environ["GEMINI_MODEL"])
     if "GEMINI_API_MODE" in os.environ:
-        config.worker.gemini.api_mode = os.environ["GEMINI_API_MODE"]
+        _set_nested_value(override, ["worker", "gemini", "api_mode"], os.environ["GEMINI_API_MODE"])
     gemini_base_url = os.environ.get("GEMINI_BASE_URL") or os.environ.get("GOOGLE_GEMINI_BASE_URL")
     if gemini_base_url:
-        config.worker.gemini.base_url = gemini_base_url
+        _set_nested_value(override, ["worker", "gemini", "base_url"], gemini_base_url)
     if "GEMINI_TIMEOUT" in os.environ:
-        config.worker.gemini.timeout_sec = float(os.environ["GEMINI_TIMEOUT"])
+        _set_nested_value(override, ["worker", "gemini", "timeout_sec"], float(os.environ["GEMINI_TIMEOUT"]))
     if "GEMINI_MAX_OUTPUT_TOKENS" in os.environ:
-        config.worker.gemini.max_output_tokens = int(os.environ["GEMINI_MAX_OUTPUT_TOKENS"])
+        _set_nested_value(override, ["worker", "gemini", "max_output_tokens"], int(os.environ["GEMINI_MAX_OUTPUT_TOKENS"]))
     if "GEMINI_JPEG_QUALITY" in os.environ:
-        config.worker.gemini.jpeg_quality = int(os.environ["GEMINI_JPEG_QUALITY"])
+        _set_nested_value(override, ["worker", "gemini", "jpeg_quality"], int(os.environ["GEMINI_JPEG_QUALITY"]))
+
+    return override
+
+
+def _build_config_with_env_overrides(config_cls, base_data: Optional[dict] = None) -> Config:
+    merged = _deep_merge_dicts(base_data or {}, _collect_env_override_data())
+    return config_cls.model_validate(merged)
 
 
 def _parse_datasets_env(spec: str) -> List[DatasetConfig]:

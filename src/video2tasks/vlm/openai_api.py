@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 import requests
 
-from .base import VLMBackend
+from .base import VLMBackend, normalize_task_window_result
 
 
 def _encode_jpeg_data_url(img_bgr: np.ndarray, quality: int = 85) -> str:
@@ -44,34 +44,6 @@ def _extract_json(text: str) -> Dict[str, Any]:
             return {}
 
     return {}
-
-
-def _normalize_vlm_json(data: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(data, dict) or "instructions" not in data:
-        return {}
-
-    transitions: List[int] = []
-    for item in data.get("transitions", []):
-        try:
-            transitions.append(int(item))
-        except (TypeError, ValueError):
-            return {}
-
-    instructions = data.get("instructions", [])
-    if not isinstance(instructions, list) or any(not isinstance(v, str) for v in instructions):
-        return {}
-
-    thought = data.get("thought", "")
-    if thought is None:
-        thought = ""
-    if not isinstance(thought, str):
-        thought = str(thought)
-
-    return {
-        "thought": thought,
-        "transitions": transitions,
-        "instructions": instructions,
-    }
 
 
 def _extract_response_payload(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -200,4 +172,4 @@ class OpenAIBackend(VLMBackend):
         except json.JSONDecodeError:
             return {}
 
-        return _normalize_vlm_json(_extract_response_payload(data))
+        return normalize_task_window_result(_extract_response_payload(data))

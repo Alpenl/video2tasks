@@ -28,6 +28,10 @@ def _boundary_refinement_positions(n_images: int) -> list[int]:
     return sorted(idx for idx in candidates if 0 < idx < (n_images - 1))
 
 
+def boundary_refinement_candidate_positions(n_images: int) -> list[int]:
+    return _boundary_refinement_positions(n_images)
+
+
 def _shared_earliest_onset_anchoring() -> str:
     return (
         "### Earliest Onset Anchoring\n"
@@ -428,7 +432,7 @@ def prompt_boundary_refinement(
     contact_sheet_cols: int = 0,
     sheet_count: int = 0,
 ) -> str:
-    candidate_positions = _boundary_refinement_positions(n_images)
+    candidate_positions = boundary_refinement_candidate_positions(n_images)
     chosen = candidate_positions[1] if len(candidate_positions) > 1 else candidate_positions[0] if candidate_positions else 1
     return (
         f"You are a robotic vision analyzer watching a {n_images}-frame video clip centered around a candidate boundary in a manipulation task.\n"
