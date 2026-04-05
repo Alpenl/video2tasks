@@ -93,6 +93,37 @@ def test_submit_result_is_idempotent_and_rejects_stale_dispatches(tmp_path) -> N
     assert record["window_id"] == 0
 
 
+def test_submit_result_persists_repeat_index_for_window_boundary(tmp_path) -> None:
+    app, client = _make_app(tmp_path)
+    task_id = "demo::sample_w0_r1"
+    meta = {
+        "subset": "demo",
+        "sample_id": "sample",
+        "window_id": 0,
+        "repeat_index": 1,
+        "job_type": "window_boundary",
+    }
+    base_job = {"task_id": task_id, "meta": meta}
+    app.state.inflight[task_id] = {"job": base_job, "ts": time.time(), "dispatch_id": "d1"}
+
+    received = client.post(
+        "/submit_result",
+        json={
+            "task_id": task_id,
+            "dispatch_id": "d1",
+            "vlm_json": {"transitions": [], "instructions": ["Add potatoes"]},
+            "meta": meta,
+        },
+    )
+
+    assert received.json()["status"] == "received"
+
+    windows_path = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample" / "windows.jsonl"
+    record = json.loads(windows_path.read_text(encoding="utf-8").strip())
+    assert record["window_id"] == 0
+    assert record["repeat_index"] == 1
+
+
 def test_submit_result_exhausts_empty_retry_budget_and_records_terminal_empty(tmp_path) -> None:
     config = Config(
         run={"base_dir": str(tmp_path), "run_id": "testrun"},

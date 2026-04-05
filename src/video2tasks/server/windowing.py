@@ -148,6 +148,157 @@ def _sample_window_frame_ids(start_frame: int, end_frame: int, frames_per_window
     return np.clip(idx, 0, nframes - 1).tolist()
 
 
+def _micro_peak_gap_frames(fps: float) -> int:
+    safe_fps = float(fps) if fps > 1e-6 else 30.0
+    return max(2, min(5, int(round(0.2 * safe_fps))))
+
+
+def _vote_repeat_window_transitions(
+    repeat_transition_sets: List[List[int]],
+    frame_ids: List[int],
+    fps: float,
+) -> Tuple[List[int], Dict[int, float]]:
+    """Vote repeated window transitions into weighted local cut indices.
+
+    Each repeat contributes at most one support count to a micro-cluster so that
+    a single noisy response cannot inflate support by emitting several nearby cuts.
+    """
+    if not repeat_transition_sets or not frame_ids:
+        return [], {}
+
+    if len(repeat_transition_sets) == 1:
+        single = sorted(
+            {
+                int(item)
+                for item in repeat_transition_sets[0]
+                if 0 <= int(item) < len(frame_ids)
+            }
+        )
+        return single, {int(local_idx): 1.0 for local_idx in single}
+
+    total_repeats = max(1, len(repeat_transition_sets))
+    gap_frames = _micro_peak_gap_frames(fps)
+    frame_to_local_indices: Dict[int, List[int]] = {}
+    for local_idx, frame in enumerate(frame_ids):
+        frame_to_local_indices.setdefault(int(frame), []).append(int(local_idx))
+
+    frame_votes: Dict[int, Dict[str, Any]] = {}
+    for repeat_id, transitions in enumerate(repeat_transition_sets):
+        for item in transitions:
+            try:
+                local_idx = int(item)
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= local_idx < len(frame_ids)):
+                continue
+            frame = int(frame_ids[local_idx])
+            bucket = frame_votes.setdefault(
+                frame,
+                {"repeat_ids": set(), "local_indices": [], "count": 0},
+            )
+            bucket["repeat_ids"].add(int(repeat_id))
+            bucket["local_indices"].append(local_idx)
+            bucket["count"] += 1
+
+    if not frame_votes:
+        return [], {}
+
+    clustered_frames: List[List[int]] = []
+    current_cluster: List[int] = []
+
+    for frame in sorted(frame_votes):
+        if not current_cluster:
+            current_cluster = [int(frame)]
+            continue
+
+        if (int(frame) - current_cluster[-1]) <= gap_frames:
+            current_cluster.append(int(frame))
+            continue
+
+        clustered_frames.append(current_cluster)
+        current_cluster = [int(frame)]
+
+    if current_cluster:
+        clustered_frames.append(current_cluster)
+
+    voted_local_indices: List[int] = []
+    support_by_local_index: Dict[int, float] = {}
+
+    for cluster in clustered_frames:
+        cluster_repeat_ids = set()
+        for frame in cluster:
+            cluster_repeat_ids.update(frame_votes[frame]["repeat_ids"])
+
+        representative_frame = min(
+            cluster,
+            key=lambda frame: (
+                -len(frame_votes[frame]["repeat_ids"]),
+                -int(frame_votes[frame]["count"]),
+                frame,
+            ),
+        )
+        representative_locals = frame_to_local_indices.get(int(representative_frame), [])
+        if representative_locals:
+            representative_local = min(int(item) for item in representative_locals)
+        else:
+            representative_local = min(
+                range(len(frame_ids)),
+                key=lambda idx: abs(int(frame_ids[idx]) - int(representative_frame)),
+            )
+
+        voted_local_indices.append(int(representative_local))
+        support_by_local_index[int(representative_local)] = len(cluster_repeat_ids) / float(total_repeats)
+
+    voted_local_indices = sorted(set(voted_local_indices))
+    support_by_local_index = {
+        int(local_idx): float(support_by_local_index.get(int(local_idx), 0.0))
+        for local_idx in voted_local_indices
+    }
+    return voted_local_indices, support_by_local_index
+
+
+def _select_instruction_source_vlm(
+    vlms: List[Dict[str, Any]],
+    voted_transitions: List[int],
+    frame_ids: List[int],
+    fps: float,
+) -> Dict[str, Any]:
+    if not vlms:
+        return {}
+    if len(vlms) == 1:
+        return vlms[0]
+
+    gap_frames = _micro_peak_gap_frames(fps)
+    voted_frames = [int(frame_ids[idx]) for idx in voted_transitions if 0 <= int(idx) < len(frame_ids)]
+
+    def record_score(vlm: Dict[str, Any]) -> Tuple[int, float, int, int]:
+        record_transitions = [int(item) for item in vlm.get("transitions", []) if 0 <= int(item) < len(frame_ids)]
+        record_frames = [int(frame_ids[idx]) for idx in record_transitions]
+
+        if not voted_frames:
+            return (-len(record_frames), 0.0, 0, -len(vlm.get("instructions", [])))
+
+        matches = 0
+        distance_sum = 0.0
+        for voted_frame in voted_frames:
+            if not record_frames:
+                distance_sum += float(gap_frames + 1)
+                continue
+            nearest = min(abs(record_frame - voted_frame) for record_frame in record_frames)
+            if nearest <= gap_frames:
+                matches += 1
+            distance_sum += float(nearest)
+
+        return (
+            matches,
+            -distance_sum,
+            -abs(len(record_frames) - len(voted_frames)),
+            len(vlm.get("instructions", [])),
+        )
+
+    return max(vlms, key=record_score)
+
+
 def _cluster_cut_votes(raw_cuts: List[Tuple[int, float]], fps: float) -> Tuple[List[int], Dict[int, float]]:
     """Cluster nearby cut votes while preserving distinct local peaks.
 
@@ -168,8 +319,7 @@ def _cluster_cut_votes(raw_cuts: List[Tuple[int, float]], fps: float) -> Tuple[L
     if not raw_cuts:
         return [], {}
 
-    safe_fps = float(fps) if fps > 1e-6 else 30.0
-    peak_gap_frames = max(2, min(5, int(round(0.2 * safe_fps))))
+    peak_gap_frames = _micro_peak_gap_frames(fps)
 
     aggregated_votes: Dict[int, Dict[str, float]] = {}
     for fid, weight in raw_cuts:
@@ -2100,26 +2250,33 @@ def _recover_dense_transition_micro_boundaries(
         if cur_len == 0:
             continue
 
-        vlm = normalize_task_window_result(
-            rec.get("vlm_json", {}),
-            max_transition_index=cur_len - 1,
-        )
-        if not vlm:
+        repeat_records = rec.get("repeat_records") if isinstance(rec, dict) else None
+        normalized_repeat_vlms: List[Dict[str, Any]] = []
+        if isinstance(repeat_records, list) and repeat_records:
+            for repeat_record in repeat_records:
+                vlm = normalize_task_window_result(
+                    repeat_record.get("vlm_json", {}),
+                    max_transition_index=cur_len - 1,
+                )
+                if vlm:
+                    normalized_repeat_vlms.append(vlm)
+        else:
+            vlm = normalize_task_window_result(
+                rec.get("vlm_json", {}),
+                max_transition_index=cur_len - 1,
+            )
+            if vlm:
+                normalized_repeat_vlms.append(vlm)
+
+        if not normalized_repeat_vlms:
             continue
 
-        transitions = sorted(
-            {
-                int(t_idx)
-                for t_idx in vlm.get("transitions", [])
-                if 0 <= int(t_idx) < cur_len
-            }
+        transitions, _ = _vote_repeat_window_transitions(
+            [vlm.get("transitions", []) for vlm in normalized_repeat_vlms],
+            window.frame_ids,
+            fps,
         )
-        instructions = [
-            str(item).strip()
-            for item in vlm.get("instructions", [])
-            if str(item).strip()
-        ]
-        if len(transitions) < 2 or len(instructions) < len(transitions) + 1:
+        if len(transitions) < 2:
             continue
 
         global_points = [int(window.frame_ids[idx]) for idx in transitions]
@@ -2167,23 +2324,50 @@ def build_segments_via_cuts(
         rec = by_wid.get(w.window_id)
         if not rec:
             continue
-        
+
         f_ids = w.frame_ids
         cur_len = len(f_ids)
 
         if cur_len == 0:
             continue
 
-        vlm = normalize_task_window_result(
-            rec.get("vlm_json", {}),
-            max_transition_index=cur_len - 1,
-        )
-        if not vlm:
+        repeat_records = rec.get("repeat_records") if isinstance(rec, dict) else None
+        normalized_repeat_vlms: List[Dict[str, Any]] = []
+        if isinstance(repeat_records, list) and repeat_records:
+            for repeat_record in repeat_records:
+                vlm = normalize_task_window_result(
+                    repeat_record.get("vlm_json", {}),
+                    max_transition_index=cur_len - 1,
+                )
+                if vlm:
+                    normalized_repeat_vlms.append(vlm)
+        else:
+            vlm = normalize_task_window_result(
+                rec.get("vlm_json", {}),
+                max_transition_index=cur_len - 1,
+            )
+            if vlm:
+                normalized_repeat_vlms.append(vlm)
+
+        if not normalized_repeat_vlms:
             continue
 
-        transitions = vlm.get("transitions", [])
-        instructions = vlm.get("instructions", [])
-        
+        voted_transitions, voted_support = _vote_repeat_window_transitions(
+            [vlm.get("transitions", []) for vlm in normalized_repeat_vlms],
+            f_ids,
+            fps,
+        )
+        instruction_vlm = _select_instruction_source_vlm(
+            normalized_repeat_vlms,
+            voted_transitions,
+            f_ids,
+            fps,
+        )
+
+        transitions = voted_transitions
+        instructions = instruction_vlm.get("instructions", [])
+        instruction_boundaries = instruction_vlm.get("transitions", [])
+
         # Collect cut points
         for t_idx in transitions:
             try:
@@ -2194,14 +2378,15 @@ def build_segments_via_cuts(
                         w_val = center_weights[idx]
                     else:
                         w_val = 1.0 if min(idx, cur_len - 1 - idx) > 2 else 0.5
-                    raw_cuts.append((global_fid, float(w_val)))
-                    raw_cut_support_by_frame[global_fid] = raw_cut_support_by_frame.get(global_fid, 0.0) + float(w_val)
+                    weighted_support = float(w_val) * float(voted_support.get(idx, 1.0))
+                    raw_cuts.append((global_fid, weighted_support))
+                    raw_cut_support_by_frame[global_fid] = raw_cut_support_by_frame.get(global_fid, 0.0) + weighted_support
             except (ValueError, IndexError):
                 pass
-        
+
         # Collect instructions
         try:
-            boundaries = [0] + [int(t) for t in transitions if 0 <= int(t) < cur_len] + [cur_len]
+            boundaries = [0] + [int(t) for t in instruction_boundaries if 0 <= int(t) < cur_len] + [cur_len]
             boundaries = sorted(list(set(boundaries)))
             
             for i in range(len(boundaries) - 1):

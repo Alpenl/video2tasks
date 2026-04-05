@@ -122,6 +122,11 @@ class WindowingConfig(BaseModel):
     window_sec: float = Field(default=12.0, description="Window duration in seconds")
     step_sec: float = Field(default=6.0, description="Step size in seconds")
     frames_per_window: int = Field(default=24, description="Frames per window")
+    window_repeat_count: int = Field(
+        default=1,
+        ge=1,
+        description="Repeat each boundary window this many times and vote across repeats",
+    )
     boundary_prompt_mode: str = Field(
         default="freeform",
         description="Boundary prompting mode: whole-window freeform output or center-focused local boundary judgment",

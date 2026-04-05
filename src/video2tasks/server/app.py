@@ -233,20 +233,81 @@ def create_app(config: Config) -> FastAPI:
         return results, failures
 
     def load_window_results(samples_dir: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
-        records, failures = _load_indexed_result_records(
-            Path(windows_jsonl_path(samples_dir, sample_id)),
-            "window_id",
-        )
+        repeat_target = max(1, int(config.windowing.window_repeat_count))
+        path = Path(windows_jsonl_path(samples_dir, sample_id))
         results: Dict[int, Dict[str, Any]] = {}
-        for window_id, record in records.items():
-            vlm_json = _normalize_loaded_window_vlm_json(record)
-            if not vlm_json:
-                failures[window_id] = {**record, "terminal_error": "invalid_vlm_json"}
-                continue
-            normalized_record = dict(record)
-            normalized_record["vlm_json"] = vlm_json
-            results[window_id] = normalized_record
+        failures: Dict[int, Dict[str, Any]] = {}
+        if not path.exists():
+            return results, failures
+
+        grouped_records: Dict[int, Dict[int, Dict[str, Any]]] = {}
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line)
+                    window_id = int(record["window_id"])
+                    repeat_index = int(record.get("repeat_index", 0) or 0)
+                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+                    continue
+                grouped_records.setdefault(window_id, {})[repeat_index] = record
+
+        for window_id, repeat_records in grouped_records.items():
+            normalized_repeats: List[Dict[str, Any]] = []
+            failed_repeats: Dict[int, Dict[str, Any]] = {}
+
+            for repeat_index, record in sorted(repeat_records.items()):
+                terminal_error = str(record.get("terminal_error", "")).strip()
+                if terminal_error:
+                    failed_repeats[repeat_index] = record
+                    continue
+
+                vlm_json = _normalize_loaded_window_vlm_json(record)
+                if not vlm_json:
+                    failed_repeats[repeat_index] = {**record, "terminal_error": "invalid_vlm_json"}
+                    continue
+
+                normalized_record = dict(record)
+                normalized_record["repeat_index"] = repeat_index
+                normalized_record["vlm_json"] = vlm_json
+                normalized_repeats.append(normalized_record)
+
+            if normalized_repeats:
+                representative = max(
+                    normalized_repeats,
+                    key=lambda record: (
+                        len(record.get("vlm_json", {}).get("transitions", [])),
+                        -int(record.get("repeat_index", 0)),
+                    ),
+                )
+                aggregated_record = dict(representative)
+                aggregated_record["repeat_records"] = normalized_repeats
+                aggregated_record["repeat_success_count"] = len(normalized_repeats)
+                aggregated_record["repeat_target_count"] = repeat_target
+                aggregated_record["repeat_indices"] = [
+                    int(record.get("repeat_index", 0))
+                    for record in normalized_repeats
+                ]
+                results[window_id] = aggregated_record
+
+            if failed_repeats:
+                first_failed_index = min(failed_repeats)
+                failure_record = dict(failed_repeats[first_failed_index])
+                failure_record["repeat_indices_failed"] = sorted(int(idx) for idx in failed_repeats)
+                failures[window_id] = failure_record
+
         return results, failures
+
+    def _completed_window_ids(results: Dict[int, Dict[str, Any]]) -> set[int]:
+        completed: set[int] = set()
+        repeat_target = max(1, int(config.windowing.window_repeat_count))
+        for window_id, record in results.items():
+            if int(record.get("repeat_success_count", 1)) >= repeat_target:
+                completed.add(int(window_id))
+        return completed
+
+    def _all_windows_completed(windows: List[Window], results: Dict[int, Dict[str, Any]]) -> bool:
+        completed = _completed_window_ids(results)
+        return all(int(window.window_id) in completed for window in windows)
 
     def load_segment_label_results(samples_dir: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
         records, failures = _load_indexed_result_records(
@@ -335,6 +396,7 @@ def create_app(config: Config) -> FastAPI:
             rec = {
                 **common_fields,
                 "window_id": meta.get("window_id"),
+                "repeat_index": int(meta.get("repeat_index", 0) or 0),
             }
             _append_jsonl_record(windows_jsonl_path(samples_dir, sid), rec)
 
@@ -680,7 +742,8 @@ def create_app(config: Config) -> FastAPI:
                             time.sleep(0.01)
                             continue
 
-                        done_wids = set(window_results)
+                        done_wids = _completed_window_ids(window_results)
+                        repeat_target = max(1, int(config.windowing.window_repeat_count))
 
                         with FrameExtractor(mp4, artifact_writer=task_artifact_writer) as extractor:
                             cnt = 0
@@ -688,53 +751,65 @@ def create_app(config: Config) -> FastAPI:
                             for w in windows:
                                 if w.window_id in done_wids:
                                     continue
-                                
-                                tid = f"{ctx.subset}::{sid}_w{w.window_id}"
-                                
-                                # Check if already active
-                                active = False
-                                with queue_lock:
-                                    if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
-                                        active = True
-                                
-                                if active:
-                                    continue
-                                
-                                meta = {
-                                    "subset": ctx.subset,
-                                    "sample_id": sid,
-                                    "job_type": "window_boundary",
-                                    "logical_frame_count": len(w.frame_ids),
-                                    **build_window_prompt_metadata(w, fps, nframes),
-                                    "use_contact_sheets": config.windowing.use_contact_sheets,
-                                    "contact_sheet_rows": (
-                                        config.windowing.contact_sheet_rows
-                                        if config.windowing.use_contact_sheets else 0
-                                    ),
-                                    "contact_sheet_cols": (
-                                        config.windowing.contact_sheet_cols
-                                        if config.windowing.use_contact_sheets else 0
-                                    ),
-                                }
-                                job = _build_job_payload(
-                                    extractor,
-                                    task_id=tid,
-                                    frame_ids=w.frame_ids,
-                                    meta=meta,
-                                    artifact_image_kind=(
-                                        "window_contact_sheet"
-                                        if config.windowing.use_contact_sheets else "window_frame"
-                                    ),
+                                success_indices = set(
+                                    int(item)
+                                    for item in window_results.get(w.window_id, {}).get("repeat_indices", [])
                                 )
-                                
-                                with queue_lock:
-                                    job_queue.append(job)
-                                
-                                cnt += 1
+
+                                for repeat_index in range(repeat_target):
+                                    if repeat_index in success_indices:
+                                        continue
+
+                                    tid = f"{ctx.subset}::{sid}_w{w.window_id}_r{repeat_index}"
+
+                                    active = False
+                                    with queue_lock:
+                                        if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
+                                            active = True
+
+                                    if active:
+                                        continue
+
+                                    meta = {
+                                        "subset": ctx.subset,
+                                        "sample_id": sid,
+                                        "job_type": "window_boundary",
+                                        "repeat_index": repeat_index,
+                                        "window_repeat_count": repeat_target,
+                                        "logical_frame_count": len(w.frame_ids),
+                                        **build_window_prompt_metadata(w, fps, nframes),
+                                        "use_contact_sheets": config.windowing.use_contact_sheets,
+                                        "contact_sheet_rows": (
+                                            config.windowing.contact_sheet_rows
+                                            if config.windowing.use_contact_sheets else 0
+                                        ),
+                                        "contact_sheet_cols": (
+                                            config.windowing.contact_sheet_cols
+                                            if config.windowing.use_contact_sheets else 0
+                                        ),
+                                    }
+                                    job = _build_job_payload(
+                                        extractor,
+                                        task_id=tid,
+                                        frame_ids=w.frame_ids,
+                                        meta=meta,
+                                        artifact_image_kind=(
+                                            "window_contact_sheet"
+                                            if config.windowing.use_contact_sheets else "window_frame"
+                                        ),
+                                    )
+
+                                    with queue_lock:
+                                        job_queue.append(job)
+
+                                    cnt += 1
+                                    if cnt > 20:
+                                        break
+
                                 if cnt > 20:
                                     break
                         
-                        if cnt == 0:
+                        if cnt == 0 and _all_windows_completed(windows, window_results):
                             sample_status[sid] = 2
                     
                     except Exception as e:
@@ -774,7 +849,7 @@ def create_app(config: Config) -> FastAPI:
                             time.sleep(0.01)
                             continue
 
-                        if len(by_wid) >= len(windows):
+                        if _all_windows_completed(windows, by_wid):
                             refinement_windows: List[Window] = []
                             if config.windowing.enable_refinement_pass:
                                 refinement_frames = (
@@ -815,57 +890,72 @@ def create_app(config: Config) -> FastAPI:
                                         time.sleep(0.01)
                                         continue
 
+                                    completed_refinement = _completed_window_ids(by_wid)
                                     missing_refinement = [
                                         refinement_window
                                         for refinement_window in refinement_windows
-                                        if refinement_window.window_id not in by_wid
+                                        if refinement_window.window_id not in completed_refinement
                                     ]
                                     if missing_refinement:
                                         with FrameExtractor(mp4, artifact_writer=task_artifact_writer) as extractor:
                                             cnt = 0
 
                                             for refinement_window in missing_refinement:
-                                                tid = f"{ctx.subset}::{sid}_rw{refinement_window.window_id}"
-                                                active = False
-                                                with queue_lock:
-                                                    if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
-                                                        active = True
-
-                                                if active:
-                                                    continue
-
-                                                meta = {
-                                                    "subset": ctx.subset,
-                                                    "sample_id": sid,
-                                                    "job_type": "window_boundary",
-                                                    "window_pass": "refinement",
-                                                    "logical_frame_count": len(refinement_window.frame_ids),
-                                                    **build_window_prompt_metadata(refinement_window, fps, nframes),
-                                                    "use_contact_sheets": config.windowing.use_contact_sheets,
-                                                    "contact_sheet_rows": (
-                                                        config.windowing.contact_sheet_rows
-                                                        if config.windowing.use_contact_sheets else 0
-                                                    ),
-                                                    "contact_sheet_cols": (
-                                                        config.windowing.contact_sheet_cols
-                                                        if config.windowing.use_contact_sheets else 0
-                                                    ),
-                                                }
-                                                job = _build_job_payload(
-                                                    extractor,
-                                                    task_id=tid,
-                                                    frame_ids=refinement_window.frame_ids,
-                                                    meta=meta,
-                                                    artifact_image_kind=(
-                                                        "refinement_contact_sheet"
-                                                        if config.windowing.use_contact_sheets else "refinement_frame"
-                                                    ),
+                                                existing_success_indices = set(
+                                                    int(item)
+                                                    for item in by_wid.get(refinement_window.window_id, {}).get("repeat_indices", [])
                                                 )
 
-                                                with queue_lock:
-                                                    job_queue.append(job)
+                                                for repeat_index in range(max(1, int(config.windowing.window_repeat_count))):
+                                                    if repeat_index in existing_success_indices:
+                                                        continue
 
-                                                cnt += 1
+                                                    tid = f"{ctx.subset}::{sid}_rw{refinement_window.window_id}_r{repeat_index}"
+                                                    active = False
+                                                    with queue_lock:
+                                                        if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
+                                                            active = True
+
+                                                    if active:
+                                                        continue
+
+                                                    meta = {
+                                                        "subset": ctx.subset,
+                                                        "sample_id": sid,
+                                                        "job_type": "window_boundary",
+                                                        "window_pass": "refinement",
+                                                        "repeat_index": repeat_index,
+                                                        "window_repeat_count": max(1, int(config.windowing.window_repeat_count)),
+                                                        "logical_frame_count": len(refinement_window.frame_ids),
+                                                        **build_window_prompt_metadata(refinement_window, fps, nframes),
+                                                        "use_contact_sheets": config.windowing.use_contact_sheets,
+                                                        "contact_sheet_rows": (
+                                                            config.windowing.contact_sheet_rows
+                                                            if config.windowing.use_contact_sheets else 0
+                                                        ),
+                                                        "contact_sheet_cols": (
+                                                            config.windowing.contact_sheet_cols
+                                                            if config.windowing.use_contact_sheets else 0
+                                                        ),
+                                                    }
+                                                    job = _build_job_payload(
+                                                        extractor,
+                                                        task_id=tid,
+                                                        frame_ids=refinement_window.frame_ids,
+                                                        meta=meta,
+                                                        artifact_image_kind=(
+                                                            "refinement_contact_sheet"
+                                                            if config.windowing.use_contact_sheets else "refinement_frame"
+                                                        ),
+                                                    )
+
+                                                    with queue_lock:
+                                                        job_queue.append(job)
+
+                                                    cnt += 1
+                                                    if cnt > 20:
+                                                        break
+
                                                 if cnt > 20:
                                                     break
 
@@ -873,7 +963,7 @@ def create_app(config: Config) -> FastAPI:
                                             time.sleep(0.05)
                                             continue
 
-                                    if len(by_wid) < len(windows) + len(refinement_windows):
+                                    if not _all_windows_completed(windows + refinement_windows, by_wid):
                                         time.sleep(0.05)
                                         continue
 

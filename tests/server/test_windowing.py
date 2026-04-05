@@ -3,6 +3,7 @@ from video2tasks.server.windowing import (
     FrameExtractor,
     Window,
     _cluster_cut_votes,
+    _vote_repeat_window_transitions,
     apply_boundary_refinement_results,
     apply_deferred_segment_labels,
     build_boundary_refinement_windows,
@@ -75,6 +76,40 @@ def test_cluster_cut_votes_keeps_two_candidates_when_gap_exceeds_micro_peak_widt
 
     assert points == [1089, 1111]
     assert support == {1089: 0.99, 1111: 0.08}
+
+
+def test_vote_repeat_window_transitions_dedupes_nearby_cuts_from_same_repeat() -> None:
+    frame_ids = [i * 2 for i in range(12)]
+
+    points, support = _vote_repeat_window_transitions(
+        [
+            [5, 6],
+            [5],
+            [],
+        ],
+        frame_ids,
+        fps=30.0,
+    )
+
+    assert points == [5]
+    assert support == {5: 2.0 / 3.0}
+
+
+def test_vote_repeat_window_transitions_keeps_separate_clusters_with_fractional_support() -> None:
+    frame_ids = [i * 2 for i in range(20)]
+
+    points, support = _vote_repeat_window_transitions(
+        [
+            [5],
+            [5],
+            [9],
+        ],
+        frame_ids,
+        fps=30.0,
+    )
+
+    assert points == [5, 9]
+    assert support == {5: 2.0 / 3.0, 9: 1.0 / 3.0}
 
 
 def test_frame_extractor_contact_sheets_fall_back_to_cv2_when_ffmpeg_returns_empty(

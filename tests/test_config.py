@@ -151,6 +151,12 @@ def test_config_accepts_contact_sheet_settings() -> None:
     assert cfg.windowing.contact_sheet_cols == 5
 
 
+def test_config_accepts_window_repeat_count() -> None:
+    cfg = Config(windowing={"window_repeat_count": 2})
+
+    assert cfg.windowing.window_repeat_count == 2
+
+
 def test_config_rejects_unknown_boundary_prompt_mode() -> None:
     with pytest.raises(ValueError, match="boundary_prompt_mode"):
         Config(windowing={"boundary_prompt_mode": "unknown_mode"})

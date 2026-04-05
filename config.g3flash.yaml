@@ -18,6 +18,7 @@ server:
   auto_exit_after_all_done: true
 
 worker:
+  count: 4
   server_url: "http://127.0.0.1:8099"
   backend: "gemini"
   gemini:
@@ -33,6 +34,7 @@ windowing:
   window_sec: 12.0
   step_sec: 6.0
   frames_per_window: 128
+  window_repeat_count: 2
   boundary_prompt_mode: "freeform"
   segment_labeling_mode: "inline"
   enable_refinement_pass: false
