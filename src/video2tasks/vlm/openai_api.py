@@ -54,6 +54,14 @@ def _extract_json(text: str) -> Dict[str, Any]:
     return {}
 
 
+def _decode_sse_line(raw_line: Any) -> str:
+    if raw_line is None:
+        return ""
+    if isinstance(raw_line, bytes):
+        return raw_line.decode("utf-8", errors="replace")
+    return str(raw_line)
+
+
 def _body_shape_summary(data: Any) -> str:
     if data is None:
         return "null"
@@ -319,11 +327,11 @@ class OpenAIBackend(VLMBackend):
         json_error: Optional[str] = None
         finish_reasons: List[str] = []
 
-        for raw_line in response.iter_lines(decode_unicode=True):
+        for raw_line in response.iter_lines(decode_unicode=False):
             if raw_line is None:
                 continue
 
-            line = raw_line.decode("utf-8", errors="ignore") if isinstance(raw_line, bytes) else str(raw_line)
+            line = _decode_sse_line(raw_line)
             line = line.strip()
             if not line or not line.startswith("data:"):
                 continue

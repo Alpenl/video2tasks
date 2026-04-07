@@ -27,6 +27,21 @@ class DummyStreamResponse:
                 yield chunk.encode("utf-8")
 
 
+class DummyLatin1StreamResponse:
+    def __init__(self, status_code, chunks):
+        self.status_code = status_code
+        self._chunks = chunks
+        self.encoding = "ISO-8859-1"
+
+    def iter_lines(self, decode_unicode=False):
+        for chunk in self._chunks:
+            encoded = chunk.encode("utf-8")
+            if decode_unicode:
+                yield encoded.decode("latin-1")
+            else:
+                yield encoded
+
+
 def _merge_schema():
     return {
         "type": "object",
@@ -36,6 +51,17 @@ def _merge_schema():
             "merged_ranges": {"type": "array"},
         },
         "required": ["thought", "merged_ranges"],
+    }
+
+
+def _text_schema():
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "text": {"type": "string"},
+        },
+        "required": ["text"],
     }
 
 
@@ -303,4 +329,56 @@ def test_openai_backend_stream_fallback_recovers_when_non_stream_body_is_missing
     assert diagnostics["chat_completions_stream"]["called"] is True
     assert diagnostics["chat_completions_stream"]["structured_payload_found"] is True
     assert diagnostics["chat_completions_stream"]["chunk_count"] == 3
+    assert diagnostics["chat_completions_stream"]["finish_reasons"] == ["stop"]
+
+
+def test_openai_backend_stream_fallback_decodes_utf8_when_endpoint_defaults_to_latin1(monkeypatch) -> None:
+    def fake_post(url, json=None, headers=None, timeout=None, stream=False):
+        if url.endswith("/responses"):
+            return DummyResponse(
+                200,
+                {
+                    "output": [],
+                    "usage": {"output_tokens": 12, "total_tokens": 33},
+                },
+            )
+        if url.endswith("/chat/completions") and stream is True:
+            return DummyLatin1StreamResponse(
+                200,
+                [
+                    'data: {"choices":[{"delta":{"content":"{\\"text\\":\\"将土豆"},"finish_reason":null}]}',
+                    'data: {"choices":[{"delta":{"content":"放入锅中\\"}"},"finish_reason":"stop"}]}',
+                    "data: [DONE]",
+                ],
+            )
+        if url.endswith("/chat/completions"):
+            return DummyResponse(
+                200,
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"completion_tokens": 12, "total_tokens": 33},
+                },
+            )
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr("video2tasks.vlm.openai_api.requests.post", fake_post)
+
+    backend = create_backend("openai", api_key="sk-test", model="gpt-5-mini", base_url="https://sub.alpen-y.top/v1")
+
+    result = backend.infer_text_json(
+        "Return Chinese JSON",
+        schema_name="text_result",
+        schema=_text_schema(),
+    )
+
+    diagnostics = backend.last_text_json_diagnostics
+
+    assert result == {"text": "将土豆放入锅中"}
+    assert diagnostics["parsed_endpoint"] == "chat_completions_stream"
+    assert diagnostics["chat_completions_stream"]["structured_payload_found"] is True
     assert diagnostics["chat_completions_stream"]["finish_reasons"] == ["stop"]
