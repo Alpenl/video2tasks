@@ -28,6 +28,59 @@ def test_config_accepts_gemini_backend() -> None:
     assert cfg.windowing.adaptive_merge_collapse_ratio == 0.6
     assert cfg.windowing.boundary_support_threshold == 0.9
     assert cfg.windowing.refine_final_instructions is True
+    assert cfg.llm_merge.enabled is False
+    assert cfg.llm_merge.model == "gpt-5.2"
+    assert cfg.llm_merge.summary_levels == [1, 1, 1]
+    assert cfg.llm_merge.granularity == "guarded"
+    assert cfg.llm_merge.max_attempts == 3
+    assert cfg.llm_merge.repeat_count == 1
+    assert cfg.llm_merge.boundary_vote_threshold == 0.5
+    assert cfg.llm_merge.min_output_ratio == 0.35
+    assert cfg.llm_merge.coarse_min_output_ratio == 0.18
+    assert cfg.llm_merge.coarse_max_supported_anchors_per_range == 1
+    assert cfg.llm_merge.coarse_anchor_min_spacing_segments == 3
+    assert cfg.llm_merge.coarse_anchor_min_side_segments == 2
+    assert cfg.llm_merge.coarse_anchor_min_score == 1.03
+    assert cfg.llm_merge.protect_supported_boundaries is True
+    assert cfg.llm_merge.protected_boundary_support_threshold == 0.45
+    assert cfg.llm_merge.protect_distinct_sequence_markers is True
+    assert cfg.llm_merge.protect_instruction_drift is True
+    assert cfg.llm_merge.protect_duplicate_tail_anchor is True
+    assert cfg.llm_merge.duplicate_tail_anchor_min_frames == 5
+
+
+def test_export_config_defaults() -> None:
+    cfg = Config()
+
+    assert cfg.export.enabled is False
+    assert cfg.export.mode == "annotated"
+    assert cfg.export.clips_dirname == "clips"
+    assert cfg.export.manifest_name == "manifest.json"
+    assert cfg.export.annotated_dirname == "exports"
+    assert cfg.export.annotated_name == "annotated.mp4"
+    assert cfg.export.subtitles.enabled is True
+    assert cfg.export.subtitles.language == "zh"
+    assert cfg.export.subtitles.position == "top_right"
+    assert cfg.export.subtitles.font_file == ""
+    assert cfg.export.subtitles.font_size == 28
+
+
+def test_config_reads_export_values_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("EXPORT_ENABLED", "true")
+    monkeypatch.setenv("EXPORT_MODE", "both")
+    monkeypatch.setenv("EXPORT_ANNOTATED_NAME", "demo.mp4")
+    monkeypatch.setenv("EXPORT_SUBTITLE_LANGUAGE", "en")
+    monkeypatch.setenv("EXPORT_SUBTITLE_POSITION", "bottom_left")
+    monkeypatch.setenv("EXPORT_SUBTITLE_FONT_SIZE", "36")
+
+    cfg = Config.from_env()
+
+    assert cfg.export.enabled is True
+    assert cfg.export.mode == "both"
+    assert cfg.export.annotated_name == "demo.mp4"
+    assert cfg.export.subtitles.language == "en"
+    assert cfg.export.subtitles.position == "bottom_left"
+    assert cfg.export.subtitles.font_size == 36
 
 
 def test_config_reads_openai_values_from_environment(monkeypatch) -> None:
@@ -78,6 +131,64 @@ def test_config_reads_gemini_values_from_environment(monkeypatch) -> None:
     assert cfg.worker.gemini.timeout_sec == 18.0
 
 
+def test_config_reads_llm_merge_values_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_MERGE_ENABLED", "true")
+    monkeypatch.setenv("LLM_MERGE_API_KEY", "sk-merge")
+    monkeypatch.setenv("LLM_MERGE_MODEL", "gpt-5.2")
+    monkeypatch.setenv("LLM_MERGE_BASE_URL", "https://merge.test/v1")
+    monkeypatch.setenv("LLM_MERGE_TIMEOUT", "33")
+    monkeypatch.setenv("LLM_MERGE_REASONING_EFFORT", "medium")
+    monkeypatch.setenv("LLM_MERGE_MAX_OUTPUT_TOKENS", "4096")
+    monkeypatch.setenv("LLM_MERGE_MAX_ATTEMPTS", "7")
+    monkeypatch.setenv("LLM_MERGE_SUMMARY_LEVELS", "[1,0,1]")
+    monkeypatch.setenv("LLM_MERGE_REPEAT_COUNT", "3")
+    monkeypatch.setenv("LLM_MERGE_BOUNDARY_VOTE_THRESHOLD", "0.6")
+    monkeypatch.setenv("LLM_MERGE_GRANULARITY", "coarse")
+    monkeypatch.setenv("LLM_MERGE_MIN_INPUT_SEGMENTS", "10")
+    monkeypatch.setenv("LLM_MERGE_MAX_INPUT_SEGMENTS", "80")
+    monkeypatch.setenv("LLM_MERGE_MIN_OUTPUT_RATIO", "0.5")
+    monkeypatch.setenv("LLM_MERGE_COARSE_MIN_OUTPUT_RATIO", "0.2")
+    monkeypatch.setenv("LLM_MERGE_COARSE_MAX_SUPPORTED_ANCHORS_PER_RANGE", "2")
+    monkeypatch.setenv("LLM_MERGE_COARSE_ANCHOR_MIN_SPACING_SEGMENTS", "5")
+    monkeypatch.setenv("LLM_MERGE_COARSE_ANCHOR_MIN_SIDE_SEGMENTS", "4")
+    monkeypatch.setenv("LLM_MERGE_COARSE_ANCHOR_MIN_SCORE", "1.4")
+    monkeypatch.setenv("LLM_MERGE_PROTECT_SUPPORTED_BOUNDARIES", "false")
+    monkeypatch.setenv("LLM_MERGE_PROTECTED_BOUNDARY_SUPPORT_THRESHOLD", "0.8")
+    monkeypatch.setenv("LLM_MERGE_PROTECT_DISTINCT_SEQUENCE_MARKERS", "false")
+    monkeypatch.setenv("LLM_MERGE_PROTECT_INSTRUCTION_DRIFT", "false")
+    monkeypatch.setenv("LLM_MERGE_PROTECT_DUPLICATE_TAIL_ANCHOR", "false")
+    monkeypatch.setenv("LLM_MERGE_DUPLICATE_TAIL_ANCHOR_MIN_FRAMES", "9")
+
+    cfg = Config.from_env()
+
+    assert cfg.llm_merge.enabled is True
+    assert cfg.llm_merge.api_key == "sk-merge"
+    assert cfg.llm_merge.model == "gpt-5.2"
+    assert cfg.llm_merge.base_url == "https://merge.test/v1"
+    assert cfg.llm_merge.timeout_sec == 33.0
+    assert cfg.llm_merge.reasoning_effort == "medium"
+    assert cfg.llm_merge.max_output_tokens == 4096
+    assert cfg.llm_merge.max_attempts == 7
+    assert cfg.llm_merge.summary_levels == [1, 0, 1]
+    assert cfg.llm_merge.repeat_count == 3
+    assert cfg.llm_merge.boundary_vote_threshold == 0.6
+    assert cfg.llm_merge.granularity == "coarse"
+    assert cfg.llm_merge.min_input_segments == 10
+    assert cfg.llm_merge.max_input_segments == 80
+    assert cfg.llm_merge.min_output_ratio == 0.5
+    assert cfg.llm_merge.coarse_min_output_ratio == 0.2
+    assert cfg.llm_merge.coarse_max_supported_anchors_per_range == 2
+    assert cfg.llm_merge.coarse_anchor_min_spacing_segments == 5
+    assert cfg.llm_merge.coarse_anchor_min_side_segments == 4
+    assert cfg.llm_merge.coarse_anchor_min_score == 1.4
+    assert cfg.llm_merge.protect_supported_boundaries is False
+    assert cfg.llm_merge.protected_boundary_support_threshold == 0.8
+    assert cfg.llm_merge.protect_distinct_sequence_markers is False
+    assert cfg.llm_merge.protect_instruction_drift is False
+    assert cfg.llm_merge.protect_duplicate_tail_anchor is False
+    assert cfg.llm_merge.duplicate_tail_anchor_min_frames == 9
+
+
 def test_config_from_yaml_applies_env_overrides(monkeypatch, tmp_path) -> None:
     cfg_path = tmp_path / "config.yaml"
     cfg_path.write_text(
@@ -95,6 +206,13 @@ def test_config_from_yaml_applies_env_overrides(monkeypatch, tmp_path) -> None:
                 model: gemini-3-flash-preview
                 api_mode: native
                 base_url: https://yaml.test/v1
+            llm_merge:
+              enabled: true
+              api_key: yaml-merge-key
+              model: gpt-5.2
+              base_url: https://yaml-merge.test/v1
+              granularity: coarse
+              coarse_min_output_ratio: 0.12
             """
         ).strip()
         + "\n",
@@ -116,6 +234,11 @@ def test_config_from_yaml_applies_env_overrides(monkeypatch, tmp_path) -> None:
     assert cfg.worker.gemini.api_key == "env-key"
     assert cfg.worker.gemini.base_url == "https://env.test/v1"
     assert cfg.worker.gemini.api_mode == "openai_compatible"
+    assert cfg.llm_merge.enabled is True
+    assert cfg.llm_merge.api_key == "yaml-merge-key"
+    assert cfg.llm_merge.base_url == "https://yaml-merge.test/v1"
+    assert cfg.llm_merge.granularity == "coarse"
+    assert cfg.llm_merge.coarse_min_output_ratio == 0.12
 
 
 def test_validate_config_cli_module_is_importable() -> None:

@@ -3,10 +3,32 @@
 datasets:
   - root: "./data"
     subset: "youcook2_single_LQDP3xm8aRk"
+  - root: "./data"
+    subset: "youcook2_single_OWtnI3m_p8g"
+  - root: "./data"
+    subset: "youcook2_single_PQ97HXmsFR0"
+  - root: "./data"
+    subset: "youcook2_single_TMpt_41UTOk"
+  - root: "./data"
+    subset: "youcook2_single"
 
 run:
   base_dir: "./runs"
   run_id: "g3flash"
+
+export:
+  enabled: false
+  mode: "annotated"
+  clips_dirname: "clips"
+  manifest_name: "manifest.json"
+  annotated_dirname: "exports"
+  annotated_name: "annotated.mp4"
+  subtitles:
+    enabled: true
+    language: "zh"
+    position: "top_right"
+    font_file: ""
+    font_size: 28
 
 server:
   host: "0.0.0.0"
@@ -54,6 +76,34 @@ windowing:
   adaptive_merge_collapse_ratio: 0.6
   boundary_support_threshold: 0.9
   refine_final_instructions: true
+
+llm_merge:
+  enabled: true
+  backend: "openai"
+  api_key: "sk-f139c6a699508c1c1d98ae9c26279c2860aa58e079fca9a93eea44afcda74615"
+  model: "gpt-5-mini"
+  base_url: "https://sub.alpen-y.top/v1"
+  timeout_sec: 60.0
+  organization: ""
+  project: ""
+  reasoning_effort: "low"
+  max_output_tokens: 2048
+  max_attempts: 3
+  granularity: "coarse"
+  min_input_segments: 12
+  max_input_segments: 256
+  min_output_ratio: 0.35
+  coarse_min_output_ratio: 0.1
+  coarse_max_supported_anchors_per_range: 1
+  coarse_anchor_min_spacing_segments: 3
+  coarse_anchor_min_side_segments: 2
+  coarse_anchor_min_score: 1.03
+  protect_supported_boundaries: true
+  protected_boundary_support_threshold: 0.8
+  protect_distinct_sequence_markers: true
+  protect_instruction_drift: true
+  protect_duplicate_tail_anchor: false
+  duplicate_tail_anchor_min_frames: 5
 
 progress:
   total_override: 0

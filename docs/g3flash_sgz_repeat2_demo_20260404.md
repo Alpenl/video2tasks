@@ -2,25 +2,42 @@
 
 本文档记录当前项目里一次结果相对稳定、边界表现还可以的实跑配置，便于后续复现、对比和继续优化。
 
+## 0. 先看清三层配置，不要混用
+
+这份文档里的“基线”是一个特定单样本 repeat2 demo，不是当前项目的全局默认配置，也不是当前所有 stitched export 运行都会直接复用的 worker 配置。
+
+复现时需要区分三层来源：
+
+- 项目默认值：`Config()` 当前默认 `worker.count == 7`，见 `tests/test_config.py` 里的 `test_worker_count_defaults_to_seven`。
+- 文档基线配置：`config.g3flash.yaml` 里写的是 `worker.count: 4`，这是这份 demo 文档依赖的 YAML 基线。
+- 当次实跑覆盖：这次真正产出 `g3flash_sgz_repeat2_demo_20260404` 的命令行环境把 worker 数进一步覆盖成了 `WORKER_COUNT=2`。
+
+所以这里的 `7 / 4 / 2` 分别表示：
+
+- `7`：项目今天的默认 worker 数。
+- `4`：`config.g3flash.yaml` 里的文档基线 worker 数。
+- `2`：这次 repeat2 demo 真正跑出结果时的实际 worker 数。
+
 ## 1. 这轮结果对应的 run
 
 - 样本：`yc_sGzBQrg1adY`
-- 数据源：[data/youcook2_stitched/yc_sGzBQrg1adY](/home/alpen/DEV/video2tasks/data/youcook2_stitched/yc_sGzBQrg1adY)
+- 数据源目录：`data/youcook2_stitched/yc_sGzBQrg1adY`
 - 本轮 run id：`g3flash_sgz_repeat2_demo_20260404`
-- 输出目录：[runs/demo_single_sGzBQrg1adY/g3flash_sgz_repeat2_demo_20260404/samples/yc_sGzBQrg1adY](/home/alpen/DEV/video2tasks/runs/demo_single_sGzBQrg1adY/g3flash_sgz_repeat2_demo_20260404/samples/yc_sGzBQrg1adY)
-- 最终切分结果：[segments.json](/home/alpen/DEV/video2tasks/runs/demo_single_sGzBQrg1adY/g3flash_sgz_repeat2_demo_20260404/samples/yc_sGzBQrg1adY/segments.json)
-- 官方边界来源：[source_meta.json](/home/alpen/DEV/video2tasks/data/youcook2_stitched/yc_sGzBQrg1adY/source_meta.json)
+- run 输出目录：`runs/demo_single_sGzBQrg1adY/g3flash_sgz_repeat2_demo_20260404/samples/yc_sGzBQrg1adY`
+- 最终切分结果：`runs/demo_single_sGzBQrg1adY/g3flash_sgz_repeat2_demo_20260404/samples/yc_sGzBQrg1adY/segments.json`
+- 官方边界来源：`data/youcook2_stitched/yc_sGzBQrg1adY/source_meta.json`
 
 说明：
 
 - 这个 stitched benchmark 没有单独落一份 `official_segments.json`。
 - 这里的官方边界取自 `source_meta.json` 里每段 clip 的 `stitched_end_frame`。
+- 这里的样本路径、run id、产物路径都是第一阶段基线的一部分；如果这三者换了，就不再是本文档记录的同一条基线。
 
 ## 2. 这轮“实际生效”的配置
 
 ### 2.1 配置文件基线
 
-基础配置文件是 [config.g3flash.yaml](/home/alpen/DEV/video2tasks/config.g3flash.yaml)。
+基础配置文件是 `config.g3flash.yaml`。
 
 关键项如下：
 
@@ -51,6 +68,11 @@
 - `server.max_retries_per_job: 50`
 - `server.max_empty_retries_per_job: 0`
 
+补充说明：
+
+- 上面这段只代表 `config.g3flash.yaml` 的 YAML 基线，不代表项目当前全局默认值。
+- 当前项目默认 `worker.count` 已经是 `7`，所以不要把 `config.g3flash.yaml` 里的 `4` 误认为“当前默认”。
+
 ### 2.2 这次实跑时的运行时覆盖
 
 这轮最终跑通并产出结果时，不是完全按配置文件默认值运行，而是带了下面这些运行时参数：
@@ -66,7 +88,8 @@ PYTHONPATH=src python3 -m video2tasks.cli.cluster --config config.g3flash.yaml
 
 因此需要明确区分：
 
-- 配置文件默认 `worker.count` 是 `4`
+- 项目当前默认 `worker.count` 是 `7`
+- `config.g3flash.yaml` 这份文档基线里的 `worker.count` 是 `4`
 - 这轮最终出结果时，实际使用的是 `WORKER_COUNT=2`
 
 也就是说，如果要“完全复刻这轮”，应以 `config.g3flash.yaml` 为基线，并额外覆盖：
@@ -76,6 +99,17 @@ PYTHONPATH=src python3 -m video2tasks.cli.cluster --config config.g3flash.yaml
 - `PORT=8107`
 - `SERVER_URL="http://127.0.0.1:8107"`
 - `WORKER_COUNT=2`
+
+### 2.3 一条最小可复现口径
+
+如果目标是复现本文档里的第一阶段基线，请固定下面四件事，而不要只抄一部分参数：
+
+- 样本：`yc_sGzBQrg1adY`
+- 数据集选择：`DATASETS="tmp:demo_single_sGzBQrg1adY"`
+- run id：`g3flash_sgz_repeat2_demo_20260404`
+- 产物检查路径：`runs/demo_single_sGzBQrg1adY/g3flash_sgz_repeat2_demo_20260404/samples/yc_sGzBQrg1adY/segments.json`
+
+只保留 `config.g3flash.yaml` 但不带上述运行时覆盖，得到的结果不能视为这份文档里的 repeat2 baseline。
 
 ## 3. 这轮配置的核心含义
 

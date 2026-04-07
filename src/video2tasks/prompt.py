@@ -474,6 +474,276 @@ def prompt_boundary_refinement(
     )
 
 
+def prompt_segment_merge(
+    segments: list[dict],
+    granularity: str = "guarded",
+    boundary_hints: list[dict] | None = None,
+) -> str:
+    formatted_segments: list[str] = []
+    for segment in segments:
+        seg_id = int(segment.get("seg_id", len(formatted_segments)))
+        start_frame = int(segment.get("start_frame", 0))
+        end_frame = int(segment.get("end_frame", start_frame))
+        duration_frames = max(0, end_frame - start_frame)
+        instruction = str(segment.get("instruction", "")).strip() or "Unknown task step"
+        formatted_segments.append(
+            f"- seg_id={seg_id}, frames=[{start_frame}, {end_frame}), duration_frames={duration_frames}, instruction={instruction!r}"
+        )
+
+    segment_listing = "\n".join(formatted_segments)
+    boundary_hint_section = ""
+
+    if granularity == "guarded":
+        merge_guidance = (
+            "Your job is to merge only the adjacent segments that are **obviously** fragments of the same immediate manipulation step.\n\n"
+            "### Goal\n"
+            "Reduce obvious over-cutting while preserving true task switches.\n"
+            "When uncertain, keep the boundary.\n"
+            "Do **NOT** invent new boundaries, delete time, reorder segments, or split a segment further.\n"
+            "You may only merge adjacent original segments into larger contiguous ranges.\n\n"
+            "### Merge Rules\n"
+            "1. Merge only when adjacent segments clearly describe the same immediate manipulation goal and the boundary looks like a fragment caused by setup, short continuation, short tail, or redundant relabeling of the same step.\n"
+            "2. Do **NOT** merge across a plausible true task switch such as a new committed action round, a new immediate goal, a clear restart, a distinct transfer outcome, or a tool or target change that indicates a real step change.\n"
+            "3. Do **NOT** rely on broad scene similarity. The same workspace, same container, same support surface, or same overall activity does **NOT** by itself justify merging.\n"
+            "4. If two adjacent segments could reasonably be separate robot commands, keep them separate.\n"
+            "5. Prefer conservative merging. A missed merge is better than deleting a real task boundary.\n"
+            "6. Do **NOT** rewrite or relabel the steps. Only output a partition of the original `seg_id` sequence into contiguous merge ranges.\n\n"
+        )
+        example_thought = "Two short setup fragments clearly belong to the following placement step."
+    elif granularity == "coarse":
+        formatted_boundary_hints: list[str] = []
+        for hint in boundary_hints or []:
+            boundary_after_seg_id = int(hint.get("boundary_after_seg_id", -1))
+            boundary_frame = int(hint.get("boundary_frame", 0))
+            left_instruction = str(hint.get("left_instruction", "")).strip() or "Unknown task step"
+            right_instruction = str(hint.get("right_instruction", "")).strip() or "Unknown task step"
+            reason_tokens: list[str] = []
+            if bool(hint.get("has_boundary_support", False)):
+                reason_tokens.append(f"support={float(hint.get('boundary_support', 0.0)):.3f}")
+            if bool(hint.get("sequence_markers", False)):
+                reason_tokens.append("sequence_change")
+            if bool(hint.get("instruction_drift", False)):
+                reason_tokens.append("focus_change")
+            reason_summary = ", ".join(reason_tokens) if reason_tokens else "candidate_anchor"
+            formatted_boundary_hints.append(
+                f"- after seg_id={boundary_after_seg_id}, frame={boundary_frame}, signals=[{reason_summary}], "
+                f"left={left_instruction!r}, right={right_instruction!r}"
+            )
+
+        merge_guidance = (
+            "These segments come from a recall-first over-segmentation pass. Your job is to merge them into **coarse task-level steps** that match broad human task annotation. Think in terms of broad robot commands tied to distinct externally visible outcomes, not in terms of domain phases, scene categories, or high-level stage labels.\n\n"
+            "### Goal\n"
+            "Favor fewer, broader task steps whenever adjacent fine segments still belong to one higher-level immediate goal.\n"
+            "The final partition should be much closer to broad human task steps than to fine-grained onset fragments.\n"
+            "Aim for one broad robot command per dominant externally visible outcome, not one segment per broad context label or stage name.\n"
+            "Do **NOT** invent new boundaries, delete time, reorder segments, or split a segment further.\n"
+            "You may only merge adjacent original segments into larger contiguous ranges.\n\n"
+            "### Coarse Merge Rules\n"
+            "1. Prefer merging setup, approach, alignment, execution, immediate continuation, and short cleanup tails when they all serve one broader task outcome. A coarse step may contain setup plus execution plus immediate cleanup for one dominant outcome.\n"
+            "2. Merge repeated micro-fragments, short restarts, and closely spaced sub-actions when a human would still describe them as one broad instruction with one dominant outcome.\n"
+            "3. Consecutive fine segments may stay together even if the verb wording changes, as long as they still read as the same broad command with the same main target and dominant visible outcome. Do **NOT** use vague same-stage reasoning to merge across separate completed outcomes.\n"
+            "4. Keep a boundary when there is a plausible coarse task switch such as a new main target, a new manipulated object focus, a new transfer destination, a completed outcome followed by a distinct next goal, or any point where a human annotator would still write a separate broad command.\n"
+            "5. Do **NOT** keep boundaries that exist only because the earlier pass intentionally split first-versus-second rounds, setup versus execution, or tiny instruction wording drift inside one broader step. But do **NOT** merge a broad stage label if that would absorb multiple separate broad commands with separate visible outcomes.\n"
+            "6. When uncertain between two neighboring coarse interpretations, choose the partition that better preserves separate broad commands with distinct visible outcomes. Do **NOT** merge merely to reduce the segment count.\n"
+            "7. Place the boundary where the two neighboring broad commands are best separated for a human annotator. Do **NOT** bias toward the earliest possible hint of the next command or the latest residual tail of the previous one. A short lead-in, overlap, or settling tail may stay with the neighboring coarse step when that yields a cleaner broad command boundary.\n"
+            "8. Do **NOT** rewrite or relabel the steps. Only output a partition of the original `seg_id` sequence into contiguous merge ranges.\n\n"
+        )
+        if formatted_boundary_hints:
+            boundary_hint_section = (
+                "### Objective Boundary Hints\n"
+                "The following candidate anchors are inferred from the visual segmentation pass. They are advisory anchors, not hard constraints.\n"
+                "Use them to check whether a broad merge would swallow distinct visible outcomes or distinct command switches.\n"
+                "Do **NOT** keep every hinted boundary automatically, but do **NOT** ignore a cluster of hinted anchors merely to force a smaller segment count.\n"
+                "If a hint introduces a short numbered sub-action that then immediately continues, the cleaner coarse boundary may be after that short completed sub-action rather than at its first introduction.\n"
+                f"{chr(10).join(formatted_boundary_hints)}\n\n"
+            )
+        example_thought = "Several adjacent fine fragments still form one broader task-level step, so they should be merged coarsely."
+    else:
+        raise ValueError(f"Unsupported merge granularity: {granularity}")
+
+    return (
+        "You are reviewing a finalized sequence of adjacent robot task segments that may be over-segmented.\n"
+        f"{merge_guidance}"
+        f"{boundary_hint_section}"
+        "### Output Format\n"
+        "Return raw JSON only.\n"
+        "Return one object with keys `thought` and `merged_ranges`.\n"
+        "`thought` must be one short sentence.\n"
+        "`merged_ranges` must cover every original `seg_id` exactly once, in order, with contiguous ranges.\n"
+        "Example:\n"
+        "{\n"
+        f"  \"thought\": \"{example_thought}\",\n"
+        "  \"merged_ranges\": [\n"
+        "    {\"start_seg_id\": 0, \"end_seg_id\": 1},\n"
+        "    {\"start_seg_id\": 2, \"end_seg_id\": 2},\n"
+        "    {\"start_seg_id\": 3, \"end_seg_id\": 5}\n"
+        "  ]\n"
+        "}\n\n"
+        "### Segments\n"
+        f"{segment_listing}\n"
+    )
+
+
+def prompt_segment_hierarchy(
+    segments: list[dict],
+    enabled_levels: list[str],
+) -> str:
+    if not enabled_levels:
+        raise ValueError("enabled_levels must not be empty")
+
+    formatted_segments: list[str] = []
+    for segment in segments:
+        seg_id = int(segment.get("seg_id", len(formatted_segments)))
+        start_frame = int(segment.get("start_frame", 0))
+        end_frame = int(segment.get("end_frame", start_frame))
+        duration_frames = max(0, end_frame - start_frame)
+        instruction = str(segment.get("instruction", "")).strip() or "Unknown task step"
+        formatted_segments.append(
+            f"- seg_id={seg_id}, frames=[{start_frame}, {end_frame}), duration_frames={duration_frames}, instruction={instruction!r}"
+        )
+
+    level_rules: list[str] = []
+    if "coarse" in enabled_levels:
+        level_rules.append(
+            "- `coarse`: the broadest meaningful task grouping. Prefer a few outcome-level commands that summarize larger chunks of work."
+        )
+    if "medium" in enabled_levels:
+        level_rules.append(
+            "- `medium`: an intermediate abstraction. Keep more structure than `coarse`, but still merge adjacent cleaned segments when they clearly serve one moderate subtask."
+        )
+    if "fine" in enabled_levels:
+        level_rules.append(
+            "- `fine`: the most detailed meaningful layer. Stay closest to the cleaned segments and summarize concrete visible actions without scene or stage labels."
+        )
+
+    example_lines = [
+        "{",
+        '  "thought": "The cleaned segments can be summarized at multiple action granularities.",',
+    ]
+    for level_name in enabled_levels:
+        if level_name == "coarse":
+            example_lines.extend(
+                [
+                    '  "coarse": [',
+                    '    {"start_seg_id": 0, "end_seg_id": 2, "summary": "Prepare the first work area"},',
+                    '    {"start_seg_id": 3, "end_seg_id": 5, "summary": "Complete the transfer and finish the task"}',
+                    "  ],",
+                ]
+            )
+        elif level_name == "medium":
+            example_lines.extend(
+                [
+                    '  "medium": [',
+                    '    {"start_seg_id": 0, "end_seg_id": 1, "summary": "Position and load the first item"},',
+                    '    {"start_seg_id": 2, "end_seg_id": 3, "summary": "Adjust the target and continue loading"},',
+                    '    {"start_seg_id": 4, "end_seg_id": 5, "summary": "Transfer out the completed result"}',
+                    "  ],",
+                ]
+            )
+        elif level_name == "fine":
+            example_lines.extend(
+                [
+                    '  "fine": [',
+                    '    {"start_seg_id": 0, "end_seg_id": 0, "summary": "Pick up the first item"},',
+                    '    {"start_seg_id": 1, "end_seg_id": 1, "summary": "Place the first item into the target area"},',
+                    '    {"start_seg_id": 2, "end_seg_id": 2, "summary": "Adjust the target area"},',
+                    '    {"start_seg_id": 3, "end_seg_id": 5, "summary": "Complete the remaining transfer sequence"}',
+                    "  ],",
+                ]
+            )
+    example_lines[-1] = example_lines[-1].rstrip(",")
+    example_lines.append("}")
+    example_json = "\n".join(example_lines)
+
+    output_keys = ", ".join([f"`{level_name}`" for level_name in enabled_levels])
+
+    return (
+        "You are reviewing a cleaned sequence of robot task segments after an over-segmentation cleanup pass.\n"
+        "Your job is to keep the cleaned segment order fixed, then summarize the same sequence at one or more abstraction levels.\n\n"
+        "### Goal\n"
+        "Produce objective hierarchical task summaries that are useful for downstream task aggregation.\n"
+        "Do **NOT** imitate scene descriptions, stage labels, recipe phases, narration, or visual presentation shots.\n"
+        "Summaries must describe visible manipulation actions or externally visible outcomes.\n"
+        "Remove no time, invent no new segments, and reorder nothing.\n"
+        "You may only group adjacent original `seg_id` values into larger contiguous ranges for each requested summary level.\n\n"
+        "### Level Definitions\n"
+        f"{chr(10).join(level_rules)}\n\n"
+        "### General Rules\n"
+        "1. Every enabled level must partition the full original `seg_id` sequence exactly once, in order, with contiguous inclusive ranges.\n"
+        "2. Finer levels must stay nested inside broader levels. Do **NOT** create crossing ranges.\n"
+        "3. Use short, objective action summaries with concrete verbs and visible objects or outcomes.\n"
+        "4. Do **NOT** use scene labels, stage labels, narration labels, camera labels, or state-only labels such as `Show result`, `Observe`, `Presentation`, or `Preparation stage`.\n"
+        "5. If identity is ambiguous, keep the wording grounded but coarse rather than guessing domain-specific terms.\n"
+        "6. `coarse` should be the broadest enabled level, `fine` the narrowest enabled level. The three levels should differ in abstraction, not just rephrase the same granularity.\n"
+        "7. The cleaned segments already removed obvious failed over-cuts. Focus this pass on meaningful grouping and summarization, not on redoing the first-stage boundary search.\n\n"
+        "### Output Format\n"
+        "Return raw JSON only.\n"
+        f"Return one object with keys `thought` and {output_keys}.\n"
+        "`thought` must be one short sentence.\n"
+        "Each enabled level must be an array of objects with keys `start_seg_id`, `end_seg_id`, and `summary`.\n"
+        "Example:\n"
+        f"{example_json}\n\n"
+        "### Cleaned Segments\n"
+        f"{chr(10).join(formatted_segments)}\n"
+    )
+
+
+def prompt_segment_subtitles(
+    segments: list[dict],
+    target_language: str,
+) -> str:
+    normalized_language = str(target_language).strip().lower()
+    if normalized_language not in {"zh", "en"}:
+        raise ValueError(f"Unsupported subtitle language: {target_language}")
+
+    formatted_segments: list[str] = []
+    for index, segment in enumerate(segments):
+        seg_id = int(segment.get("seg_id", index))
+        start_frame = int(segment.get("start_frame", 0))
+        end_frame = int(segment.get("end_frame", start_frame))
+        instruction = str(segment.get("instruction", "")).strip() or "Unknown task step"
+        formatted_segments.append(
+            f"- seg_id={seg_id}, frames=[{start_frame}, {end_frame}), instruction={instruction!r}"
+        )
+
+    target_label = "Simplified Chinese" if normalized_language == "zh" else "English"
+    target_rule = (
+        "Write concise Simplified Chinese robot-task subtitles. Use objective action wording and visible objects. "
+        "Preserve ordinal cues such as first/second when they are semantically important."
+        if normalized_language == "zh"
+        else "Write concise English robot-task subtitles. Preserve the original task meaning and ordering."
+    )
+    example_subtitles = (
+        '[{"seg_id": 0, "subtitle": "拿起第一个物体"}, {"seg_id": 1, "subtitle": "将第一个物体放入目标区域"}]'
+        if normalized_language == "zh"
+        else '[{"seg_id": 0, "subtitle": "Pick up the first item"}, {"seg_id": 1, "subtitle": "Place the first item into the target area"}]'
+    )
+
+    return (
+        "You are localizing finalized robot task instructions for exported video subtitles.\n"
+        "Do not change the segment count, order, or time ranges.\n"
+        "The source `instruction` text must remain semantically unchanged; only generate subtitle text for export.\n\n"
+        "### Goal\n"
+        f"Translate each segment instruction into {target_label} subtitles.\n"
+        f"{target_rule}\n"
+        "Do **NOT** merge, split, reorder, summarize across segments, or introduce scene narration.\n"
+        "Do **NOT** mention cameras, recipes, stages, or presentation language.\n"
+        "Keep one subtitle per input segment.\n\n"
+        "### Output Format\n"
+        "Return raw JSON only.\n"
+        "Return one object with keys `thought` and `subtitles`.\n"
+        "`thought` must be one short sentence.\n"
+        "`subtitles` must be an array of objects with keys `seg_id` and `subtitle`, covering every original segment exactly once in order.\n"
+        "Example:\n"
+        "{\n"
+        '  "thought": "The finalized instructions can be localized one by one.",\n'
+        f'  "subtitles": {example_subtitles}\n'
+        "}\n\n"
+        "### Segments\n"
+        f"{chr(10).join(formatted_segments)}\n"
+    )
+
+
 def prompt_switch_detection(
     n_images: int,
     mode: str = "freeform",

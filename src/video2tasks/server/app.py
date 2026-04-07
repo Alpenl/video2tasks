@@ -22,6 +22,8 @@ from .windowing import (
     build_refinement_windows, build_window_prompt_metadata, Window,
     sample_segment_frame_ids,
 )
+from .exporter import export_sample_outputs
+from .llm_merge import run_export_subtitle_localization_pass, run_llm_postprocess_pass
 from .task_artifacts import TaskArtifactWriter
 from ..vlm.base import normalize_task_window_result
 
@@ -1179,6 +1181,67 @@ def create_app(config: Config) -> FastAPI:
                                     int(segment_id) for segment_id in sorted(label_failures)
                                 ]
                                 final_res["diagnostics"] = diagnostics
+
+                            cleaned_segments, task_hierarchy, llm_postprocess_diagnostics = run_llm_postprocess_pass(
+                                sid,
+                                final_res.get("segments", []),
+                                config.llm_merge,
+                            )
+                            final_res = dict(final_res)
+                            final_res["segments"] = cleaned_segments
+                            if task_hierarchy is not None:
+                                final_res["task_hierarchy"] = task_hierarchy
+                            diagnostics = dict(final_res.get("diagnostics", {}))
+                            diagnostics.update(llm_postprocess_diagnostics)
+
+                            export_segments = [
+                                dict(segment)
+                                for segment in final_res.get("segments", [])
+                                if isinstance(segment, dict)
+                            ]
+                            if bool(config.export.enabled) and bool(config.export.subtitles.enabled):
+                                subtitle_segments, subtitle_localization_diagnostics = run_export_subtitle_localization_pass(
+                                    sid,
+                                    export_segments,
+                                    config.llm_merge,
+                                    str(config.export.subtitles.language),
+                                )
+                                export_segments = subtitle_segments
+                            else:
+                                subtitle_localization_diagnostics = {
+                                    "export_subtitle_language": str(config.export.subtitles.language),
+                                    "export_subtitle_attempted": False,
+                                    "export_subtitle_applied": False,
+                                    "export_subtitle_fallback_used": False,
+                                    "export_subtitle_reason": (
+                                        "export_disabled"
+                                        if not bool(config.export.enabled)
+                                        else "subtitles_disabled"
+                                    ),
+                                    "export_subtitle_segment_count": len(export_segments),
+                                }
+                            diagnostics.update(subtitle_localization_diagnostics)
+
+                            try:
+                                export_diagnostics = export_sample_outputs(
+                                    run_dir=ctx.run_dir,
+                                    sample_id=sid,
+                                    video_path=mp4,
+                                    fps=fps,
+                                    segments=export_segments,
+                                    export_config=config.export,
+                                )
+                            except Exception as exc:
+                                export_diagnostics = {
+                                    "export_enabled": bool(config.export.enabled),
+                                    "export_attempted": bool(config.export.enabled),
+                                    "export_mode": str(config.export.mode),
+                                    "export_reason": "failed_before_export_completion",
+                                    "export_error": str(exc).strip() or type(exc).__name__,
+                                }
+
+                            diagnostics.update(export_diagnostics)
+                            final_res["diagnostics"] = diagnostics
                             
                             with open(segments_path(ctx.samples_dir, sid), "w", encoding="utf-8") as f:
                                 json.dump(final_res, f, indent=2, ensure_ascii=False)

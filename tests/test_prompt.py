@@ -1,5 +1,7 @@
 from video2tasks.prompt import (
     prompt_boundary_refinement,
+    prompt_segment_hierarchy,
+    prompt_segment_merge,
     prompt_segment_instruction,
     prompt_switch_detection,
 )
@@ -217,7 +219,38 @@ def test_prompt_segment_instruction_requests_single_label_without_boundaries() -
     assert "do not split it further" in prompt.lower()
     assert "grounded but coarse names" in prompt.lower()
     assert '"transitions": []' in prompt
-    assert '"instructions": ["one concise task instruction"]' in prompt
+
+
+def test_prompt_segment_hierarchy_requests_objective_multilevel_partitions() -> None:
+    prompt = prompt_segment_hierarchy(
+        [
+            {"seg_id": 0, "start_frame": 0, "end_frame": 10, "instruction": "Pick up the item"},
+            {"seg_id": 1, "start_frame": 10, "end_frame": 20, "instruction": "Place the item into the target area"},
+        ],
+        ["coarse", "medium", "fine"],
+    )
+
+    assert "objective hierarchical task summaries" in prompt.lower()
+    assert "scene descriptions" in prompt.lower()
+    assert "coarse" in prompt
+    assert "medium" in prompt
+    assert "fine" in prompt
+    assert "partition the full original `seg_id` sequence exactly once" in prompt
+    assert "Finer levels must stay nested inside broader levels" in prompt
+
+
+def test_prompt_segment_hierarchy_uses_only_enabled_levels_in_output_contract() -> None:
+    prompt = prompt_segment_hierarchy(
+        [
+            {"seg_id": 0, "start_frame": 0, "end_frame": 10, "instruction": "Pick up the item"},
+        ],
+        ["medium", "fine"],
+    )
+
+    assert "keys `thought` and `medium`, `fine`" in prompt
+    assert '"medium": [' in prompt
+    assert '"fine": [' in prompt
+    assert '"coarse": [' not in prompt
 
 
 def test_prompt_segment_instruction_prefers_narrow_completed_manipulation() -> None:
@@ -226,6 +259,62 @@ def test_prompt_segment_instruction_prefers_narrow_completed_manipulation() -> N
     assert "narrowest completed visible manipulation" in prompt.lower()
     assert "broad scene-level activity summary" in prompt.lower()
     assert "raw json only" in prompt.lower()
+
+
+def test_prompt_segment_merge_is_conservative_and_generic() -> None:
+    prompt = prompt_segment_merge(
+        [
+            {"seg_id": 0, "start_frame": 0, "end_frame": 12, "instruction": "Align the tool"},
+            {"seg_id": 1, "start_frame": 12, "end_frame": 24, "instruction": "Place the cover onto the target"},
+            {"seg_id": 2, "start_frame": 24, "end_frame": 36, "instruction": "Remove the tool"},
+        ]
+    )
+
+    assert "merge only the adjacent segments that are **obviously** fragments" in prompt.lower()
+    assert "when uncertain, keep the boundary" in prompt.lower()
+    assert "do **not** invent new boundaries" in prompt.lower()
+    assert "do **not** rely on broad scene similarity" in prompt.lower()
+    assert "only output a partition of the original `seg_id` sequence" in prompt.lower()
+    assert "\"merged_ranges\"" in prompt
+
+
+def test_prompt_segment_merge_coarse_targets_broader_steps() -> None:
+    prompt = prompt_segment_merge(
+        [
+            {"seg_id": 0, "start_frame": 0, "end_frame": 12, "instruction": "Align the tool"},
+            {"seg_id": 1, "start_frame": 12, "end_frame": 24, "instruction": "Place the cover onto the target"},
+            {"seg_id": 2, "start_frame": 24, "end_frame": 36, "instruction": "Remove the tool"},
+        ],
+        granularity="coarse",
+        boundary_hints=[
+            {
+                "boundary_after_seg_id": 1,
+                "boundary_frame": 24,
+                "boundary_support": 0.73,
+                "has_boundary_support": True,
+                "sequence_markers": False,
+                "instruction_drift": True,
+                "left_instruction": "Place the cover onto the target",
+                "right_instruction": "Remove the tool",
+            }
+        ],
+    )
+
+    assert "coarse task-level steps" in prompt.lower()
+    assert "match broad human task annotation" in prompt.lower()
+    assert "not in terms of domain phases, scene categories, or high-level stage labels" in prompt.lower()
+    assert "one broad robot command per dominant externally visible outcome" in prompt.lower()
+    assert "do **not** use vague same-stage reasoning" in prompt.lower()
+    assert "do **not** merge merely to reduce the segment count" in prompt.lower()
+    assert "do **not** keep boundaries that exist only because the earlier pass intentionally split first-versus-second rounds" in prompt.lower()
+    assert "place the boundary where the two neighboring broad commands are best separated for a human annotator" in prompt.lower()
+    assert "do **not** bias toward the earliest possible hint of the next command" in prompt.lower()
+    assert "objective boundary hints" in prompt.lower()
+    assert "advisory anchors, not hard constraints" in prompt.lower()
+    assert "ignore a cluster of hinted anchors" in prompt.lower()
+    assert "after seg_id=1, frame=24" in prompt.lower()
+    assert "cooking" not in prompt.lower()
+    assert "plating" not in prompt.lower()
 
 
 def test_prompt_segment_instruction_contact_sheet_layout_uses_logical_indices() -> None:

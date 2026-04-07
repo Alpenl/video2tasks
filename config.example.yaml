@@ -12,6 +12,21 @@ run:
   base_dir: "./runs"  # Base directory for all outputs
   run_id: "default"    # Run identifier (creates subdirectory)
 
+# Optional export configuration
+export:
+  enabled: false               # Keep false unless you want extra exported video artifacts
+  mode: "annotated"           # "annotated", "clips", or "both"
+  clips_dirname: "clips"
+  manifest_name: "manifest.json"
+  annotated_dirname: "exports"
+  annotated_name: "annotated.mp4"
+  subtitles:
+    enabled: true
+    language: "zh"          # "zh" uses second-stage localized subtitles, "en" reuses source instructions
+    position: "top_right"     # "top_right", "top_left", "bottom_right", "bottom_left"
+    font_file: ""             # Optional font path; empty means auto-pick a common local font
+    font_size: 28
+
 # Server configuration
 server:
   host: "0.0.0.0"
@@ -76,6 +91,35 @@ windowing:
   use_contact_sheets: true   # Pack multiple logical frames into each uploaded image
   contact_sheet_rows: 4      # 4 rows per uploaded contact sheet
   contact_sheet_cols: 4      # 4 columns per uploaded contact sheet
+
+# Optional text-only LLM merge pass for collapsing over-segmented final steps
+llm_merge:
+  enabled: false
+  backend: "openai"
+  api_key: ""
+  model: "gpt-5.2"
+  base_url: "https://api.openai.com/v1"
+  timeout_sec: 60.0
+  organization: ""
+  project: ""
+  reasoning_effort: "low"
+  max_output_tokens: 2048
+  max_attempts: 3
+  granularity: "coarse"
+  min_input_segments: 12
+  max_input_segments: 256
+  min_output_ratio: 0.35
+  coarse_min_output_ratio: 0.1
+  coarse_max_supported_anchors_per_range: 1
+  coarse_anchor_min_spacing_segments: 3
+  coarse_anchor_min_side_segments: 2
+  coarse_anchor_min_score: 1.03
+  protect_supported_boundaries: true
+  protected_boundary_support_threshold: 0.8
+  protect_distinct_sequence_markers: true
+  protect_instruction_drift: true
+  protect_duplicate_tail_anchor: false
+  duplicate_tail_anchor_min_frames: 5
 
 # Progress configuration
 progress:
