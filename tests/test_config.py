@@ -2,7 +2,7 @@ import importlib
 from textwrap import dedent
 import pytest
 
-from video2tasks.config import Config
+from video2tasks.config import Config, LLMMergeConfig
 
 
 def test_config_accepts_openai_backend() -> None:
@@ -111,6 +111,14 @@ def test_config_reads_worker_count_from_environment(monkeypatch) -> None:
     cfg = Config.from_env()
 
     assert cfg.worker.count == 3
+
+
+def test_config_reads_run_force_resume_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("RUN_FORCE_RESUME", "true")
+
+    cfg = Config.from_env()
+
+    assert cfg.run.force_resume is True
 
 
 def test_config_reads_gemini_values_from_environment(monkeypatch) -> None:
@@ -241,6 +249,52 @@ def test_config_from_yaml_applies_env_overrides(monkeypatch, tmp_path) -> None:
     assert cfg.llm_merge.coarse_min_output_ratio == 0.12
 
 
+def test_config_load_does_not_auto_discover_config_yaml_from_cwd(monkeypatch, tmp_path) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        dedent(
+            """
+            run:
+              run_id: discovered-config
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    cfg = Config.load()
+
+    assert cfg.run.run_id == "default"
+
+
+def test_config_load_uses_video2tasks_config_env_path(monkeypatch, tmp_path) -> None:
+    cfg_path = tmp_path / "named-config.yaml"
+    cfg_path.write_text(
+        dedent(
+            """
+            run:
+              run_id: env-config
+            server:
+              port: 8010
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("VIDEO2TASKS_CONFIG", str(cfg_path))
+
+    cfg = Config.load()
+
+    assert cfg.run.run_id == "env-config"
+    assert cfg.server.port == 8010
+
+
+def test_max_empty_retries_per_job_defaults_to_finite_value() -> None:
+    cfg = Config()
+
+    assert cfg.server.max_empty_retries_per_job == 3
+
+
 def test_validate_config_cli_module_is_importable() -> None:
     module = importlib.import_module("video2tasks.cli.validate_config")
 
@@ -317,3 +371,52 @@ def test_config_rejects_invalid_backend_from_environment(monkeypatch) -> None:
 
     with pytest.raises(ValueError, match="backend"):
         Config.from_env()
+
+
+def test_llm_merge_config_accepts_named_summary_levels_mapping() -> None:
+    cfg = LLMMergeConfig(summary_levels={"coarse": 1, "medium": 0, "fine": 1})
+
+    assert cfg.summary_levels == [1, 0, 1]
+    assert cfg.summary_levels_named == {"coarse": 1, "medium": 0, "fine": 1}
+
+
+def test_llm_merge_config_accepts_partial_named_summary_levels_mapping() -> None:
+    cfg = LLMMergeConfig(summary_levels={"fine": 1})
+
+    assert cfg.summary_levels == [0, 0, 1]
+    assert cfg.summary_levels_named == {"coarse": 0, "medium": 0, "fine": 1}
+
+
+def test_config_accepts_named_summary_levels_mapping() -> None:
+    cfg = Config(llm_merge={"summary_levels": {"coarse": 0, "medium": 1, "fine": 1}})
+
+    assert cfg.llm_merge.summary_levels == [0, 1, 1]
+    assert cfg.llm_merge.summary_levels_named == {"coarse": 0, "medium": 1, "fine": 1}
+
+
+def test_export_subtitle_language_accepts_language_aliases() -> None:
+    cfg = Config(export={"subtitles": {"language": "en-US"}})
+
+    assert cfg.export.subtitles.language == "en"
+
+    cfg = Config(export={"subtitles": {"language": "zh-Hans"}})
+
+    assert cfg.export.subtitles.language == "zh"
+
+
+def test_config_reads_export_subtitle_language_aliases_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("EXPORT_SUBTITLE_LANGUAGE", "en-GB")
+
+    cfg = Config.from_env()
+
+    assert cfg.export.subtitles.language == "en"
+
+
+def test_config_reads_llm_merge_summary_levels_named_mapping_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv("LLM_MERGE_SUMMARY_LEVELS", '{"coarse": 1, "medium": 0, "fine": 1}')
+
+    cfg = Config.from_env()
+
+    assert cfg.llm_merge.summary_levels == [1, 0, 1]
+    assert cfg.llm_merge.summary_levels_named == {"coarse": 1, "medium": 0, "fine": 1}
+

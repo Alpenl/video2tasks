@@ -31,3 +31,31 @@ def test_score_boundary_recall_uses_only_tight_boundary_hits() -> None:
     assert summary.matches[1].hit is False
     assert summary.matches[2].delta_frames == 5
     assert summary.matches[2].hit is True
+
+
+def test_score_boundary_recall_allows_each_prediction_to_hit_only_one_gt() -> None:
+    summary = score_boundary_recall(
+        gt_boundaries=[100, 104],
+        pred_boundaries=[102],
+        tolerance_frames=3,
+    )
+
+    assert summary.hit_count == 1
+    assert summary.miss_count == 1
+    assert summary.recall == 0.5
+    assert [match.hit for match in summary.matches] == [True, False]
+    assert summary.matches[0].matched_pred_frame == 102
+
+
+def test_score_boundary_recall_finds_maximum_one_to_one_hits() -> None:
+    summary = score_boundary_recall(
+        gt_boundaries=[100, 104],
+        pred_boundaries=[97, 102],
+        tolerance_frames=3,
+    )
+
+    assert summary.hit_count == 2
+    assert summary.miss_count == 0
+    assert summary.recall == 1.0
+    assert [match.hit for match in summary.matches] == [True, True]
+    assert [match.matched_pred_frame for match in summary.matches] == [97, 102]

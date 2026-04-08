@@ -1,7 +1,7 @@
 """Robot Video Segmentor - Configuration management."""
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 from pathlib import Path
 import json
 import os
@@ -19,6 +19,10 @@ class RunConfig(BaseModel):
     """Run/output configuration."""
     base_dir: str = Field(default="./runs", description="Base directory for outputs")
     run_id: str = Field(default="default", description="Run identifier")
+    force_resume: bool = Field(
+        default=False,
+        description="Allow resume to continue across manifest identity mismatches for this run start",
+    )
 
 
 class SubtitleConfig(BaseModel):
@@ -26,7 +30,10 @@ class SubtitleConfig(BaseModel):
     enabled: bool = Field(default=True, description="Burn instruction subtitles into exported videos")
     language: str = Field(
         default="zh",
-        description="Subtitle language for exported videos: zh/en. Only export subtitles change language; source instructions remain unchanged.",
+        description=(
+            "Subtitle language for exported videos: zh/en (aliases like zh-CN/zh-Hans/en-US are accepted). "
+            "Only subtitles change language; source instructions remain unchanged."
+        ),
     )
     position: str = Field(
         default="top_right",
@@ -42,10 +49,13 @@ class SubtitleConfig(BaseModel):
         aliases = {
             "zh": "zh",
             "zh-cn": "zh",
+            "zh-hans": "zh",
             "cn": "zh",
             "中文": "zh",
             "chinese": "zh",
             "en": "en",
+            "en-us": "en",
+            "en-gb": "en",
             "english": "en",
         }
         if normalized not in aliases:
@@ -91,8 +101,9 @@ class ServerConfig(BaseModel):
     inflight_timeout_sec: float = Field(default=300.0, description="Timeout for in-flight jobs")
     max_retries_per_job: int = Field(default=5, description="Maximum retries per job")
     max_empty_retries_per_job: int = Field(
-        default=0,
-        description="Maximum retries after an empty VLM JSON (<= 0 means unlimited)",
+        default=3,
+        ge=0,
+        description="Maximum retries after an empty VLM JSON before failing the job; set to 0 only to explicitly allow unlimited empty-result retries",
     )
     auto_exit_after_all_done: bool = Field(default=False, description="Auto exit when all done")
 
@@ -291,9 +302,12 @@ class LLMMergeConfig(BaseModel):
         ge=1,
         description="Maximum number of merge-pass request attempts when the backend returns an empty payload or transient error",
     )
-    summary_levels: List[int] = Field(
+    summary_levels: Union[List[int], Dict[str, int]] = Field(
         default_factory=lambda: [1, 1, 1],
-        description="Three-level summary switches [coarse, medium, fine], where 1 enables the level and 0 disables it",
+        description=(
+            "Three-level summary switches. Accepts either a positional list [coarse, medium, fine] "
+            "or a named mapping {coarse: 1, medium: 0, fine: 1}. Values are 0/1."
+        ),
     )
     repeat_count: int = Field(
         default=1,
@@ -405,16 +419,31 @@ class LLMMergeConfig(BaseModel):
 
     @field_validator("summary_levels")
     @classmethod
-    def validate_summary_levels(cls, v: List[int]) -> List[int]:
-        if len(v) != 3:
+    def validate_summary_levels(cls, v: Any) -> List[int]:
+        level_names = ["coarse", "medium", "fine"]
+        if isinstance(v, dict):
+            normalized_keys = {str(key).strip().lower(): value for key, value in v.items()}
+            unknown = sorted(set(normalized_keys) - set(level_names))
+            if unknown:
+                raise ValueError(f"llm_merge.summary_levels mapping has unknown keys: {unknown}")
+            raw_list = [normalized_keys.get(name, 0) for name in level_names]
+        else:
+            raw_list = list(v)
+
+        if len(raw_list) != 3:
             raise ValueError("llm_merge.summary_levels must contain exactly 3 integers: [coarse, medium, fine]")
-        normalized = []
-        for item in v:
+        normalized: List[int] = []
+        for item in raw_list:
             value = int(item)
             if value not in {0, 1}:
                 raise ValueError("llm_merge.summary_levels values must be 0 or 1")
             normalized.append(value)
         return normalized
+
+    @property
+    def summary_levels_named(self) -> Dict[str, int]:
+        levels = [int(value) for value in self.summary_levels]
+        return {"coarse": levels[0], "medium": levels[1], "fine": levels[2]}
 
 
 class ProgressConfig(BaseModel):
@@ -467,13 +496,13 @@ class Config(BaseModel):
 
     @classmethod
     def load(cls, path: Optional[Union[str, Path]] = None) -> "Config":
-        """Load configuration with priority: file > env > defaults."""
+        """Load configuration with priority: explicit path > env-config path > env > defaults."""
         if path:
             return cls.from_yaml(path)
 
-        default_path = Path("config.yaml")
-        if default_path.exists():
-            return cls.from_yaml(default_path)
+        env_config_path = os.environ.get("VIDEO2TASKS_CONFIG", "").strip()
+        if env_config_path:
+            return cls.from_yaml(env_config_path)
 
         return cls.from_env()
 
@@ -504,6 +533,12 @@ def _collect_env_override_data() -> dict:
         _set_nested_value(override, ["run", "base_dir"], os.environ["RUN_BASE"])
     if "RUN_ID" in os.environ:
         _set_nested_value(override, ["run", "run_id"], os.environ["RUN_ID"])
+    if "RUN_FORCE_RESUME" in os.environ:
+        _set_nested_value(
+            override,
+            ["run", "force_resume"],
+            _parse_env_bool(os.environ["RUN_FORCE_RESUME"]),
+        )
     if "EXPORT_ENABLED" in os.environ:
         _set_nested_value(override, ["export", "enabled"], _parse_env_bool(os.environ["EXPORT_ENABLED"]))
     if "EXPORT_MODE" in os.environ:
@@ -612,7 +647,7 @@ def _collect_env_override_data() -> dict:
     if "LLM_MERGE_MAX_ATTEMPTS" in os.environ:
         _set_nested_value(override, ["llm_merge", "max_attempts"], int(os.environ["LLM_MERGE_MAX_ATTEMPTS"]))
     if "LLM_MERGE_SUMMARY_LEVELS" in os.environ:
-        _set_nested_value(override, ["llm_merge", "summary_levels"], _parse_env_int_list(os.environ["LLM_MERGE_SUMMARY_LEVELS"]))
+        _set_nested_value(override, ["llm_merge", "summary_levels"], _parse_env_summary_levels(os.environ["LLM_MERGE_SUMMARY_LEVELS"]))
     if "LLM_MERGE_REPEAT_COUNT" in os.environ:
         _set_nested_value(override, ["llm_merge", "repeat_count"], int(os.environ["LLM_MERGE_REPEAT_COUNT"]))
     if "LLM_MERGE_BOUNDARY_VOTE_THRESHOLD" in os.environ:
@@ -723,6 +758,32 @@ def _parse_env_bool(value: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Invalid boolean environment value: {value}")
+
+
+def _parse_env_summary_levels(value: str) -> Union[List[int], Dict[str, int]]:
+    text = str(value).strip()
+    if not text:
+        raise ValueError("Invalid summary_levels environment value: empty string")
+
+    # JSON object: {"coarse":1,"medium":0,"fine":1}
+    if text.startswith("{"):
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise ValueError("Invalid summary_levels environment value: expected a JSON object")
+        normalized: Dict[str, int] = {}
+        for key, raw in parsed.items():
+            normalized[str(key)] = int(raw)
+        return normalized
+
+    # JSON list: [1,0,1]
+    if text.startswith("["):
+        parsed = json.loads(text)
+        if not isinstance(parsed, list):
+            raise ValueError("Invalid summary_levels environment value: expected a JSON list")
+        return [int(item) for item in parsed]
+
+    # Fallback: comma-separated list like 1,0,1
+    return _parse_env_int_list(text)
 
 
 def _parse_env_int_list(value: str) -> List[int]:

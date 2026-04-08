@@ -46,11 +46,41 @@ def official_boundary_frames_from_file(path: str | Path) -> list[int]:
     return [int(segment["end_frame"]) for segment in segments[:-1]]
 
 
-def _nearest_predicted_boundary(gt_frame: int, pred_boundaries: list[int]) -> tuple[Optional[int], Optional[int]]:
+def _nearest_predicted_boundary_index(
+    gt_frame: int, pred_boundaries: list[int]
+) -> Optional[int]:
     if not pred_boundaries:
-        return None, None
-    nearest = min(pred_boundaries, key=lambda pred_frame: abs(pred_frame - gt_frame))
-    return nearest, nearest - gt_frame
+        return None
+    return min(range(len(pred_boundaries)), key=lambda index: abs(pred_boundaries[index] - gt_frame))
+
+
+def _nearest_predicted_boundary(
+    gt_frame: int, pred_boundaries: list[int]
+) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    nearest_index = _nearest_predicted_boundary_index(gt_frame, pred_boundaries)
+    if nearest_index is None:
+        return None, None, None
+    nearest = pred_boundaries[nearest_index]
+    return nearest_index, nearest, nearest - gt_frame
+
+
+def _maximum_hit_matches(
+    gt_boundaries: list[int], pred_boundaries: list[int], tolerance_frames: int
+) -> dict[int, int]:
+    sorted_gt = sorted(enumerate(gt_boundaries), key=lambda item: (item[1], item[0]))
+    matched_pred_index_by_gt_index: dict[int, int] = {}
+    pred_index = 0
+
+    for gt_index, gt_frame in sorted_gt:
+        while pred_index < len(pred_boundaries) and pred_boundaries[pred_index] < gt_frame - tolerance_frames:
+            pred_index += 1
+        if pred_index >= len(pred_boundaries):
+            break
+        if pred_boundaries[pred_index] <= gt_frame + tolerance_frames:
+            matched_pred_index_by_gt_index[gt_index] = pred_index
+            pred_index += 1
+
+    return matched_pred_index_by_gt_index
 
 
 def score_boundary_recall(
@@ -62,14 +92,29 @@ def score_boundary_recall(
         raise ValueError("tolerance_frames must be non-negative")
 
     normalized_pred = sorted(int(frame) for frame in pred_boundaries)
+    normalized_gt = [int(frame) for frame in gt_boundaries]
+    matched_pred_index_by_gt_index = _maximum_hit_matches(
+        normalized_gt, normalized_pred, tolerance_frames
+    )
+    used_pred_indices = set(matched_pred_index_by_gt_index.values())
+    unmatched_pred = [
+        frame
+        for pred_index, frame in enumerate(normalized_pred)
+        if pred_index not in used_pred_indices
+    ]
     matches: list[BoundaryMatch] = []
     hit_deltas: list[int] = []
 
-    for gt_index, gt_frame in enumerate(int(frame) for frame in gt_boundaries):
-        matched_pred_frame, delta_frames = _nearest_predicted_boundary(gt_frame, normalized_pred)
-        hit = delta_frames is not None and abs(delta_frames) <= tolerance_frames
-        if hit and delta_frames is not None:
+    for gt_index, gt_frame in enumerate(normalized_gt):
+        matched_pred_index = matched_pred_index_by_gt_index.get(gt_index)
+        if matched_pred_index is not None:
+            matched_pred_frame = normalized_pred[matched_pred_index]
+            delta_frames = matched_pred_frame - gt_frame
+            hit = True
             hit_deltas.append(abs(delta_frames))
+        else:
+            _, matched_pred_frame, delta_frames = _nearest_predicted_boundary(gt_frame, unmatched_pred)
+            hit = False
         matches.append(
             BoundaryMatch(
                 gt_index=gt_index,

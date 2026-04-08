@@ -1,130 +1,32 @@
-# Video2Tasks Configuration
-# Copy this file to config.yaml and customize for your setup
+# Minimal runnable Video2Tasks config template.
+# Precedence: environment variables > this YAML file > built-in defaults.
+# Secrets should come from environment variables, not tracked YAML files.
+#
+# Deployment contract: single-machine shared-fs.
+# Run the server and workers on the same machine (or the same mounted container volume) so local paths are identical.
+# This example is intentionally minimal; it is not a full catalog of tuning knobs.
+# Frozen operator semantics:
+# - .DONE means all required stages for current config are complete.
+# - Resume refuses cross config/prompt/backend identity by default unless force_resume=true.
 
-# Dataset configuration
-# Format: list of {root: path, subset: name} pairs
 datasets:
-  - root: "./data"  # Path to your video data directory
-    subset: "demo"   # Subdirectory name containing video samples
+  - root: "./data"
+    subset: "demo"
 
-# Run configuration
 run:
-  base_dir: "./runs"  # Base directory for all outputs
-  run_id: "default"    # Run identifier (creates subdirectory)
+  base_dir: "./runs"
+  run_id: "demo"
+  force_resume: false
 
-# Optional export configuration
-export:
-  enabled: false               # Keep false unless you want extra exported video artifacts
-  mode: "annotated"           # "annotated", "clips", or "both"
-  clips_dirname: "clips"
-  manifest_name: "manifest.json"
-  annotated_dirname: "exports"
-  annotated_name: "annotated.mp4"
-  subtitles:
-    enabled: true
-    language: "zh"          # "zh" uses second-stage localized subtitles, "en" reuses source instructions
-    position: "top_right"     # "top_right", "top_left", "bottom_right", "bottom_left"
-    font_file: ""             # Optional font path; empty means auto-pick a common local font
-    font_size: 28
-
-# Server configuration
 server:
   host: "0.0.0.0"
   port: 8099
-  max_queue: 32
-  inflight_timeout_sec: 300.0
-  max_retries_per_job: 50
-  max_empty_retries_per_job: 0  # <= 0 means unlimited empty-JSON retries
-  auto_exit_after_all_done: false
+  max_empty_retries_per_job: 3
 
-# Worker configuration
 worker:
-  count: 4
+  count: 1
   server_url: "http://127.0.0.1:8099"
-  backend: "dummy"  # Options: "dummy", "qwen3vl", "remote_api", "openai", "gemini"
-  
-  # Qwen3VL-specific settings (only used when backend: qwen3vl)
-  qwen3vl:
-    model_path: "/path/to/Qwen3-VL-32B-Instruct"  # Or HuggingFace model name
-    device_map: "balanced"  # "auto", "balanced", "balanced_low_0", or specific device
+  backend: "dummy"
 
-  # Remote API settings (only used when backend: remote_api)
-  remote_api:
-    api_url: "http://127.0.0.1:8080/infer"
-    api_key: ""
-    timeout_sec: 60.0
-    headers: {}
-
-  # OpenAI Responses API settings (only used when backend: openai)
-  # api_key can also be provided via OPENAI_API_KEY
-  openai:
-    api_key: ""
-    model: "gpt-5.2"
-    base_url: "https://api.openai.com/v1"
-    timeout_sec: 60.0
-    organization: ""
-    project: ""
-    reasoning_effort: "low"
-    max_output_tokens: 512
-    jpeg_quality: 85
-
-  # Gemini-compatible API settings (only used when backend: gemini)
-  # api_key can also be provided via GEMINI_API_KEY
-  gemini:
-    api_key: ""
-    model: "gemini-3-flash-preview"
-    api_mode: "openai_compatible"
-    base_url: "https://api.duckcoding.ai"
-    timeout_sec: 60.0
-    max_output_tokens: 2048
-    jpeg_quality: 85
-
-# Windowing configuration
-windowing:
-  window_sec: 12.0        # Window duration in seconds
-  step_sec: 6.0           # Step size between windows
-  frames_per_window: 128  # Number of logical frames to sample per window
-  window_repeat_count: 2  # Repeat each boundary window and vote across the repeats
-  target_width: 720      # Target frame width
-  target_height: 480     # Target frame height
-  png_compression: 0     # PNG compression level (0-9)
-  use_contact_sheets: true   # Pack multiple logical frames into each uploaded image
-  contact_sheet_rows: 4      # 4 rows per uploaded contact sheet
-  contact_sheet_cols: 4      # 4 columns per uploaded contact sheet
-
-# Optional text-only LLM merge pass for collapsing over-segmented final steps
-llm_merge:
-  enabled: false
-  backend: "openai"
-  api_key: ""
-  model: "gpt-5.2"
-  base_url: "https://api.openai.com/v1"
-  timeout_sec: 60.0
-  organization: ""
-  project: ""
-  reasoning_effort: "low"
-  max_output_tokens: 2048
-  max_attempts: 3
-  granularity: "coarse"
-  min_input_segments: 12
-  max_input_segments: 256
-  min_output_ratio: 0.35
-  coarse_min_output_ratio: 0.1
-  coarse_max_supported_anchors_per_range: 1
-  coarse_anchor_min_spacing_segments: 3
-  coarse_anchor_min_side_segments: 2
-  coarse_anchor_min_score: 1.03
-  protect_supported_boundaries: true
-  protected_boundary_support_threshold: 0.8
-  protect_distinct_sequence_markers: true
-  protect_instruction_drift: true
-  protect_duplicate_tail_anchor: false
-  duplicate_tail_anchor_min_frames: 5
-
-# Progress configuration
-progress:
-  total_override: 0  # Override total sample count (0 = auto-detect)
-
-# Logging
 logging:
-  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
