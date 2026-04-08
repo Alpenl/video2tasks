@@ -3,6 +3,7 @@ import base64
 import cv2
 import numpy as np
 import pytest
+import video2tasks.server.segment_semantics as segment_semantics_module
 import video2tasks.server.windowing as windowing_module
 from video2tasks.server.task_artifacts import ArtifactPayloadValidationError, TaskArtifactWriter
 from video2tasks.server.windowing import (
@@ -1960,6 +1961,20 @@ def test_refine_segment_instructions_prefers_specific_contributors() -> None:
 
     refined = refine_segment_instructions(final_segments, source_segments)
     assert refined[0]["instruction"] == "Pick up the red bowl from the counter"
+
+
+def test_windowing_shared_segment_semantics_bind_to_public_module() -> None:
+    assert windowing_module._boundary_support_between is segment_semantics_module.boundary_support_between
+    assert windowing_module._has_distinct_sequence_markers is segment_semantics_module.has_distinct_sequence_markers
+    assert windowing_module._should_split_on_instruction_drift is segment_semantics_module.should_split_on_instruction_drift
+    assert windowing_module.refine_segment_instructions is segment_semantics_module.refine_segment_instructions
+
+
+def test_windowing_lexical_helpers_bind_to_segment_semantics_module() -> None:
+    assert windowing_module._instruction_tokens is segment_semantics_module._instruction_tokens
+    assert windowing_module._ingredient_tokens is segment_semantics_module._ingredient_tokens
+    assert windowing_module._instruction_focus_tokens is segment_semantics_module._instruction_focus_tokens
+    assert windowing_module._action_families is segment_semantics_module._action_families
 
 
 def test_build_window_prompt_metadata_includes_temporal_context() -> None:

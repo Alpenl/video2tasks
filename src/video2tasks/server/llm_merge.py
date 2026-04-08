@@ -11,11 +11,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from ..config import LLMMergeConfig
 from ..prompt import prompt_segment_hierarchy, prompt_segment_merge, prompt_segment_subtitles
 from ..vlm.openai_api import OpenAIBackend
-from .windowing import (
-    _boundary_support_between,
-    _has_distinct_sequence_markers,
-    _should_split_on_instruction_drift,
+from .segment_semantics import (
+    boundary_support_between,
+    has_distinct_sequence_markers,
     refine_segment_instructions,
+    should_split_on_instruction_drift,
 )
 
 
@@ -281,7 +281,7 @@ def merge_segments_by_ranges(segments: List[dict], merged_ranges: List[Tuple[int
 
 def _merge_guard_reasons(left: dict, right: dict, merge_config: LLMMergeConfig) -> List[str]:
     reasons: List[str] = []
-    boundary_support, has_boundary_support = _boundary_support_between(left, right)
+    boundary_support, has_boundary_support = boundary_support_between(left, right)
 
     if (
         merge_config.protect_supported_boundaries
@@ -292,7 +292,7 @@ def _merge_guard_reasons(left: dict, right: dict, merge_config: LLMMergeConfig) 
 
     if (
         merge_config.protect_distinct_sequence_markers
-        and _has_distinct_sequence_markers(
+        and has_distinct_sequence_markers(
             str(left.get("instruction", "")),
             str(right.get("instruction", "")),
         )
@@ -301,7 +301,7 @@ def _merge_guard_reasons(left: dict, right: dict, merge_config: LLMMergeConfig) 
 
     if (
         merge_config.protect_instruction_drift
-        and _should_split_on_instruction_drift(
+        and should_split_on_instruction_drift(
             str(left.get("instruction", "")),
             str(right.get("instruction", "")),
         )
@@ -345,7 +345,7 @@ def _blocked_boundary_info(
     if not reasons:
         return None
 
-    boundary_support, has_boundary_support = _boundary_support_between(left, right)
+    boundary_support, has_boundary_support = boundary_support_between(left, right)
     info = {
         "boundary_after_seg_id": int(boundary_after_seg_id),
         "left_seg_id": int(left.get("seg_id", boundary_after_seg_id)),
@@ -475,9 +475,9 @@ def _build_prompt_boundary_hints(
             right = segments[boundary_after_seg_id + 1]
             left_instruction = str(left.get("instruction", "")).strip()
             right_instruction = str(right.get("instruction", "")).strip()
-            boundary_support, has_boundary_support = _boundary_support_between(left, right)
-            sequence_markers = _has_distinct_sequence_markers(left_instruction, right_instruction)
-            instruction_drift = _should_split_on_instruction_drift(left_instruction, right_instruction)
+            boundary_support, has_boundary_support = boundary_support_between(left, right)
+            sequence_markers = has_distinct_sequence_markers(left_instruction, right_instruction)
+            instruction_drift = should_split_on_instruction_drift(left_instruction, right_instruction)
             if not (
                 (has_boundary_support and boundary_support >= _PROMPT_BOUNDARY_HINT_SUPPORT_THRESHOLD)
                 or sequence_markers

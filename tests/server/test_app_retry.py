@@ -154,6 +154,10 @@ class _CountingArtifactFrameExtractor:
         return [], batch
 
 
+class _ProducerBatchedCountingArtifactFrameExtractor(_CountingArtifactFrameExtractor):
+    pass
+
+
 def _single_window() -> list[Window]:
     return [Window(window_id=0, start_frame=0, end_frame=15, frame_ids=[0, 5, 10, 15])]
 
@@ -365,31 +369,32 @@ def test_step_a_repeat_jobs_do_not_reuse_contact_sheet_artifacts_across_logical_
 
 
 def test_step_a_repeat_jobs_reuse_contact_sheet_artifacts_across_producer_batches(tmp_path, monkeypatch) -> None:
-    _CountingArtifactFrameExtractor.calls = 0
+    _ProducerBatchedCountingArtifactFrameExtractor.calls = 0
     monkeypatch.setattr(app_module, "read_video_info", lambda _mp4: (30.0, 16))
     monkeypatch.setattr(app_module, "build_windows", lambda *_args, **_kwargs: _single_window())
-    monkeypatch.setattr(app_module, "FrameExtractor", _CountingArtifactFrameExtractor)
+    monkeypatch.setattr(app_module, "FrameExtractor", _ProducerBatchedCountingArtifactFrameExtractor)
 
     app, _, sample_out_dir = _make_dataset_app(
         tmp_path,
         with_mp4=True,
-        windowing={"window_repeat_count": 25, "use_contact_sheets": True},
+        windowing={"window_repeat_count": 3, "use_contact_sheets": True},
+        start_runtime=False,
     )
+    app.state.step_a_producer_batch_limit = 0
+    _start_runtime(app)
 
-    _wait_until(lambda: len(app.state.job_queue) >= 25)
+    _wait_until(lambda: len(app.state.job_queue) >= 3)
 
-    assert _CountingArtifactFrameExtractor.calls == 1
+    assert _ProducerBatchedCountingArtifactFrameExtractor.calls == 1
     assert [job.task_id for job in app.state.job_queue[:3]] == [
         "demo::sample_w0_r0",
         "demo::sample_w0_r1",
         "demo::sample_w0_r2",
     ]
-    assert app.state.job_queue[20].task_id == "demo::sample_w0_r20"
-    assert app.state.job_queue[21].task_id == "demo::sample_w0_r21"
-    manifest_paths = {
-        job.image_transport.artifact_manifest_path
-        for job in app.state.job_queue[:25]
-    }
+    assert app.state.job_queue[1].meta["artifact_reuse"] is True
+    assert app.state.job_queue[1].meta["artifact_producer_task_id"] == "demo::sample_w0_r0"
+    assert app.state.job_queue[2].meta["artifact_producer_task_id"] == "demo::sample_w0_r0"
+    manifest_paths = {job.image_transport.artifact_manifest_path for job in app.state.job_queue[:3]}
     assert manifest_paths == {"/tmp/repeat_artifact_01.json"}
 
     (sample_out_dir / ".FAILED").touch()

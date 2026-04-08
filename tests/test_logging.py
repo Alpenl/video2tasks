@@ -1,8 +1,12 @@
+import json
+import logging
+from io import StringIO
+
 import video2tasks.server.app as server_app_module
 import video2tasks.vlm.openai_api as openai_api_module
 import video2tasks.worker.runner as worker_runner_module
 from video2tasks.config import Config
-from video2tasks.logging_utils import PACKAGE_LOGGER_NAME
+from video2tasks.logging_utils import PACKAGE_LOGGER_NAME, log_event
 
 
 def test_server_worker_and_vlm_loggers_share_package_namespace(tmp_path) -> None:
@@ -38,3 +42,29 @@ def test_config_logging_level_suppresses_info_output_across_package(tmp_path, ca
     assert "[Server] hidden info" not in out
     assert "[Worker] hidden info" not in out
     assert "[OpenAI] visible warning" in out
+
+
+def test_log_event_emits_json_with_event_and_fields() -> None:
+    stream = StringIO()
+    logger = logging.getLogger("video2tasks.tests.logging")
+    logger.handlers = []
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+
+    log_event(
+        logger,
+        "artifact_reuse_hit",
+        subset="demo",
+        sample_id="sample",
+        artifact_reuse=True,
+        artifact_producer_task_id="demo::sample_w0_r0",
+    )
+
+    payload = json.loads(stream.getvalue().strip())
+    assert payload["event"] == "artifact_reuse_hit"
+    assert payload["subset"] == "demo"
+    assert payload["artifact_reuse"] is True
+    assert payload["artifact_producer_task_id"] == "demo::sample_w0_r0"

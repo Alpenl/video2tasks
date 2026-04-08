@@ -13,31 +13,33 @@ from fastapi import Body, FastAPI, HTTPException
 import uvicorn
 
 from ..config import Config, DatasetConfig
-from ..logging_utils import configure_logging, get_logger
+from ..logging_utils import configure_logging, get_logger, log_event
 from ..prompt import boundary_refinement_candidate_positions
 from .windowing import (
     read_video_info, build_windows, FrameExtractor,
     apply_boundary_refinement_results, apply_deferred_segment_labels,
     build_boundary_refinement_windows, build_segments_via_cuts,
-    build_refinement_windows, build_window_prompt_metadata, Window,
+    build_refinement_windows, Window,
     sample_segment_frame_ids,
 )
 from .exporter import export_sample_outputs
 from .llm_merge import run_export_subtitle_localization_pass, run_llm_postprocess_pass
+from .job_builder import ArtifactReuseEntry, JobBuilder
 from .run_manifest import ensure_run_manifest, run_manifest_path
 from .protocol import (
-    InlineImageTransport,
     JobEnvelope,
     ProtocolValidationError,
     ResultEnvelope,
-    SharedFSImageTransport,
 )
 from .runtime import ThreadRuntime
+from .sample_store import SampleStore
 from .task_artifacts import TaskArtifactWriter
 from ..vlm.base import normalize_task_window_result
 
 
 logger = get_logger(__name__)
+
+_STEP_A_PRODUCER_BATCH_LIMIT = 20
 
 
 @dataclass
@@ -47,7 +49,6 @@ class DatasetCtx:
     subset: str
     data_dir: str
     run_dir: str
-    samples_dir: str
     run_dir_nonempty_before_prepare: bool
     sample_ids: List[str]
 
@@ -73,7 +74,6 @@ def parse_datasets(config: Config) -> List[DatasetCtx]:
             subset=ds.subset,
             data_dir=str(data_dir),
             run_dir=str(run_dir),
-            samples_dir=str(samples_dir),
             run_dir_nonempty_before_prepare=run_dir_nonempty_before_prepare,
             sample_ids=sample_ids
         ))
@@ -157,56 +157,6 @@ def _merge_result_meta(authoritative_meta: Dict[str, Any], worker_meta: Dict[str
     return merged
 
 
-
-def _clone_shared_fs_transport(transport: SharedFSImageTransport) -> SharedFSImageTransport:
-    return SharedFSImageTransport(
-        image_paths=list(transport.image_paths),
-        artifact_manifest_path=transport.artifact_manifest_path,
-    )
-
-
-
-def _repeat_artifact_reuse_key(
-    *,
-    meta: Dict[str, Any],
-    frame_ids: List[int],
-    artifact_image_kind: str,
-    target_width: int,
-    target_height: int,
-    png_compression: int,
-    use_contact_sheets: bool,
-    contact_sheet_rows: int,
-    contact_sheet_cols: int,
-) -> Optional[Tuple[Any, ...]]:
-    if not use_contact_sheets:
-        return None
-
-    window_id = meta.get("window_id")
-    if window_id is None:
-        return None
-
-    try:
-        normalized_window_id = int(window_id)
-    except (TypeError, ValueError):
-        return None
-
-    return (
-        str(meta.get("subset", "")),
-        str(meta.get("sample_id", "")),
-        str(meta.get("job_type", "")),
-        str(meta.get("window_pass", "coarse") or "coarse"),
-        normalized_window_id,
-        tuple(int(frame_id) for frame_id in frame_ids),
-        str(artifact_image_kind),
-        int(target_width),
-        int(target_height),
-        int(png_compression),
-        int(contact_sheet_rows),
-        int(contact_sheet_cols),
-    )
-
-
-
 def _normalize_submitted_vlm_json(vlm_json: Dict[str, Any], authoritative_meta: Dict[str, Any]) -> Dict[str, Any]:
     logical_frame_count = _logical_frame_count_from_meta(authoritative_meta)
     max_transition_index = (logical_frame_count - 1) if logical_frame_count and logical_frame_count > 0 else None
@@ -285,7 +235,6 @@ def create_app(config: Config) -> FastAPI:
     
     # Initialize dataset contexts
     dataset_ctxs = parse_datasets(config)
-    samples_dir_by_subset = {ctx.subset: ctx.samples_dir for ctx in dataset_ctxs}
     data_dir_by_subset = {ctx.subset: ctx.data_dir for ctx in dataset_ctxs}
     
     # Thread-safe job management
@@ -298,10 +247,31 @@ def create_app(config: Config) -> FastAPI:
     completed_dispatch_ids: Dict[str, str] = {}
     step_a_repeat_artifact_reuse_caches: Dict[
         Tuple[str, str],
-        Dict[Tuple[Any, ...], SharedFSImageTransport],
+        Dict[Tuple[Any, ...], ArtifactReuseEntry],
     ] = {}
     artifact_root_dir = os.getenv("VIDEO2TASKS_TMP_DIR", "tmp").strip() or "tmp"
     task_artifact_writer = TaskArtifactWriter(root_dir=artifact_root_dir)
+    sample_store = SampleStore(
+        base_dir=config.run.base_dir,
+        run_id=config.run.run_id,
+        initial_samples_dir_by_subset={
+            ctx.subset: str(Path(ctx.run_dir) / "samples")
+            for ctx in dataset_ctxs
+        },
+        default_subset=dataset_ctxs[0].subset if dataset_ctxs else "default",
+        window_repeat_count=config.windowing.window_repeat_count,
+        normalize_window_record=_normalize_loaded_window_vlm_json,
+        normalize_boundary_refinement_record=_normalize_loaded_boundary_refinement_vlm_json,
+        normalize_segment_label_payload=normalize_task_window_result,
+    )
+    job_builder = JobBuilder(
+        target_width=config.windowing.target_width,
+        target_height=config.windowing.target_height,
+        png_compression=config.windowing.png_compression,
+        use_contact_sheets=config.windowing.use_contact_sheets,
+        contact_sheet_rows=config.windowing.contact_sheet_rows,
+        contact_sheet_cols=config.windowing.contact_sheet_cols,
+    )
     run_manifest_paths: Dict[str, str] = {}
     run_manifest_status_by_subset: Dict[str, Dict[str, Any]] = {}
 
@@ -322,131 +292,32 @@ def create_app(config: Config) -> FastAPI:
                 f"mismatches={manifest_status.resume.mismatch_fields}"
             )
     
-    # Per-sample locks
-    _sample_locks: Dict[str, threading.Lock] = {}
-    _sample_locks_lock = threading.Lock()
-    
-    def get_sample_lock(sample_key: str) -> threading.Lock:
-        with _sample_locks_lock:
-            if sample_key not in _sample_locks:
-                _sample_locks[sample_key] = threading.Lock()
-            return _sample_locks[sample_key]
-    
-    def sample_out_dir(samples_dir: str, sample_id: str) -> str:
-        p = Path(samples_dir) / sample_id
-        p.mkdir(parents=True, exist_ok=True)
-        return str(p)
-    
-    def windows_jsonl_path(samples_dir: str, sample_id: str) -> str:
-        return str(Path(sample_out_dir(samples_dir, sample_id)) / "windows.jsonl")
-    
-    def segments_path(samples_dir: str, sample_id: str) -> str:
-        return str(Path(sample_out_dir(samples_dir, sample_id)) / "segments.json")
+    def sample_out_dir(subset: str, sample_id: str) -> str:
+        return sample_store.sample_out_dir(subset, sample_id)
 
-    def segment_labels_jsonl_path(samples_dir: str, sample_id: str) -> str:
-        return str(Path(sample_out_dir(samples_dir, sample_id)) / "segment_labels.jsonl")
+    def windows_jsonl_path(subset: str, sample_id: str) -> str:
+        return sample_store.windows_jsonl_path(subset, sample_id)
 
-    def boundary_refinements_jsonl_path(samples_dir: str, sample_id: str) -> str:
-        return str(Path(sample_out_dir(samples_dir, sample_id)) / "boundary_refinements.jsonl")
-    
-    def done_marker_path(samples_dir: str, sample_id: str) -> str:
-        return str(Path(sample_out_dir(samples_dir, sample_id)) / ".DONE")
+    def segments_path(subset: str, sample_id: str) -> str:
+        return sample_store.segments_path(subset, sample_id)
 
-    def failed_marker_path(samples_dir: str, sample_id: str) -> str:
-        return str(Path(sample_out_dir(samples_dir, sample_id)) / ".FAILED")
+    def segment_labels_jsonl_path(subset: str, sample_id: str) -> str:
+        return sample_store.segment_labels_jsonl_path(subset, sample_id)
 
-    def failure_report_path(samples_dir: str, sample_id: str) -> str:
-        return str(Path(sample_out_dir(samples_dir, sample_id)) / "failure.json")
+    def boundary_refinements_jsonl_path(subset: str, sample_id: str) -> str:
+        return sample_store.boundary_refinements_jsonl_path(subset, sample_id)
 
-    def _load_indexed_result_records(path: Path, index_key: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
-        results: Dict[int, Dict[str, Any]] = {}
-        failures: Dict[int, Dict[str, Any]] = {}
-        if not path.exists():
-            return results, failures
+    def done_marker_path(subset: str, sample_id: str) -> str:
+        return sample_store.done_marker_path(subset, sample_id)
 
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    record = json.loads(line)
-                    index = int(record[index_key])
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                    continue
+    def failed_marker_path(subset: str, sample_id: str) -> str:
+        return sample_store.failed_marker_path(subset, sample_id)
 
-                terminal_error = str(record.get("terminal_error", "")).strip()
-                if terminal_error:
-                    failures[index] = record
-                    results.pop(index, None)
-                    continue
+    def failure_report_path(subset: str, sample_id: str) -> str:
+        return sample_store.failure_report_path(subset, sample_id)
 
-                results[index] = record
-                failures.pop(index, None)
-
-        return results, failures
-
-    def load_window_results(samples_dir: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
-        repeat_target = max(1, int(config.windowing.window_repeat_count))
-        path = Path(windows_jsonl_path(samples_dir, sample_id))
-        results: Dict[int, Dict[str, Any]] = {}
-        failures: Dict[int, Dict[str, Any]] = {}
-        if not path.exists():
-            return results, failures
-
-        grouped_records: Dict[int, Dict[int, Dict[str, Any]]] = {}
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                try:
-                    record = json.loads(line)
-                    window_id = int(record["window_id"])
-                    repeat_index = int(record.get("repeat_index", 0) or 0)
-                except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-                    continue
-                grouped_records.setdefault(window_id, {})[repeat_index] = record
-
-        for window_id, repeat_records in grouped_records.items():
-            normalized_repeats: List[Dict[str, Any]] = []
-            failed_repeats: Dict[int, Dict[str, Any]] = {}
-
-            for repeat_index, record in sorted(repeat_records.items()):
-                terminal_error = str(record.get("terminal_error", "")).strip()
-                if terminal_error:
-                    failed_repeats[repeat_index] = record
-                    continue
-
-                vlm_json = _normalize_loaded_window_vlm_json(record)
-                if not vlm_json:
-                    failed_repeats[repeat_index] = {**record, "terminal_error": "invalid_vlm_json"}
-                    continue
-
-                normalized_record = dict(record)
-                normalized_record["repeat_index"] = repeat_index
-                normalized_record["vlm_json"] = vlm_json
-                normalized_repeats.append(normalized_record)
-
-            if normalized_repeats:
-                representative = max(
-                    normalized_repeats,
-                    key=lambda record: (
-                        len(record.get("vlm_json", {}).get("transitions", [])),
-                        -int(record.get("repeat_index", 0)),
-                    ),
-                )
-                aggregated_record = dict(representative)
-                aggregated_record["repeat_records"] = normalized_repeats
-                aggregated_record["repeat_success_count"] = len(normalized_repeats)
-                aggregated_record["repeat_target_count"] = repeat_target
-                aggregated_record["repeat_indices"] = [
-                    int(record.get("repeat_index", 0))
-                    for record in normalized_repeats
-                ]
-                results[window_id] = aggregated_record
-
-            if failed_repeats:
-                first_failed_index = min(failed_repeats)
-                failure_record = dict(failed_repeats[first_failed_index])
-                failure_record["repeat_indices_failed"] = sorted(int(idx) for idx in failed_repeats)
-                failures[window_id] = failure_record
-
-        return results, failures
+    def load_window_results(subset: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+        return sample_store.load_window_results(subset, sample_id)
 
     def _completed_window_ids(results: Dict[int, Dict[str, Any]]) -> set[int]:
         completed: set[int] = set()
@@ -460,47 +331,14 @@ def create_app(config: Config) -> FastAPI:
         completed = _completed_window_ids(results)
         return all(int(window.window_id) in completed for window in windows)
 
-    def load_segment_label_results(samples_dir: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
-        records, failures = _load_indexed_result_records(
-            Path(segment_labels_jsonl_path(samples_dir, sample_id)),
-            "segment_id",
-        )
-        results: Dict[int, Dict[str, Any]] = {}
-        for segment_id, record in records.items():
-            vlm_json = normalize_task_window_result(record.get("vlm_json", {}))
-            if not vlm_json:
-                failures[segment_id] = {**record, "terminal_error": "invalid_vlm_json"}
-                continue
-            results[segment_id] = vlm_json
-        return results, failures
+    def load_segment_label_results(subset: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+        return sample_store.load_segment_label_results(subset, sample_id)
 
-    def load_boundary_refinement_results(samples_dir: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
-        records, failures = _load_indexed_result_records(
-            Path(boundary_refinements_jsonl_path(samples_dir, sample_id)),
-            "boundary_id",
-        )
-        results: Dict[int, Dict[str, Any]] = {}
-        for boundary_id, record in records.items():
-            vlm_json = _normalize_loaded_boundary_refinement_vlm_json(record)
-            if not vlm_json:
-                failures[boundary_id] = {**record, "terminal_error": "invalid_vlm_json"}
-                continue
-            normalized_record = dict(record)
-            normalized_record["vlm_json"] = vlm_json
-            results[boundary_id] = normalized_record
-        return results, failures
+    def load_boundary_refinement_results(subset: str, sample_id: str) -> tuple[Dict[int, Dict[str, Any]], Dict[int, Dict[str, Any]]]:
+        return sample_store.load_boundary_refinement_results(subset, sample_id)
 
     def _resolve_samples_dir(subset: str) -> str:
-        samples_dir = samples_dir_by_subset.get(subset)
-        if not samples_dir:
-            samples_dir = str(Path(config.run.base_dir) / subset / config.run.run_id / "samples")
-            Path(samples_dir).mkdir(parents=True, exist_ok=True)
-            samples_dir_by_subset[subset] = samples_dir
-        return samples_dir
-
-    def _append_jsonl_record(path: str, record: Dict[str, Any]) -> None:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        return sample_store.resolve_samples_dir(subset)
 
     def _persist_result_record(
         task_id: str,
@@ -509,47 +347,13 @@ def create_app(config: Config) -> FastAPI:
         meta: Dict[str, Any],
         terminal_error: str = "",
     ) -> None:
-        subset = str(meta.get("subset", dataset_ctxs[0].subset if dataset_ctxs else "default"))
-        sid = str(meta.get("sample_id", "unknown"))
-        samples_dir = _resolve_samples_dir(subset)
-        job_type = str(meta.get("job_type", "window_boundary"))
-        common_fields: Dict[str, Any] = {
-            "task_id": task_id,
-            "dispatch_id": dispatch_id,
-            "vlm_json": vlm_json,
-        }
-        logical_frame_count = int(meta.get("logical_frame_count", 0) or 0)
-        if logical_frame_count > 0:
-            common_fields["logical_frame_count"] = logical_frame_count
-        if terminal_error:
-            common_fields["terminal_error"] = terminal_error
-
-        sample_key = f"{subset}::{sid}"
-        with get_sample_lock(sample_key):
-            if job_type == "segment_label":
-                rec = {
-                    **common_fields,
-                    "segment_id": int(meta.get("segment_id", -1)),
-                }
-                _append_jsonl_record(segment_labels_jsonl_path(samples_dir, sid), rec)
-                return
-
-            if job_type == "boundary_refinement":
-                rec = {
-                    **common_fields,
-                    "boundary_id": int(meta.get("boundary_id", -1)),
-                    "coarse_boundary_frame": int(meta.get("coarse_boundary_frame", -1)),
-                    "frame_ids": [int(frame_id) for frame_id in meta.get("frame_ids", [])],
-                }
-                _append_jsonl_record(boundary_refinements_jsonl_path(samples_dir, sid), rec)
-                return
-
-            rec = {
-                **common_fields,
-                "window_id": meta.get("window_id"),
-                "repeat_index": int(meta.get("repeat_index", 0) or 0),
-            }
-            _append_jsonl_record(windows_jsonl_path(samples_dir, sid), rec)
+        sample_store.persist_result_record(
+            task_id,
+            dispatch_id,
+            vlm_json,
+            meta,
+            terminal_error=terminal_error,
+        )
 
     def _persist_sample_failure(
         subset: str,
@@ -557,24 +361,7 @@ def create_app(config: Config) -> FastAPI:
         reason: str,
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
-        samples_dir = _resolve_samples_dir(subset)
-        sample_key = f"{subset}::{sample_id}"
-        payload = {
-            "subset": subset,
-            "sample_id": sample_id,
-            "reason": reason,
-            "details": details or {},
-        }
-
-        with get_sample_lock(sample_key):
-            for stale_path in (segments_path(samples_dir, sample_id), done_marker_path(samples_dir, sample_id)):
-                try:
-                    Path(stale_path).unlink()
-                except FileNotFoundError:
-                    pass
-            Path(failed_marker_path(samples_dir, sample_id)).touch()
-            with open(failure_report_path(samples_dir, sample_id), "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
+        sample_store.persist_sample_failure(subset, sample_id, reason, details)
 
     def _clear_sample_jobs(subset: str, sample_id: str) -> None:
         removed_task_ids: set[str] = set()
@@ -610,6 +397,29 @@ def create_app(config: Config) -> FastAPI:
     def _clear_step_a_repeat_artifact_reuse_cache(subset: str, sample_id: str) -> None:
         step_a_repeat_artifact_reuse_caches.pop((subset, sample_id), None)
 
+    def _log_fallback_applied(subset: str, sample_id: str, diagnostics: Dict[str, Any]) -> None:
+        fallback_fields: Dict[str, Any] = {}
+        if str(diagnostics.get("selection_policy", "")) == "light_cleanup_fallback":
+            fallback_fields["selection_policy"] = "light_cleanup_fallback"
+
+        for key, value in diagnostics.items():
+            if key.endswith("_fallback_used") and bool(value):
+                fallback_fields[key] = True
+                reason_key = key.replace("_fallback_used", "_fallback_reason")
+                if reason_key in diagnostics:
+                    fallback_fields[reason_key] = diagnostics[reason_key]
+            if key.endswith("used_subtitle_fallback") and bool(value):
+                fallback_fields[key] = True
+
+        if fallback_fields:
+            log_event(
+                logger,
+                "fallback_applied",
+                subset=subset,
+                sample_id=sample_id,
+                **fallback_fields,
+            )
+
     def _fail_sample(
         state: Dict[str, Any],
         subset: str,
@@ -622,6 +432,14 @@ def create_app(config: Config) -> FastAPI:
         _clear_sample_jobs(subset, sample_id)
         _clear_step_a_repeat_artifact_reuse_cache(subset, sample_id)
         _persist_sample_failure(subset, sample_id, reason, details)
+        log_event(
+            logger,
+            "sample_failed",
+            subset=subset,
+            sample_id=sample_id,
+            reason=reason,
+            details=details or {},
+        )
         state["sample_status"][sample_id] = 4
         state["cur_idx"] += 1
         if log_message:
@@ -646,62 +464,6 @@ def create_app(config: Config) -> FastAPI:
             terminal_error=terminal_error,
         )
 
-    def _build_job_payload(
-        extractor: FrameExtractor,
-        *,
-        task_id: str,
-        frame_ids: List[int],
-        meta: Dict[str, Any],
-        artifact_image_kind: str,
-        repeat_artifact_reuse_cache: Optional[Dict[Tuple[Any, ...], SharedFSImageTransport]] = None,
-    ) -> JobEnvelope:
-        cache_key = _repeat_artifact_reuse_key(
-            meta=meta,
-            frame_ids=frame_ids,
-            artifact_image_kind=artifact_image_kind,
-            target_width=config.windowing.target_width,
-            target_height=config.windowing.target_height,
-            png_compression=config.windowing.png_compression,
-            use_contact_sheets=config.windowing.use_contact_sheets,
-            contact_sheet_rows=config.windowing.contact_sheet_rows,
-            contact_sheet_cols=config.windowing.contact_sheet_cols,
-        )
-        if repeat_artifact_reuse_cache is not None and cache_key is not None:
-            cached_transport = repeat_artifact_reuse_cache.get(cache_key)
-            if cached_transport is not None:
-                return JobEnvelope(
-                    task_id=task_id,
-                    meta=dict(meta),
-                    image_transport=_clone_shared_fs_transport(cached_transport),
-                )
-
-        images, artifact_batch = extractor.get_many_b64_with_artifacts(
-            frame_ids,
-            config.windowing.target_width,
-            config.windowing.target_height,
-            config.windowing.png_compression,
-            use_contact_sheets=config.windowing.use_contact_sheets,
-            contact_sheet_rows=config.windowing.contact_sheet_rows,
-            contact_sheet_cols=config.windowing.contact_sheet_cols,
-            artifact_metadata={**meta, "task_id": task_id},
-            artifact_image_kind=artifact_image_kind,
-            return_images=getattr(extractor, "artifact_writer", None) is None,
-        )
-        if artifact_batch is not None and artifact_batch.records:
-            image_transport = SharedFSImageTransport(
-                image_paths=[record.path for record in artifact_batch.records],
-                artifact_manifest_path=artifact_batch.manifest_path,
-            )
-            if repeat_artifact_reuse_cache is not None and cache_key is not None:
-                repeat_artifact_reuse_cache.setdefault(cache_key, _clone_shared_fs_transport(image_transport))
-        else:
-            image_transport = InlineImageTransport(images=images)
-        return JobEnvelope(
-            task_id=task_id,
-            meta=dict(meta),
-            image_transport=image_transport,
-        )
-
     app.state.job_queue = job_queue
     app.state.inflight = inflight
     app.state.timeout_retry_counts = timeout_retry_counts
@@ -709,7 +471,8 @@ def create_app(config: Config) -> FastAPI:
     app.state.dispatch_counts = dispatch_counts
     app.state.completed_dispatch_ids = completed_dispatch_ids
     app.state.task_artifact_writer = task_artifact_writer
-    app.state.samples_dir_by_subset = samples_dir_by_subset
+    app.state.sample_store = sample_store
+    app.state.step_a_producer_batch_limit = _STEP_A_PRODUCER_BATCH_LIMIT
     app.state.run_manifest_paths = run_manifest_paths
     app.state.run_manifest_status_by_subset = run_manifest_status_by_subset
 
@@ -728,10 +491,23 @@ def create_app(config: Config) -> FastAPI:
             dispatch_id = f"d{dispatch_counts[task_id]}"
             dispatched_job = base_job.with_dispatch(dispatch_id)
             inflight[task_id] = {"ts": time.time(), "job": base_job, "dispatch_id": dispatch_id}
+            log_event(
+                logger,
+                "job_dispatched",
+                task_id=task_id,
+                dispatch_id=dispatch_id,
+                subset=str(base_job.meta.get("subset", "")),
+                sample_id=str(base_job.meta.get("sample_id", "")),
+                job_type=str(base_job.meta.get("job_type", "")),
+                source_count=base_job.source_count,
+                transport_mode=str(base_job.image_transport.mode),
+                artifact_reuse=bool(base_job.meta.get("artifact_reuse", False)),
+            )
             return {"status": "ok", "data": dispatched_job.model_dump_payload()}
     
     @app.post("/submit_result")
     def submit_result(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+        submit_start = time.perf_counter()
         try:
             res = ResultEnvelope.parse_payload(payload)
         except ProtocolValidationError as exc:
@@ -758,6 +534,17 @@ def create_app(config: Config) -> FastAPI:
 
         authoritative_meta = _job_payload_meta(job_info["job"])
         result_meta = _merge_result_meta(authoritative_meta, dict(res.meta), dispatch_id)
+        infer_ms = int(round(max(0.0, float(res.latency_s)) * 1000.0))
+        log_event(
+            logger,
+            "infer_attempt",
+            task_id=tid,
+            dispatch_id=dispatch_id,
+            subset=str(result_meta.get("subset", "")),
+            sample_id=str(result_meta.get("sample_id", "")),
+            job_type=str(result_meta.get("job_type", "")),
+            infer_ms=infer_ms,
+        )
         normalized_vlm_json = _normalize_submitted_vlm_json(
             res.vlm_json,
             authoritative_meta,
@@ -775,6 +562,19 @@ def create_app(config: Config) -> FastAPI:
                 limit = config.server.max_empty_retries_per_job
                 limit_label = "inf" if limit <= 0 else str(limit)
                 if requeued:
+                    log_event(
+                        logger,
+                        "result_empty_retry",
+                        task_id=tid,
+                        dispatch_id=dispatch_id,
+                        subset=str(result_meta.get("subset", "")),
+                        sample_id=str(result_meta.get("sample_id", "")),
+                        job_type=str(result_meta.get("job_type", "")),
+                        attempt=attempt,
+                        retry_limit=limit_label,
+                        infer_ms=infer_ms,
+                        submit_ms=int(round((time.perf_counter() - submit_start) * 1000.0)),
+                    )
                     logger.warning(
                         f"[Warn] Task {tid} empty or invalid, re-queueing to tail "
                         f"(empty attempt {attempt}/{limit_label})"
@@ -799,6 +599,17 @@ def create_app(config: Config) -> FastAPI:
             empty_retry_counts.pop(tid, None)
 
         _persist_result_record(tid, dispatch_id, normalized_vlm_json, result_meta)
+        log_event(
+            logger,
+            "job_done",
+            task_id=tid,
+            dispatch_id=dispatch_id,
+            subset=str(result_meta.get("subset", "")),
+            sample_id=str(result_meta.get("sample_id", "")),
+            job_type=str(result_meta.get("job_type", "")),
+            infer_ms=infer_ms,
+            submit_ms=int(round((time.perf_counter() - submit_start) * 1000.0)),
+        )
         return {"status": "received"}
     
     @app.get("/health")
@@ -814,7 +625,7 @@ def create_app(config: Config) -> FastAPI:
         done = 0
         for ctx in dataset_ctxs:
             for sid in ctx.sample_ids:
-                if Path(done_marker_path(ctx.samples_dir, sid)).exists():
+                if Path(done_marker_path(ctx.subset, sid)).exists():
                     done += 1
         
         logger.info(
@@ -855,6 +666,17 @@ def create_app(config: Config) -> FastAPI:
                     limit_label = "inf" if limit <= 0 else str(limit)
                     if limit <= 0 or attempt <= limit:
                         job_queue.append(job)
+                        log_event(
+                            logger,
+                            "result_timeout_retry",
+                            task_id=tid,
+                            dispatch_id=dispatch_id,
+                            subset=str(_job_payload_meta(job).get("subset", "")),
+                            sample_id=str(_job_payload_meta(job).get("sample_id", "")),
+                            job_type=str(_job_payload_meta(job).get("job_type", "")),
+                            attempt=attempt,
+                            retry_limit=limit_label,
+                        )
                         logger.warning(
                             f"[Warn] Task {tid} timed out, re-queueing to tail "
                             f"(timeout attempt {attempt}/{limit_label})"
@@ -916,14 +738,14 @@ def create_app(config: Config) -> FastAPI:
                 s_dir = Path(ctx.data_dir) / sid
                 
                 # Skip if already done
-                if Path(done_marker_path(ctx.samples_dir, sid)).exists():
+                if Path(done_marker_path(ctx.subset, sid)).exists():
                     _clear_step_a_repeat_artifact_reuse_cache(ctx.subset, sid)
                     sample_status[sid] = 3
                     st["cur_idx"] += 1
                     time.sleep(0.01)
                     continue
 
-                if Path(failed_marker_path(ctx.samples_dir, sid)).exists():
+                if Path(failed_marker_path(ctx.subset, sid)).exists():
                     _clear_step_a_repeat_artifact_reuse_cache(ctx.subset, sid)
                     sample_status[sid] = 4
                     st["cur_idx"] += 1
@@ -948,7 +770,7 @@ def create_app(config: Config) -> FastAPI:
                     continue
                 mp4 = str(mp4s[0])
                 
-                w_path = windows_jsonl_path(ctx.samples_dir, sid)
+                w_path = windows_jsonl_path(ctx.subset, sid)
                 
                 # Step A: Generate window tasks
                 if sample_status[sid] == 0:
@@ -962,7 +784,7 @@ def create_app(config: Config) -> FastAPI:
                         )
                         
                         # Load completed windows
-                        window_results, failed_window_results = load_window_results(ctx.samples_dir, sid)
+                        window_results, failed_window_results = load_window_results(ctx.subset, sid)
                         if failed_window_results:
                             _fail_sample(
                                 st,
@@ -988,6 +810,9 @@ def create_app(config: Config) -> FastAPI:
                             {},
                         )
 
+                        step_a_producer_batch_limit = int(
+                            getattr(app.state, "step_a_producer_batch_limit", _STEP_A_PRODUCER_BATCH_LIMIT)
+                        )
                         with FrameExtractor(mp4, artifact_writer=task_artifact_writer) as extractor:
                             cnt = 0
                             
@@ -1013,44 +838,27 @@ def create_app(config: Config) -> FastAPI:
                                     if active:
                                         continue
 
-                                    meta = {
-                                        "subset": ctx.subset,
-                                        "sample_id": sid,
-                                        "job_type": "window_boundary",
-                                        "repeat_index": repeat_index,
-                                        "window_repeat_count": repeat_target,
-                                        "logical_frame_count": len(w.frame_ids),
-                                        **build_window_prompt_metadata(w, fps, nframes),
-                                        "use_contact_sheets": config.windowing.use_contact_sheets,
-                                        "contact_sheet_rows": (
-                                            config.windowing.contact_sheet_rows
-                                            if config.windowing.use_contact_sheets else 0
-                                        ),
-                                        "contact_sheet_cols": (
-                                            config.windowing.contact_sheet_cols
-                                            if config.windowing.use_contact_sheets else 0
-                                        ),
-                                    }
-                                    job = _build_job_payload(
+                                    job = job_builder.build_window_boundary_job(
                                         extractor,
                                         task_id=tid,
-                                        frame_ids=w.frame_ids,
-                                        meta=meta,
-                                        artifact_image_kind=(
-                                            "window_contact_sheet"
-                                            if config.windowing.use_contact_sheets else "window_frame"
-                                        ),
-                                        repeat_artifact_reuse_cache=repeat_artifact_reuse_cache,
+                                        subset=ctx.subset,
+                                        sample_id=sid,
+                                        window=w,
+                                        fps=fps,
+                                        nframes=nframes,
+                                        repeat_index=repeat_index,
+                                        repeat_count=repeat_target,
+                                        reuse_cache=repeat_artifact_reuse_cache,
                                     )
 
                                     with queue_lock:
                                         job_queue.append(job)
 
                                     cnt += 1
-                                    if cnt > 20:
+                                    if cnt > step_a_producer_batch_limit:
                                         break
 
-                                if cnt > 20:
+                                if cnt > step_a_producer_batch_limit:
                                     break
                         
                         if cnt == 0 and _all_windows_completed(windows, window_results):
@@ -1075,6 +883,7 @@ def create_app(config: Config) -> FastAPI:
                 # Step B: Finalize
                 if sample_status[sid] == 2:
                     try:
+                        finalize_start = time.perf_counter()
                         fps, nframes = read_video_info(mp4)
                         windows = build_windows(
                             fps, nframes,
@@ -1083,7 +892,7 @@ def create_app(config: Config) -> FastAPI:
                             config.windowing.frames_per_window
                         )
                         
-                        by_wid, failed_window_results = load_window_results(ctx.samples_dir, sid)
+                        by_wid, failed_window_results = load_window_results(ctx.subset, sid)
                         if failed_window_results:
                             _fail_sample(
                                 st,
@@ -1146,34 +955,17 @@ def create_app(config: Config) -> FastAPI:
                                                     if active:
                                                         continue
 
-                                                    meta = {
-                                                        "subset": ctx.subset,
-                                                        "sample_id": sid,
-                                                        "job_type": "window_boundary",
-                                                        "window_pass": "refinement",
-                                                        "repeat_index": repeat_index,
-                                                        "window_repeat_count": max(1, int(config.windowing.window_repeat_count)),
-                                                        "logical_frame_count": len(refinement_window.frame_ids),
-                                                        **build_window_prompt_metadata(refinement_window, fps, nframes),
-                                                        "use_contact_sheets": config.windowing.use_contact_sheets,
-                                                        "contact_sheet_rows": (
-                                                            config.windowing.contact_sheet_rows
-                                                            if config.windowing.use_contact_sheets else 0
-                                                        ),
-                                                        "contact_sheet_cols": (
-                                                            config.windowing.contact_sheet_cols
-                                                            if config.windowing.use_contact_sheets else 0
-                                                        ),
-                                                    }
-                                                    job = _build_job_payload(
+                                                    job = job_builder.build_window_boundary_job(
                                                         extractor,
                                                         task_id=tid,
-                                                        frame_ids=refinement_window.frame_ids,
-                                                        meta=meta,
-                                                        artifact_image_kind=(
-                                                            "refinement_contact_sheet"
-                                                            if config.windowing.use_contact_sheets else "refinement_frame"
-                                                        ),
+                                                        subset=ctx.subset,
+                                                        sample_id=sid,
+                                                        window=refinement_window,
+                                                        fps=fps,
+                                                        nframes=nframes,
+                                                        repeat_index=repeat_index,
+                                                        repeat_count=max(1, int(config.windowing.window_repeat_count)),
+                                                        window_pass="refinement",
                                                     )
 
                                                     with queue_lock:
@@ -1224,7 +1016,7 @@ def create_app(config: Config) -> FastAPI:
 
                             final_res = provisional_res
                             if config.windowing.enable_boundary_refinement:
-                                boundary_results, boundary_failures = load_boundary_refinement_results(ctx.samples_dir, sid)
+                                boundary_results, boundary_failures = load_boundary_refinement_results(ctx.subset, sid)
                                 if boundary_failures:
                                     _fail_sample(
                                         st,
@@ -1274,35 +1066,12 @@ def create_app(config: Config) -> FastAPI:
                                             if active:
                                                 continue
 
-                                            meta = {
-                                                "subset": ctx.subset,
-                                                "sample_id": sid,
-                                                "job_type": "boundary_refinement",
-                                                "boundary_id": boundary_id,
-                                                "coarse_boundary_frame": int(boundary_window.coarse_boundary_frame),
-                                                "frame_ids": [int(frame_id) for frame_id in boundary_window.frame_ids],
-                                                "logical_frame_count": len(boundary_window.frame_ids),
-                                                "window_start_frame": int(boundary_window.start_frame),
-                                                "window_end_frame": int(boundary_window.end_frame),
-                                                "use_contact_sheets": config.windowing.use_contact_sheets,
-                                                "contact_sheet_rows": (
-                                                    config.windowing.contact_sheet_rows
-                                                    if config.windowing.use_contact_sheets else 0
-                                                ),
-                                                "contact_sheet_cols": (
-                                                    config.windowing.contact_sheet_cols
-                                                    if config.windowing.use_contact_sheets else 0
-                                                ),
-                                            }
-                                            job = _build_job_payload(
+                                            job = job_builder.build_boundary_refinement_job(
                                                 extractor,
                                                 task_id=tid,
-                                                frame_ids=boundary_window.frame_ids,
-                                                meta=meta,
-                                                artifact_image_kind=(
-                                                    "boundary_refinement_contact_sheet"
-                                                    if config.windowing.use_contact_sheets else "boundary_refinement_frame"
-                                                ),
+                                                subset=ctx.subset,
+                                                sample_id=sid,
+                                                boundary_window=boundary_window,
                                             )
 
                                             with queue_lock:
@@ -1338,7 +1107,7 @@ def create_app(config: Config) -> FastAPI:
                                 final_res["diagnostics"] = diagnostics
 
                             if config.windowing.segment_labeling_mode == "deferred":
-                                label_results, label_failures = load_segment_label_results(ctx.samples_dir, sid)
+                                label_results, label_failures = load_segment_label_results(ctx.subset, sid)
                                 if label_failures:
                                     _fail_sample(
                                         st,
@@ -1383,34 +1152,13 @@ def create_app(config: Config) -> FastAPI:
                                                 config.windowing.frames_per_window,
                                                 nframes,
                                             )
-                                            meta = {
-                                                "subset": ctx.subset,
-                                                "sample_id": sid,
-                                                "job_type": "segment_label",
-                                                "segment_id": seg_id,
-                                                "segment_start_frame": int(segment["start_frame"]),
-                                                "segment_end_frame": int(segment["end_frame"]),
-                                                "frame_ids": [int(frame_id) for frame_id in frame_ids],
-                                                "logical_frame_count": len(frame_ids),
-                                                "use_contact_sheets": config.windowing.use_contact_sheets,
-                                                "contact_sheet_rows": (
-                                                    config.windowing.contact_sheet_rows
-                                                    if config.windowing.use_contact_sheets else 0
-                                                ),
-                                                "contact_sheet_cols": (
-                                                    config.windowing.contact_sheet_cols
-                                                    if config.windowing.use_contact_sheets else 0
-                                                ),
-                                            }
-                                            job = _build_job_payload(
+                                            job = job_builder.build_segment_label_job(
                                                 extractor,
                                                 task_id=tid,
+                                                subset=ctx.subset,
+                                                sample_id=sid,
+                                                segment=segment,
                                                 frame_ids=frame_ids,
-                                                meta=meta,
-                                                artifact_image_kind=(
-                                                    "segment_label_contact_sheet"
-                                                    if config.windowing.use_contact_sheets else "segment_label_frame"
-                                                ),
                                             )
 
                                             with queue_lock:
@@ -1508,24 +1256,22 @@ def create_app(config: Config) -> FastAPI:
 
                             diagnostics.update(export_diagnostics)
                             final_res["diagnostics"] = diagnostics
-                            
-                            with open(segments_path(ctx.samples_dir, sid), "w", encoding="utf-8") as f:
-                                json.dump(final_res, f, indent=2, ensure_ascii=False)
-                            
-                            done_path = done_marker_path(ctx.samples_dir, sid)
-                            already_done = Path(done_path).exists()
-                            for stale_failure_path in (failed_marker_path(ctx.samples_dir, sid), failure_report_path(ctx.samples_dir, sid)):
-                                try:
-                                    Path(stale_failure_path).unlink()
-                                except FileNotFoundError:
-                                    pass
-                            Path(done_path).touch()
+                            _log_fallback_applied(ctx.subset, sid, diagnostics)
+                            already_done = sample_store.finalize_sample_success(ctx.subset, sid, final_res)
                             
                             sample_status[sid] = 3
                             st["cur_idx"] += 1
                             
                             if not already_done:
                                 global_done += 1
+                            log_event(
+                                logger,
+                                "finalize_done",
+                                subset=ctx.subset,
+                                sample_id=sid,
+                                finalize_ms=int(round((time.perf_counter() - finalize_start) * 1000.0)),
+                                segment_count=len(final_res.get("segments", [])),
+                            )
                             logger.info(f"[Progress] {global_done}/{progress_total} (finished: {ctx.subset}/{sid})")
 
                     except Exception as e:

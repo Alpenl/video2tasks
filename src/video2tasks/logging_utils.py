@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
+from typing import Any, Dict
 
 
 PACKAGE_LOGGER_NAME = "video2tasks"
@@ -34,3 +36,15 @@ def get_logger(name: str) -> logging.Logger:
     if logger_name != PACKAGE_LOGGER_NAME and not logger_name.startswith(f"{PACKAGE_LOGGER_NAME}."):
         logger_name = f"{PACKAGE_LOGGER_NAME}.{logger_name}"
     return logging.getLogger(logger_name)
+
+
+def log_event(logger: logging.Logger, event: str, level: str = "info", **fields: Any) -> None:
+    """Emit a single-line structured event through the existing logger tree."""
+    payload: Dict[str, Any] = {"event": str(event)}
+    for key, value in fields.items():
+        if value is None:
+            continue
+        payload[str(key)] = value
+
+    log_method = getattr(logger, str(level).lower(), logger.info)
+    log_method(json.dumps(payload, ensure_ascii=False, sort_keys=True))
