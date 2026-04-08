@@ -28,7 +28,7 @@
      │  🎬 Video2Tasks                                             │
      │  • VLM 驱动的任务边界检测                                     │
      │  • 自动生成自然语言指令标注                                   │
-     │  • 分布式处理支持大规模数据集                                 │
+     │  • 单机并行处理（共享文件系统）                               │
      └─────────────────────────────────────────────────────────────┘
            ┃
            ▼
@@ -42,7 +42,11 @@
 
 ### 🔧 工作原理
 
-本工具采用**分布式 Client-Server 架构**，使用视觉语言模型（如 Qwen3-VL）分析视频帧，智能检测任务边界，并为每个片段生成自然语言指令。
+本工具采用 **Server/Worker 架构**（FastAPI Server + 多个 Worker 进程），使用视觉语言模型（如 Qwen3-VL）分析视频帧，检测任务边界，并为每个片段生成自然语言指令。
+
+**支持的部署模式：** `single-machine shared-fs`。
+
+也就是说：Server 与所有 Worker 必须运行在同一台机器（或共享同一套容器宿主机卷），并且看到的运行产物路径必须一致（例如 `./runs`、`./tmp`）。当前的传输语义不支持把 Worker 跑在不同机器或不同挂载点路径下。
 
 | 组件 | 描述 |
 |------|------|
@@ -153,13 +157,11 @@ VLM 会分析每个重叠的帧窗口，并提供详细的任务切换推理：
 <tr>
 <td width="50%">
 
-### 🧠 分布式架构
+### 🧠 单机 Server/Worker（共享文件系统）
 
 这不是一个死循环脚本。FastAPI 作为调度中心，Worker 只负责推理。
 
-**你可以在一台 4090 上跑 Server，再挂 10 台机器跑 Worker 并行处理海量数据。**
-
-这是工业级的思路。
+**当前仅支持在同一台机器上运行 Server 与多个 Worker 进程，并共享同一套文件系统路径。**
 
 </td>
 <td width="50%">
@@ -168,7 +170,7 @@ VLM 会分析每个重叠的帧窗口，并提供详细的任务切换推理：
 
 - ⏱️ Inflight 超时重发
 - 🔄 失败重试上限
-- 📍 `.DONE` 断点续传标记
+- 📍 `.DONE` 完成标记（见下文语义）
 
 这些机制是大规模任务稳定跑完的关键。
 
@@ -207,7 +209,7 @@ VLM 会分析每个重叠的帧窗口，并提供详细的任务切换推理：
 | 🎥 **视频分窗** | 可配置的视频窗口抽样参数 |
 | 🧩 **可插拔后端** | 支持 Qwen3-VL / 远程 API / 自定义 VLM |
 | 📊 **智能聚合** | 加权投票 + Hanning Window 自动聚合分段结果 |
-| 🔄 **分布式处理** | 支持多 Worker 水平扩展 |
+| 🔄 **并行 Worker** | 同机多进程并行（共享文件系统） |
 | ⚙️ **YAML 配置** | 简洁的声明式配置管理 |
 | 🧪 **跨平台** | 推荐 Linux + GPU；Windows/CPU 可用 dummy 后端 |
 
@@ -250,14 +252,27 @@ pip install -e ".[qwen3vl]"
 ### 配置
 
 ```bash
-# 复制示例配置
+# 复制最小可运行模板
 cp config.example.yaml config.yaml
 
-# 根据需要修改配置
+# 只修改数据路径和非敏感配置
 vim config.yaml  # 或使用你喜欢的编辑器
 ```
 
+像 `OPENAI_API_KEY`、`GEMINI_API_KEY`、`LLM_MERGE_API_KEY` 这类敏感信息应通过环境变量提供。
+
 ### 运行
+
+**一条命令启动（推荐） - 同时启动 Server 和配置好的 Worker：**
+```bash
+v2t-cluster --config config.yaml
+```
+
+代码中的 `worker.count` 默认值是 `7`，但 [`config.example.yaml`](config.example.yaml) 这个最小模板为了保守起跑，显式写的是 `worker.count: 1`。如果你直接复制模板不改，实际会以 `1` 启动，而不是 `7`。
+
+**部署契约（`single-machine shared-fs`）：**
+- Server 与 Worker 必须在同一台机器上运行，并且看到的本地路径必须一致。
+- 如果容器化，请把同一组宿主机目录以相同的容器内路径同时挂载给 Server 与 Worker（不要依赖不同挂载点或路径重写）。
 
 **终端 1 - 启动服务器：**
 ```bash
@@ -271,11 +286,25 @@ v2t-worker --config config.yaml
 
 > 💡 **提示：** 可以启动多个 Worker 来并行处理视频！
 
+CLI 现在不会再从当前工作目录隐式扫描 `./config.yaml`。请显式传 `--config config.yaml`，或者导出 `VIDEO2TASKS_CONFIG=/absolute/path/to/config.yaml`。如果两者都没有设置，配置将按“环境变量优先，其次代码默认值”的方式加载。
+
 ---
 
 ## ⚙️ 配置说明
 
-查看 [`config.example.yaml`](config.example.yaml) 了解所有可用选项：
+[`config.example.yaml`](config.example.yaml) 现在是最小可运行模板，不再试图列出所有调优项。未写出的字段会回落到 [`src/video2tasks/config.py`](src/video2tasks/config.py) 中定义的默认值。
+
+配置优先级为：
+
+1. 环境变量
+2. 通过 `--config` 或 `VIDEO2TASKS_CONFIG` 指定加载的 YAML
+3. 代码内置默认值
+
+敏感信息优先放环境变量，不要提交到受版本控制的 YAML 中。
+
+`server.max_empty_retries_per_job` 的默认值现在是 `3`。只有在你明确要允许空结果无限重试时，才把它设成 `0`。
+
+完整配置模型中的常见分组：
 
 | 配置项 | 描述 |
 |--------|------|
@@ -284,6 +313,22 @@ v2t-worker --config config.yaml
 | `server` | 主机、端口和队列设置 |
 | `worker` | VLM 后端选择和模型路径 |
 | `windowing` | 帧采样参数 |
+
+### 输出产物与状态标记（运维契约）
+
+下文中的 `<run_dir>` 统一表示 `<run.base_dir>/<subset>/<run_id>`；默认示例是 `./runs/<subset>/<run_id>`。
+
+- `<run_dir>/samples/<sample_id>/windows.jsonl`：Stage 1 每个窗口的原始结果（append-only）。
+- `<run_dir>/samples/<sample_id>/segments.json`：样本结果层产物。只承载 segmentation + Stage 2 文本产物（merge/summary/字幕本地化结果）。run/export/fallback 等运行态信息不属于最终切分真相。
+  source instruction 永远是英文；字幕本地化只改变字幕文本。
+- `<run_dir>/samples/<sample_id>/.DONE` / `<run_dir>/samples/<sample_id>/.FAILED`：样本终态标记。
+  `.DONE` 的语义是：该样本已完成 `<run_dir>/run_manifest.json.required_stages` 里定义的全部必需阶段。
+- `<run_dir>/exports/<sample_id>/annotated.mp4`：当 `export.mode=annotated|both` 且 annotated 导出成功时可见。
+- `<run_dir>/clips/<sample_id>/...`：当 `export.mode=clips|both` 且 clips 导出成功时可见。
+  `<run_dir>/clips/<sample_id>/manifest.json` 是 clips 导出契约记录。clips 导出必须保留音频（`audio_preserved=true`）。
+- `<run_dir>/run_manifest.json`（run 级）：记录 run 身份（config/prompt hash、backend 摘要、`required_stages`）与 resume 校验元数据。
+  resume 默认严格拒绝跨 identity 续跑（config/prompt/backend/required-stages 不一致）。只有显式设置 `run.force_resume=true` 或 `RUN_FORCE_RESUME=true` 才会放行。
+- `manifest + diagnostics` 是运行态证据层（run/export/fallback state），用于 operator 判断和审计，不替代最终切分结果本体。
 
 ---
 
@@ -371,7 +416,7 @@ worker:
     reasoning_effort: low
 ```
 
-API Key 可以写在 `config.yaml` 中，也可以通过环境变量提供：
+API Key 可以写在本地未跟踪的 `config.yaml` 中，也可以通过环境变量提供；真实凭证更推荐放环境变量：
 
 ```bash
 export OPENAI_API_KEY=your_api_key

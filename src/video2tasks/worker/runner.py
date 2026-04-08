@@ -1,26 +1,41 @@
 """Worker runner implementation."""
 
+import base64
 import os
 import time
-import base64
-from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, Optional
 
-import requests
 import numpy as np
+import requests
 from PIL import Image
 
 from ..config import Config
+from ..logging_utils import configure_logging, get_logger
+from ..server.protocol import (
+    InlineImageTransport,
+    JobEnvelope,
+    ProtocolValidationError,
+    ResultEnvelope,
+    SharedFSImageTransport,
+)
 from ..vlm import create_backend
-from ..vlm.base import normalize_task_window_result
+from ..vlm.base import (
+    LoadedTransportImage,
+    backend_uses_raw_transport_images,
+    normalize_task_window_result,
+    prepare_backend_images,
+)
 from ..prompt import (
     boundary_refinement_candidate_positions,
     prompt_boundary_refinement,
     prompt_segment_instruction,
     prompt_switch_detection,
 )
+
+
+logger = get_logger(__name__)
 
 MAX_LOCAL_RETRIES = 4
 MAX_CONNECTION_RETRIES = 30
@@ -40,13 +55,6 @@ _IMAGE_MIME_BY_SUFFIX = {
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
 }
-
-
-@dataclass
-class LoadedImage:
-    raw_bytes: bytes
-    mime_type: str
-    bgr: Optional[np.ndarray] = None
 
 
 def _is_empty_vlm_json(vlm_json: Optional[Dict[str, Any]]) -> bool:
@@ -106,13 +114,12 @@ def _mime_type_from_path(path: str) -> str:
     return _IMAGE_MIME_BY_SUFFIX.get(suffix, "image/png")
 
 
-def load_job_image_records(job: Dict[str, Any], decode_arrays: bool = True) -> list[LoadedImage]:
-    """Load job images while optionally preserving raw bytes for direct upload."""
-    image_paths = [str(path) for path in (job.get("image_paths") or []) if str(path)]
-    if image_paths:
-        records: list[LoadedImage] = []
+def load_job_image_records(job: JobEnvelope, decode_arrays: bool = True) -> list[LoadedTransportImage]:
+    """Load job images from the parsed transport schema."""
+    if isinstance(job.image_transport, SharedFSImageTransport):
+        records: list[LoadedTransportImage] = []
         failed_paths: list[str] = []
-        for path in image_paths:
+        for path in job.image_transport.image_paths:
             try:
                 raw_bytes = Path(path).read_bytes()
             except Exception:
@@ -125,16 +132,22 @@ def load_job_image_records(job: Dict[str, Any], decode_arrays: bool = True) -> l
             if decode_arrays and bgr is None:
                 failed_paths.append(path)
                 continue
-            records.append(LoadedImage(raw_bytes=raw_bytes, mime_type=_mime_type_from_path(path), bgr=bgr))
+            records.append(
+                LoadedTransportImage(
+                    raw_bytes=raw_bytes,
+                    mime_type=_mime_type_from_path(path),
+                    bgr=bgr,
+                )
+            )
         if failed_paths:
             preview = ", ".join(failed_paths[:3])
             raise RuntimeError(f"failed to load image_paths: {preview}")
         return records
 
-    images_b64 = [str(item) for item in (job.get("images") or [])]
-    records: list[LoadedImage] = []
+    records = []
     failed_indices: list[int] = []
-    for idx, b64 in enumerate(images_b64):
+    assert isinstance(job.image_transport, InlineImageTransport)
+    for idx, b64 in enumerate(job.image_transport.images):
         raw_bytes, mime_type = _decode_b64_to_bytes_and_mime(b64)
         if not raw_bytes:
             failed_indices.append(idx)
@@ -143,13 +156,13 @@ def load_job_image_records(job: Dict[str, Any], decode_arrays: bool = True) -> l
         if decode_arrays and bgr is None:
             failed_indices.append(idx)
             continue
-        records.append(LoadedImage(raw_bytes=raw_bytes, mime_type=mime_type, bgr=bgr))
+        records.append(LoadedTransportImage(raw_bytes=raw_bytes, mime_type=mime_type, bgr=bgr))
     if failed_indices:
         raise RuntimeError(f"failed to decode inline images at indices {failed_indices}")
     return records
 
 
-def load_job_images(job: Dict[str, Any]) -> list[np.ndarray]:
+def load_job_images(job: JobEnvelope) -> list[np.ndarray]:
     """Backward-compatible wrapper returning decoded numpy arrays."""
     records = load_job_image_records(job, decode_arrays=True)
     return [record.bgr for record in records if record.bgr is not None]
@@ -198,7 +211,23 @@ def build_backend_kwargs(config: Config) -> Dict[str, Any]:
     return {}
 
 
-def submit_result_with_retries(server_url: str, payload: Dict[str, Any], task_id: str) -> str:
+def _backend_uses_raw_transport_images(backend: Any) -> bool:
+    method = getattr(backend, "uses_raw_transport_images", None)
+    if callable(method):
+        return bool(method())
+    return backend_uses_raw_transport_images(backend)
+
+
+
+def _backend_prepare_images(backend: Any, image_records: list[LoadedTransportImage]) -> list[Any]:
+    method = getattr(backend, "prepare_images", None)
+    if callable(method):
+        return list(method(image_records))
+    return list(prepare_backend_images(backend, image_records))
+
+
+
+def submit_result_with_retries(server_url: str, payload: ResultEnvelope, task_id: str) -> str:
     """Submit a finished job result and require an explicit server ack."""
     last_error: Optional[Exception] = None
 
@@ -206,7 +235,7 @@ def submit_result_with_retries(server_url: str, payload: Dict[str, Any], task_id
         try:
             response = requests.post(
                 f"{server_url}/submit_result",
-                json=payload,
+                json=payload.model_dump_payload(),
                 timeout=30,
             )
             if response.status_code != 200:
@@ -219,7 +248,7 @@ def submit_result_with_retries(server_url: str, payload: Dict[str, Any], task_id
             raise RuntimeError(f"unexpected status {status or '<missing>'}")
         except Exception as exc:
             last_error = exc
-            print(
+            logger.warning(
                 f"[Warn] Submit failed for {task_id} "
                 f"(attempt {attempt}/{MAX_SUBMIT_RETRIES}): {exc}"
             )
@@ -232,14 +261,15 @@ def submit_result_with_retries(server_url: str, payload: Dict[str, Any], task_id
 
 def run_worker(config: Config) -> None:
     """Run the worker loop."""
+    configure_logging(config.logging.level)
     server_url = config.worker.server_url
 
     backend_kwargs = build_backend_kwargs(config)
     backend = create_backend(config.worker.backend, **backend_kwargs)
-    print(f"[Worker] Using backend: {backend.name}")
+    logger.info(f"[Worker] Using backend: {backend.name}")
     backend.warmup()
 
-    print(f"[Worker] Connecting to {server_url}")
+    logger.info(f"[Worker] Connecting to {server_url}")
 
     connection_retry_count = 0
     had_prior_connection = False
@@ -258,11 +288,11 @@ def run_worker(config: Config) -> None:
                     )
                     if connection_retry_count >= max_retries:
                         if had_prior_connection:
-                            print("[Worker] Server became unavailable after prior connection. Exiting.")
+                            logger.warning("[Worker] Server became unavailable after prior connection. Exiting.")
                         else:
-                            print(f"[Worker] Failed to connect after {MAX_CONNECTION_RETRIES} retries. Exiting.")
+                            logger.warning(f"[Worker] Failed to connect after {MAX_CONNECTION_RETRIES} retries. Exiting.")
                         break
-                    print(
+                    logger.info(
                         f"[Worker] Waiting for server at {server_url}... "
                         f"(attempt {connection_retry_count}/{max_retries})"
                     )
@@ -278,15 +308,22 @@ def run_worker(config: Config) -> None:
                     time.sleep(0.5)
                     continue
 
-                job = resp.get("data")
-                if job is None:
-                    print("[Worker] Invalid job data received")
+                job_payload = resp.get("data")
+                if job_payload is None:
+                    logger.warning("[Worker] Invalid job data received")
                     time.sleep(1)
                     continue
 
-                task_id = job.get("task_id", "unknown")
-                dispatch_id = str(job.get("dispatch_id") or "")
-                meta = job.get("meta", {})
+                try:
+                    job = JobEnvelope.parse_payload(job_payload)
+                except ProtocolValidationError as exc:
+                    logger.warning(f"[Worker] Invalid job payload received: {exc}")
+                    time.sleep(1)
+                    continue
+
+                task_id = job.task_id
+                dispatch_id = job.dispatch_id
+                meta = dict(job.meta)
                 job_type = str(meta.get("job_type", "window_boundary"))
                 contact_sheet_rows = int(meta.get("contact_sheet_rows", 0) or 0)
                 contact_sheet_cols = int(meta.get("contact_sheet_cols", 0) or 0)
@@ -297,18 +334,17 @@ def run_worker(config: Config) -> None:
                     if isinstance(frame_ids, list) and frame_ids:
                         logical_frame_count = len(frame_ids)
                     else:
-                        source_count = len(job.get("image_paths") or job.get("images") or [])
+                        source_count = job.source_count
                         if contact_sheet_rows > 0 and contact_sheet_cols > 0:
                             logical_frame_count = source_count * contact_sheet_rows * contact_sheet_cols
                         else:
                             logical_frame_count = source_count
 
-                use_raw_image_payloads = config.worker.backend == "gemini"
-                image_records = load_job_image_records(job, decode_arrays=not use_raw_image_payloads)
-                images = [
-                    {"raw_bytes": record.raw_bytes, "mime_type": record.mime_type}
-                    for record in image_records
-                ] if use_raw_image_payloads else [record.bgr for record in image_records if record.bgr is not None]
+                image_records = load_job_image_records(
+                    job,
+                    decode_arrays=not _backend_uses_raw_transport_images(backend),
+                )
+                images = _backend_prepare_images(backend, image_records)
 
                 if job_type == "segment_label":
                     prompt = prompt_segment_instruction(
@@ -343,7 +379,7 @@ def run_worker(config: Config) -> None:
                     try:
                         raw_vlm_json = backend.infer(images, prompt)
                     except Exception as exc:
-                        print(f"[Err] Inference failed: {exc}")
+                        logger.error(f"[Err] Inference failed: {exc}")
                         raw_vlm_json = {}
 
                     vlm_json = normalize_task_window_result(
@@ -354,38 +390,38 @@ def run_worker(config: Config) -> None:
                     if not _is_empty_vlm_json(vlm_json):
                         break
 
-                    print(
+                    logger.warning(
                         f"[Warn] {task_id} Empty or invalid VLM JSON "
                         f"(attempt {attempt + 1}/{MAX_LOCAL_RETRIES})"
                     )
                     if attempt + 1 < MAX_LOCAL_RETRIES:
                         delay_s = float(min(2 * (attempt + 1), 8))
-                        print(f"[Worker] Sleeping {delay_s:.1f}s before local retry")
+                        logger.info(f"[Worker] Sleeping {delay_s:.1f}s before local retry")
                         time.sleep(delay_s)
 
                 if _is_empty_vlm_json(vlm_json):
-                    print(f"[Fail] {task_id} Returning empty to trigger server retry")
+                    logger.warning(f"[Fail] {task_id} Returning empty to trigger server retry")
                 else:
-                    print(
+                    logger.info(
                         f"[Done] {task_id} ({logical_frame_count}logical/{len(image_records)}img) -> Cuts: {vlm_json.get('transitions', [])}"
                     )
 
                 submit_result_with_retries(
                     server_url,
-                    {
-                        "task_id": task_id,
-                        "dispatch_id": dispatch_id,
-                        "vlm_json": vlm_json,
-                        "meta": meta,
-                    },
+                    ResultEnvelope(
+                        task_id=task_id,
+                        dispatch_id=dispatch_id,
+                        vlm_json=vlm_json,
+                        meta=meta,
+                    ),
                     task_id,
                 )
 
             except KeyboardInterrupt:
-                print("[Worker] Stopping...")
+                logger.info("[Worker] Stopping...")
                 break
             except Exception as exc:
-                print(f"[Error] Loop crashed: {exc}")
+                logger.error(f"[Error] Loop crashed: {exc}")
                 time.sleep(1)
 
     finally:

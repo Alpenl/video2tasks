@@ -28,7 +28,7 @@ Input:  Long video with multiple tasks, NO labels
      │  🎬 Video2Tasks                                             │
      │  • VLM-powered task boundary detection                      │
      │  • Auto-generate natural language instructions              │
-     │  • Distributed processing for large-scale datasets          │
+     │  • Parallel processing on a single machine                  │
      └─────────────────────────────────────────────────────────────┘
            ┃
            ▼
@@ -42,7 +42,11 @@ Output: Single-task segments + instruction labels, READY for VLA training
 
 ### 🔧 How It Works
 
-This tool uses a **distributed client-server architecture** with VLMs (like Qwen3-VL) to analyze video frames, intelligently detect task boundaries, and generate natural language instructions for each segment.
+This tool uses a **server/worker architecture** (FastAPI server + worker processes) with VLMs (like Qwen3-VL) to analyze video frames, detect task boundaries, and generate natural language instructions for each segment.
+
+**Supported deployment mode:** `single-machine shared-fs`.
+
+That means the server and all workers must run on the same machine (or the same container host volume) and see the **same filesystem paths** for runtime artifacts (for example `./runs` and `./tmp`). Running workers on different machines or different mountpoints is not supported by the current transport semantics.
 
 | Component | Description |
 |-----------|-------------|
@@ -153,13 +157,11 @@ A 4501-frame video automatically split into 16 single-task segments:
 <tr>
 <td width="50%">
 
-### 🧠 Distributed Architecture
+### 🧠 Single-Machine Server/Worker
 
-Not just a single script. FastAPI acts as the orchestrator, Workers handle inference only.
+Not just a single script. FastAPI acts as the orchestrator; workers handle inference only.
 
-**Run Server on one 4090, then connect 10 machines running Workers to process massive datasets in parallel.**
-
-This is production-grade thinking.
+**Run the server and multiple worker processes on the same machine, sharing the same filesystem.**
 
 </td>
 <td width="50%">
@@ -168,7 +170,7 @@ This is production-grade thinking.
 
 - ⏱️ Inflight timeout & re-dispatch
 - 🔄 Configurable retry limits
-- 📍 `.DONE` checkpoint markers for resume
+- 📍 `.DONE` completion markers (see semantics below)
 
 Critical mechanisms for running large-scale tasks to completion.
 
@@ -207,7 +209,7 @@ Tailored for manipulation datasets, **significantly reducing over-segmentation**
 | 🎥 **Video Windowing** | Configurable video window sampling parameters |
 | 🤖 **Pluggable Backends** | Support for Qwen3-VL, Remote API, or custom VLM implementations |
 | 📊 **Smart Aggregation** | Automatic segment generation with weighted voting & Hanning window |
-| 🔄 **Distributed Processing** | Scale horizontally with multiple workers |
+| 🔄 **Parallel Workers** | Run multiple worker processes on one machine (shared filesystem) |
 | ⚙️ **YAML Config** | Simple, declarative configuration management |
 | 🖥️ **Cross-Platform** | Linux/GPU recommended; Windows/CPU with dummy backend |
 
@@ -250,12 +252,14 @@ pip install -e ".[qwen3vl]"
 ### Configuration
 
 ```bash
-# Copy example config
+# Copy the minimal runnable template
 cp config.example.yaml config.yaml
 
-# Edit with your paths and settings
+# Edit the dataset path and any non-secret settings
 vim config.yaml  # or your preferred editor
 ```
+
+Use environment variables for secrets such as `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `LLM_MERGE_API_KEY`.
 
 ### Running
 
@@ -264,7 +268,13 @@ vim config.yaml  # or your preferred editor
 v2t-cluster --config config.yaml
 ```
 
-`worker.count` controls how many worker processes are launched (default: `7`).
+The code default for `worker.count` is `7`, but [`config.example.yaml`](config.example.yaml) intentionally sets `worker.count: 1` for a conservative first run. If you copy the template unchanged, you will start with `1`, not `7`.
+
+The CLI no longer auto-discovers `./config.yaml` from the current working directory. Use `--config config.yaml` explicitly, or export `VIDEO2TASKS_CONFIG=/absolute/path/to/config.yaml`. If neither is set, configuration comes from environment variables first and then built-in defaults.
+
+**Deployment contract (`single-machine shared-fs`):**
+- Run the server and workers on the same machine, and ensure they see the same on-disk paths.
+- If you containerize, mount the same host directories into the same in-container paths for both server and workers (do not rely on different mountpoints or path rewrites).
 
 **Terminal 1 - Start the Server:**
 ```bash
@@ -282,7 +292,19 @@ v2t-worker --config config.yaml
 
 ## ⚙️ Configuration
 
-See [`config.example.yaml`](config.example.yaml) for all available options:
+[`config.example.yaml`](config.example.yaml) is the minimal runnable template, not the full source of truth for every tuning knob. Omitted values fall back to the defaults defined in [`src/video2tasks/config.py`](src/video2tasks/config.py).
+
+Configuration precedence is:
+
+1. Environment variables
+2. YAML loaded via `--config` or `VIDEO2TASKS_CONFIG`
+3. Built-in defaults
+
+For secrets, prefer environment variables over YAML. Keep tracked config files credential-free.
+
+The server now defaults `server.max_empty_retries_per_job` to `3`. Set it to `0` only if you explicitly want unlimited retries after empty model outputs.
+
+Common sections in the full config model:
 
 | Section | Description |
 |---------|-------------|
@@ -291,6 +313,22 @@ See [`config.example.yaml`](config.example.yaml) for all available options:
 | `server` | Host, port, and queue settings |
 | `worker` | Worker count, VLM backend selection and model paths |
 | `windowing` | Frame sampling parameters |
+
+### Output Artifacts (Operator Contract)
+
+`<run_dir>` below means `<run.base_dir>/<subset>/<run_id>`; by default that is `./runs/<subset>/<run_id>`.
+
+- `<run_dir>/samples/<sample_id>/windows.jsonl`: Stage 1 window-level raw results (append-only).
+- `<run_dir>/samples/<sample_id>/segments.json`: sample result-layer output. It only carries segmentation + Stage 2 text artifacts (merge/summary/subtitle-localization results). Run/export/fallback runtime state is not part of the final segmentation truth.
+  Source instructions are always English. Subtitle localization changes subtitle text only.
+- `<run_dir>/samples/<sample_id>/.DONE` / `<run_dir>/samples/<sample_id>/.FAILED`: sample terminal markers.
+  `.DONE` means all stages listed in `<run_dir>/run_manifest.json.required_stages` completed for that sample.
+- `<run_dir>/exports/<sample_id>/annotated.mp4`: expected when `export.mode=annotated|both` and annotated export succeeds.
+- `<run_dir>/clips/<sample_id>/...`: expected when `export.mode=clips|both` and clip export succeeds.
+  `<run_dir>/clips/<sample_id>/manifest.json` is the clip export contract record. Clips must preserve audio (`audio_preserved=true`).
+- `<run_dir>/run_manifest.json` (run-level): records run identity (config/prompt hashes, backend summary, `required_stages`) and resume validation metadata.
+  Resume is strict by default: cross identity continuation (config/prompt/backend/required stage mismatch) is rejected unless you explicitly set `run.force_resume=true` or `RUN_FORCE_RESUME=true`.
+- `manifest + diagnostics` are runtime evidence (run/export/fallback state). They are for operator decisions and auditing, not a replacement for the final segmentation result itself.
 
 ---
 
@@ -344,12 +382,23 @@ worker:
 }
 ```
 
-**Response:**
+**Response (either format is accepted):**
 ```json
 {
   "transitions": [6],
   "instructions": ["Place the fork", "Place the spoon"],
   "thought": "..."
+}
+```
+
+or:
+```json
+{
+  "vlm_json": {
+    "transitions": [6],
+    "instructions": ["Place the fork", "Place the spoon"],
+    "thought": "..."
+  }
 }
 ```
 
@@ -368,7 +417,7 @@ worker:
     reasoning_effort: low
 ```
 
-You can provide the API key either in `config.yaml` or through the environment:
+You can provide the API key either in a local untracked `config.yaml` or through the environment. Environment variables are the recommended path for real credentials so they do not end up in tracked YAML files.
 
 ```bash
 export OPENAI_API_KEY=your_api_key

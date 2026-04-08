@@ -1728,3 +1728,132 @@ def test_run_llm_merge_pass_coarse_does_not_reintroduce_duplicate_tail_anchor_sp
     assert len(merged_segments) == 2
     assert merged_segments[0]["start_frame"] == 0
     assert merged_segments[0]["end_frame"] == 135
+
+
+def test_run_llm_merge_pass_accepts_payload_using_input_seg_id_tokens() -> None:
+    source_segments = [
+        {
+            "seg_id": 10,
+            "start_frame": 0,
+            "end_frame": 12,
+            "instruction": "Place the flat item",
+            "confidence": 0.8,
+            "boundary_support_before": 0.0,
+            "boundary_support_after": 0.2,
+        },
+        {
+            "seg_id": 11,
+            "start_frame": 12,
+            "end_frame": 24,
+            "instruction": "Place the flat item into the target region",
+            "confidence": 0.95,
+            "boundary_support_before": 0.2,
+            "boundary_support_after": 0.4,
+        },
+        {
+            "seg_id": 12,
+            "start_frame": 24,
+            "end_frame": 36,
+            "instruction": "Remove the hand from the target region",
+            "confidence": 0.9,
+            "boundary_support_before": 0.4,
+            "boundary_support_after": 0.7,
+        },
+        {
+            "seg_id": 13,
+            "start_frame": 36,
+            "end_frame": 48,
+            "instruction": "Pick up the next item",
+            "confidence": 0.9,
+            "boundary_support_before": 0.7,
+            "boundary_support_after": 0.8,
+        },
+    ]
+    backend = FakeMergeBackend(
+        {
+            "thought": "Merge the first two fragments.",
+            "merged_ranges": [
+                {"start_seg_id": 10, "end_seg_id": 11},
+                {"start_seg_id": 12, "end_seg_id": 12},
+                {"start_seg_id": 13, "end_seg_id": 13},
+            ],
+        }
+    )
+    cfg = LLMMergeConfig(enabled=True, min_input_segments=4, min_output_ratio=0.35)
+
+    merged_segments, diagnostics = run_llm_merge_pass(
+        "demo_sample",
+        source_segments,
+        cfg,
+        backend=backend,
+    )
+
+    assert diagnostics["llm_merge_applied"] is True
+    assert diagnostics["llm_merge_output_segment_count"] == 3
+    assert merged_segments[0]["start_frame"] == 0
+    assert merged_segments[0]["end_frame"] == 24
+
+
+def test_run_llm_merge_pass_accepts_payload_using_one_based_seg_id_tokens() -> None:
+    source_segments = [
+        {
+            "seg_id": 1,
+            "start_frame": 0,
+            "end_frame": 12,
+            "instruction": "Place the flat item",
+            "confidence": 0.8,
+            "boundary_support_before": 0.0,
+            "boundary_support_after": 0.2,
+        },
+        {
+            "seg_id": 2,
+            "start_frame": 12,
+            "end_frame": 24,
+            "instruction": "Place the flat item into the target region",
+            "confidence": 0.95,
+            "boundary_support_before": 0.2,
+            "boundary_support_after": 0.4,
+        },
+        {
+            "seg_id": 3,
+            "start_frame": 24,
+            "end_frame": 36,
+            "instruction": "Remove the hand from the target region",
+            "confidence": 0.9,
+            "boundary_support_before": 0.4,
+            "boundary_support_after": 0.7,
+        },
+        {
+            "seg_id": 4,
+            "start_frame": 36,
+            "end_frame": 48,
+            "instruction": "Pick up the next item",
+            "confidence": 0.9,
+            "boundary_support_before": 0.7,
+            "boundary_support_after": 0.8,
+        },
+    ]
+    backend = FakeMergeBackend(
+        {
+            "thought": "Merge the first two fragments.",
+            "merged_ranges": [
+                {"start_seg_id": 1, "end_seg_id": 2},
+                {"start_seg_id": 3, "end_seg_id": 3},
+                {"start_seg_id": 4, "end_seg_id": 4},
+            ],
+        }
+    )
+    cfg = LLMMergeConfig(enabled=True, min_input_segments=4, min_output_ratio=0.35)
+
+    merged_segments, diagnostics = run_llm_merge_pass(
+        "demo_sample",
+        source_segments,
+        cfg,
+        backend=backend,
+    )
+
+    assert diagnostics["llm_merge_applied"] is True
+    assert diagnostics["llm_merge_output_segment_count"] == 3
+    assert merged_segments[0]["start_frame"] == 0
+    assert merged_segments[0]["end_frame"] == 24
+

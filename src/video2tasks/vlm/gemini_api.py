@@ -10,7 +10,11 @@ import cv2
 import numpy as np
 import requests
 
+from ..logging_utils import get_logger
 from .base import VLMBackend, normalize_task_window_result
+
+
+logger = get_logger(__name__)
 
 
 def _encode_jpeg_b64(img_bgr: np.ndarray, quality: int = 85) -> str:
@@ -142,7 +146,7 @@ def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeo
 
             if attempt < max_attempts:
                 delay_s = float(min(2 * attempt, 8))
-                print(
+                logger.warning(
                     f"[Gemini] Retryable status={response.status_code}; "
                     f"sleeping {delay_s:.1f}s before retry {attempt + 1}/{max_attempts}"
                 )
@@ -152,13 +156,13 @@ def _post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeo
         except requests.RequestException as exc:
             if attempt < max_attempts:
                 delay_s = float(min(2 * attempt, 8))
-                print(
+                logger.warning(
                     f"[Gemini] requests failed (attempt {attempt}/{max_attempts}), "
                     f"retrying in {delay_s:.1f}s: {exc}"
                 )
                 time.sleep(delay_s)
                 continue
-            print(f"[Gemini] requests failed, falling back to curl: {exc}")
+            logger.warning(f"[Gemini] requests failed, falling back to curl: {exc}")
             return _post_json_via_curl(url, headers, payload, timeout_sec)
 
     return last_status_code, last_response_text
@@ -193,7 +197,7 @@ def _post_json_via_curl(url: str, headers: Dict[str, str], payload: Dict[str, An
     if proc.returncode != 0:
         stderr = proc.stderr.decode("utf-8", errors="replace").strip()
         if stderr:
-            print(f"[Gemini] curl fallback failed: {stderr}")
+            logger.warning(f"[Gemini] curl fallback failed: {stderr}")
         return 0, ""
 
     stdout = proc.stdout.decode("utf-8", errors="replace")
@@ -301,7 +305,7 @@ class GeminiBackend(VLMBackend):
         for attempt in range(1, max_payload_attempts + 1):
             status_code, response_text = _post_json(url, headers, payload, self.timeout_sec)
             if status_code != 200:
-                print(f"[Gemini] Error: status={status_code}")
+                logger.warning(f"[Gemini] Error: status={status_code}")
                 return {}
 
             parsed = _parse_structured_response_text(response_text, extractor)
@@ -310,18 +314,18 @@ class GeminiBackend(VLMBackend):
 
             if attempt < max_payload_attempts:
                 delay_s = float(min(2 * attempt, 8))
-                print(
+                logger.warning(
                     f"[Gemini] Empty structured payload; sleeping {delay_s:.1f}s "
                     f"before retry {attempt + 1}/{max_payload_attempts}"
                 )
                 time.sleep(delay_s)
 
         max_curl_payload_attempts = 2
-        print("[Gemini] Falling back to curl after repeated empty structured payload")
+        logger.warning("[Gemini] Falling back to curl after repeated empty structured payload")
         for attempt in range(1, max_curl_payload_attempts + 1):
             status_code, response_text = _post_json_via_curl(url, headers, payload, self.timeout_sec)
             if status_code != 200:
-                print(f"[Gemini] curl fallback error: status={status_code}")
+                logger.warning(f"[Gemini] curl fallback error: status={status_code}")
                 return {}
 
             parsed = _parse_structured_response_text(response_text, extractor)
@@ -330,7 +334,7 @@ class GeminiBackend(VLMBackend):
 
             if attempt < max_curl_payload_attempts:
                 delay_s = float(min(2 * attempt, 8))
-                print(
+                logger.warning(
                     f"[Gemini] curl fallback still empty; sleeping {delay_s:.1f}s "
                     f"before retry {attempt + 1}/{max_curl_payload_attempts}"
                 )

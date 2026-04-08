@@ -8,7 +8,11 @@ import cv2
 import numpy as np
 import requests
 
+from ..logging_utils import get_logger
 from .base import VLMBackend, normalize_task_window_result
+
+
+logger = get_logger(__name__)
 
 
 def _encode_jpeg_data_url(img_bgr: np.ndarray, quality: int = 85) -> str:
@@ -490,7 +494,7 @@ class OpenAIBackend(VLMBackend):
             diagnostics["responses"]["failure_reason"] = "request_exception"
             diagnostics["responses"]["exception_type"] = type(exc).__name__
             diagnostics["responses"]["error"] = str(exc).strip() or type(exc).__name__
-            print(f"[OpenAI] /responses request failed: {type(exc).__name__}")
+            logger.warning(f"[OpenAI] /responses request failed: {type(exc).__name__}")
             response = None
 
         if response is not None:
@@ -516,10 +520,10 @@ class OpenAIBackend(VLMBackend):
                     diagnostics["parsed_endpoint"] = "responses"
                     return finalize(parsed)
                 diagnostics["responses"]["failure_reason"] = failure_reason
-                print("[OpenAI] /responses returned empty structured payload; trying /chat/completions fallback")
+                logger.warning("[OpenAI] /responses returned empty structured payload; trying /chat/completions fallback")
             elif response.status_code != 200:
                 diagnostics["responses"]["failure_reason"] = "http_error"
-                print(f"[OpenAI] Error: status={response.status_code}")
+                logger.warning(f"[OpenAI] Error: status={response.status_code}")
 
         fallback_payload = {
             "model": self.model,
@@ -548,7 +552,7 @@ class OpenAIBackend(VLMBackend):
             diagnostics["chat_completions"]["failure_reason"] = "request_exception"
             diagnostics["chat_completions"]["exception_type"] = type(exc).__name__
             diagnostics["chat_completions"]["error"] = str(exc).strip() or type(exc).__name__
-            print(f"[OpenAI] /chat/completions fallback failed: {type(exc).__name__}")
+            logger.warning(f"[OpenAI] /chat/completions fallback failed: {type(exc).__name__}")
             diagnostics["final_failure_reason"] = "chat_completions_request_exception"
             if raise_on_http_error:
                 finalize({}, final_failure_reason="chat_completions_request_exception")
@@ -573,7 +577,7 @@ class OpenAIBackend(VLMBackend):
         if fallback_response.status_code != 200:
             diagnostics["chat_completions"]["failure_reason"] = "http_error"
             diagnostics["final_failure_reason"] = "chat_completions_http_error"
-            print(f"[OpenAI] Fallback error: status={fallback_response.status_code}")
+            logger.warning(f"[OpenAI] Fallback error: status={fallback_response.status_code}")
             if raise_on_http_error:
                 finalize({}, final_failure_reason="chat_completions_http_error")
                 raise RuntimeError(build_http_error_message())

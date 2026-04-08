@@ -1,4 +1,4 @@
-from video2tasks.vlm.base import normalize_task_window_result
+from video2tasks.vlm.base import LoadedTransportImage, VLMBackend, backend_uses_raw_transport_images, normalize_task_window_result, prepare_backend_images
 
 
 def test_normalize_task_window_result_rejects_transition_outside_allowed_indices() -> None:
@@ -32,3 +32,23 @@ def test_normalize_task_window_result_accepts_allowed_candidate_transition() -> 
         "transitions": [3],
         "instructions": ["Add potatoes", "Stir the pot"],
     }
+
+
+class _OverrideBackend(VLMBackend):
+    name = "dummy"
+
+    def infer(self, images, prompt):
+        return {}
+
+    def uses_raw_transport_images(self) -> bool:
+        return True
+
+
+def test_backend_transport_image_helpers_respect_instance_override() -> None:
+    backend = _OverrideBackend()
+    record = LoadedTransportImage(raw_bytes=b"abc", mime_type="image/png", bgr=None)
+
+    assert backend_uses_raw_transport_images(backend) is True
+    assert prepare_backend_images(backend, [record]) == [
+        {"raw_bytes": b"abc", "mime_type": "image/png"}
+    ]

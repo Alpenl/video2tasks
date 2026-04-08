@@ -1,21 +1,32 @@
 """VLM Backend interface and structured output validation."""
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
+
+VLMRawImagePayload = Dict[str, Any]
+VLMInferImage = Union[np.ndarray, VLMRawImagePayload]
+
+
+@dataclass
+class LoadedTransportImage:
+    raw_bytes: bytes
+    mime_type: str
+    bgr: Optional[np.ndarray] = None
 
 
 class VLMBackend(ABC):
     """Abstract base class for VLM backends."""
 
     @abstractmethod
-    def infer(self, images: List[np.ndarray], prompt: str) -> Dict[str, Any]:
+    def infer(self, images: List[VLMInferImage], prompt: str) -> Dict[str, Any]:
         """
         Run inference on a list of images.
 
         Args:
-            images: List of images as numpy arrays (BGR format)
+            images: List of decoded arrays or backend-specific raw image payloads
             prompt: The prompt text
 
         Returns:
@@ -39,6 +50,44 @@ class VLMBackend(ABC):
     def cleanup(self) -> None:
         """Optional cleanup routine. Called on shutdown."""
         pass
+
+    def uses_raw_transport_images(self) -> bool:
+        """Whether this backend consumes raw bytes + mime metadata directly."""
+        return backend_uses_raw_transport_images(self)
+
+    def prepare_images(self, image_records: List[LoadedTransportImage]) -> List[VLMInferImage]:
+        """Convert transport-loaded images into the backend's inference input shape."""
+        return prepare_backend_images(self, image_records)
+
+
+def _backend_overrides_method(backend: Any, method_name: str, base_method: Any) -> bool:
+    backend_method = getattr(type(backend), method_name, None)
+    return callable(backend_method) and backend_method is not base_method
+
+
+def backend_uses_raw_transport_images(backend: Any) -> bool:
+    if _backend_overrides_method(backend, "uses_raw_transport_images", VLMBackend.uses_raw_transport_images):
+        return bool(backend.uses_raw_transport_images())
+    return str(getattr(backend, "name", "")).strip() == "gemini"
+
+
+def prepare_backend_images(backend: Any, image_records: List[LoadedTransportImage]) -> List[VLMInferImage]:
+    if _backend_overrides_method(backend, "prepare_images", VLMBackend.prepare_images):
+        return backend.prepare_images(image_records)
+
+    if backend_uses_raw_transport_images(backend):
+        return [
+            {
+                "raw_bytes": record.raw_bytes,
+                "mime_type": record.mime_type,
+            }
+            for record in image_records
+        ]
+
+    prepared = [record.bgr for record in image_records if record.bgr is not None]
+    if len(prepared) != len(image_records):
+        raise ValueError("decoded image arrays are required for this backend")
+    return prepared
 
 
 def normalize_task_window_result(

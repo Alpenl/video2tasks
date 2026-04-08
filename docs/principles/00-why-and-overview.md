@@ -3,7 +3,7 @@
 这个仓库把一个长视频变成两类东西：
 
 1. 一组带时间戳的“任务片段”（segments），每段对应一个相对完整的动作。
-2. 一个导出视频，把每段动作对应的字幕直接烧录到视频里（annotated.mp4）。
+2. （可选）一个导出视频（例如 `annotated.mp4`），用于把每段动作的字幕渲染到视频里。是否产出以及字幕是否实际烧录，取决于导出相关开关与导出是否成功。
 
 核心思路很朴素：
 
@@ -15,26 +15,36 @@
 
 这么设计主要是为了三件事：
 
-- 可以并行：窗口之间互不依赖，worker 可以同时跑很多个。
+- 可以并行：窗口之间互不依赖，同一台机器上可以跑多个 worker 进程。
 - 可以恢复：少量窗口失败不会把整段视频的结果毁掉。
 - 可以调参：速度和质量主要由几个配置控制，而不是改代码。
 
 ## 你会得到哪些文件
 
-默认输出根目录是 `./runs`（可在配置里改）。
+默认输出根目录是 `./runs`（可在配置里改）。本文统一用 `<run_dir>` 表示 `<run.base_dir>/<subset>/<run_id>`；默认示例是 `./runs/<subset>/<run_id>`。
+部署模式固定为 `single-machine shared-fs`：Server 和 Worker 必须看到同一套本地路径。
 
 对单个样本（sample）通常会看到：
 
-- `samples/<sample_id>/windows.jsonl`
+- `<run_dir>/samples/<sample_id>/windows.jsonl`
   第一阶段每个窗口的原始结果（每行一个窗口）。
-- `samples/<sample_id>/segments.json`
-  全局切分结果（最终以它为准）。
-- `exports/<sample_id>/annotated.mp4`
-  导出的视频，字幕已经烧录。
-- `exports/<sample_id>/seg_XX.caption.txt`（或类似命名）
-  每段的字幕文本（导出时会用）。
-- `samples/<sample_id>/.DONE`
-  这个样本跑完的标记文件。
+- `<run_dir>/samples/<sample_id>/segments.json`
+  结果层产物：只放全局切分结果 + Stage 2 文本产物（merge/summary/subtitle localization）。
+  source instruction 永远是英文；字幕本地化只改变字幕文本。
+- `<run_dir>/run_manifest.json`
+  run 级身份和契约文件：记录 config/prompt/backend identity、`required_stages`、resume 校验信息。
+  resume 默认拒绝跨 identity 续跑；只有显式 force（`run.force_resume=true` 或 `RUN_FORCE_RESUME=true`）才放行。
+- `<run_dir>/samples/<sample_id>/.DONE`
+  样本完成标记：表示该样本完成了当前配置要求的全部必需阶段（即 `run_manifest.json.required_stages`）。
+- `<run_dir>/samples/<sample_id>/.FAILED`（以及 `<run_dir>/samples/<sample_id>/failure.json`）
+  样本失败标记与失败详情。
+- `<run_dir>/exports/<sample_id>/annotated.mp4`（若 `export.mode=annotated|both` 且导出成功）
+  annotated 导出产物。
+- `<run_dir>/clips/<sample_id>/...`（若 `export.mode=clips|both` 且导出成功）
+  clips 导出产物；同时会写 `<run_dir>/clips/<sample_id>/manifest.json`。
+  clips 导出必须保留音频（`audio_preserved=true`）。
+- `diagnostics` / 各类 manifest
+  运行态事实（run/export/fallback state）放在 manifest 与 diagnostics，不和最终切分真相混在一起。
 
 调试时你可能还会看到 `tmp/` 下的中间产物（例如联系图、日志等），是否写入取决于配置和代码路径。
 
@@ -52,7 +62,7 @@
 4. 把联系图 + 提示词发给视觉模型。
 5. 模型返回：这个窗口里哪些位置是“新动作开始”。
 
-输出：`windows.jsonl`。
+输出：`<run_dir>/samples/<sample_id>/windows.jsonl`。
 
 为什么慢：每个窗口都是一次多模态请求，而且窗口通常有重叠（这是为了不漏边界）。
 
@@ -64,21 +74,24 @@
 
 - 把明显的过切合并掉（从很多小段变成更可读的段）。
 - 生成或整理每段的动作描述。
-- 把字幕从英文转成中文（或反过来），用于导出。
+- 字幕本地化：把字幕在中英文之间转换。它是 Stage 2 的正式 artifact，而不是临时导出副产物。
+  source instruction language 固定为 `en`，不会因为字幕语言切换而改写。
 
-输出：更新后的 `segments.json` 和字幕文本。
+输出：更新后的 `<run_dir>/samples/<sample_id>/segments.json`。
+这里的 Stage 2 文本结果就是结果层的一部分，不需要再去导出目录里找“最终真相”。
 
 这个阶段通常比阶段 1 便宜，因为主要是文本处理，不需要上传图片。
 
 ### 导出：渲染带字幕的视频
 
-输入：原视频 + `segments.json` + 每段字幕。
+输入：原视频 + `<run_dir>/samples/<sample_id>/segments.json` + 每段字幕（若有）。
 
 做的事：
 
 - 按 segments 切片。
-- 用 ffmpeg 把字幕烧录进去。
-- 拼成一个 `annotated.mp4`。
+- （若启用字幕且渲染成功）用 ffmpeg 把字幕烧录进去。
+- （若导出成功）生成 `<run_dir>/exports/<sample_id>/annotated.mp4`（`export.mode=annotated|both`）或 `<run_dir>/clips/<sample_id>/...`（`export.mode=clips|both`）。
+- clips 导出必须保音频；音频丢失属于导出契约失败。
 
 导出一般比阶段 1 快很多；如果导出慢，多数是本机 CPU/磁盘或 ffmpeg 参数问题。
 
@@ -89,7 +102,7 @@
 窗口的好处：
 
 - 把问题缩小到 10 到 20 秒级别，模型更容易回答。
-- 可并行，吞吐靠 worker 数量堆起来。
+- 可并行，吞吐主要靠同机 worker 并发堆起来。
 - 允许用重叠换边界命中（`step_sec` 越小越密）。
 
 联系图的好处：
@@ -111,4 +124,3 @@
 - 重试触发（空 JSON、超时、HTTP 429/5xx）。
 
 下一份文档会把主流程按“Server 做什么、Worker 做什么、哪些文件什么时候出现”串起来。
-

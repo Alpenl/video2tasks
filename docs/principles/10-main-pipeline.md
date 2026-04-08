@@ -2,6 +2,7 @@
 
 这份文档按“谁负责什么”讲清楚主流程。
 如果你想知道“到底是谁生成了 windows.jsonl”“为什么 worker 跑完了但 segments.json 还没变”，从这里开始看。
+本文统一用 `<run_dir>` 表示 `<run.base_dir>/<subset>/<run_id>`；默认示例是 `./runs/<subset>/<run_id>`。
 
 ## 三个角色（概念上）
 
@@ -10,6 +11,15 @@
 - 模型端点：外部服务（Gemini/OpenAI 兼容等）。绝大多数时间消耗在这里。
 
 一句话：worker 负责并行干活，server 负责流程和持久化。
+
+## 运行契约（冻结语义）
+
+- 部署模式是 `single-machine shared-fs`，Server/Worker 必须共享同一路径视图。
+- `.DONE` 表示当前配置要求的全部必需阶段完成（由 `<run_dir>/run_manifest.json.required_stages` 定义）。
+- `segments.json` 只放 segmentation + Stage 2 文本产物，不承载 run/export/fallback 的最终真相。
+- source instruction 永远英文；subtitle localization 是 Stage 2 正式 artifact。
+- resume 默认拒绝跨 config/prompt/backend/required-stages 续跑，除非显式 force。
+- clips 导出必须保留音频；音频不保留属于导出契约失败。
 
 ## Stage 1：窗口任务（最重）
 
@@ -66,7 +76,7 @@ worker 的工作是“把一个窗口变成一个 JSON 结果”：
 
 server 收到 worker 的 JSON 后，会把它追加写入：
 
-- `samples/<sample_id>/windows.jsonl`
+- `<run_dir>/samples/<sample_id>/windows.jsonl`
 
 这是排查 Stage 1 的第一手证据。
 你可以在里面看到：
@@ -85,9 +95,10 @@ server 收到 worker 的 JSON 后，会把它追加写入：
 
 输出文件是：
 
-- `samples/<sample_id>/segments.json`
+- `<run_dir>/samples/<sample_id>/segments.json`
 
-对后续所有步骤来说，segments.json 是“最终真相”。
+`segments.json` 只承载分段结果与 Stage 2 文本层结果。
+run/resume/export/fallback 等运行态事实在 manifest 与 diagnostics，不和分段结果混成一个“最终真相”。
 
 ## Stage 2：后处理（合并/字幕语言等）
 
@@ -103,6 +114,7 @@ Stage 2 常做的事：
 - 合并碎段：把明显的过切合回更粗粒度的段。
 - 整理描述：把每段动作写成更可读的指令。
 - 字幕本地化：导出字幕可选中文/英文（通常是把英文指令翻译成中文字幕）。
+  这是 Stage 2 的正式文本产物；source instruction language 固定为 `en`。
 
 Stage 2 的常见失败点：
 
@@ -110,19 +122,22 @@ Stage 2 的常见失败点：
 - 合并提示词太激进，把真实边界也合掉了。
 - 校验条件太松，接受了不完整或乱序的合并结果。
 
-设计上应该允许 Stage 2 失败后回退：至少还能用 Stage 1 的 segments.json 导出。
+关于失败处理（required-stages）：如果 Stage 2 在当前配置下属于必需阶段，Stage 2 失败就不能标记 `.DONE`。
 
 ## Export：导出带字幕视频
 
 导出会读取：
 
 - 原视频
-- `segments.json`
-- 每段字幕文本（如果启用字幕）
+- `<run_dir>/samples/<sample_id>/segments.json`
+- 每段字幕文本（来自 Stage 2 字幕本地化产物）
 
-然后生成：
+然后（若启用导出且导出成功）生成的产物取决于 `export.mode`：
 
-- `exports/<sample_id>/annotated.mp4`
+- `export.mode=annotated|both`：`<run_dir>/exports/<sample_id>/annotated.mp4`（默认目录名 `exports`，文件名 `annotated.mp4`）
+- `export.mode=clips|both`：`<run_dir>/clips/<sample_id>/seg_XX_*.mp4` 以及 `<run_dir>/clips/<sample_id>/manifest.json`（默认目录名 `clips`）
+
+对 clips，`manifest.json` 里每条记录都应满足 `audio_preserved=true`。
 
 导出慢通常是本地 ffmpeg 的计算/IO，不是模型端点。
 
@@ -136,9 +151,9 @@ Stage 2 的常见失败点：
 
 从“最终结果”往回查最快：
 
-- 先看 `samples/<sample_id>/segments.json`：段数、时间戳是否合理。
-- 若 segments 不合理，再看 `samples/<sample_id>/windows.jsonl`：哪些窗口贡献了错误 cut。
-- 若字幕不对，看 `exports/<sample_id>/seg_XX.caption.txt` 和 Stage 2 的输出。
+- 先看 `<run_dir>/samples/<sample_id>/segments.json`：段数、时间戳是否合理。
+- 若 segments 不合理，再看 `<run_dir>/samples/<sample_id>/windows.jsonl`：哪些窗口贡献了错误 cut。
+- 若字幕不对，先看 `<run_dir>/samples/<sample_id>/segments.json` 里的 Stage 2 字幕结果，再看对应 `diagnostics`。
+- 若导出不对，按 `export.mode` 检查：`<run_dir>/exports/<sample_id>/annotated.mp4`（annotated|both）与 `<run_dir>/clips/<sample_id>/`（clips|both，包括 `manifest.json`），并重点看 clips 的 `audio_preserved` 字段。
 
 下一份文档会专门讲：哪些配置最影响速度/质量，以及怎么做最小代价的调参试验。
-

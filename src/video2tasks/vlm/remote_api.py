@@ -8,7 +8,11 @@ import cv2
 import numpy as np
 import requests
 
+from ..logging_utils import get_logger
 from .base import VLMBackend
+
+
+logger = get_logger(__name__)
 
 
 def _encode_png_b64(img_bgr: np.ndarray) -> str:
@@ -26,7 +30,7 @@ def _extract_json(text: str) -> Dict[str, Any]:
     try:
         return json.loads(t)
     except json.JSONDecodeError as e:
-        print(f"[RemoteAPI] Failed to parse JSON directly: {e}")
+        logger.warning(f"[RemoteAPI] Failed to parse JSON directly: {e}")
 
     s = t.find("{")
     e = t.rfind("}")
@@ -34,7 +38,7 @@ def _extract_json(text: str) -> Dict[str, Any]:
         try:
             return json.loads(t[s : e + 1])
         except json.JSONDecodeError as e:
-            print(f"[RemoteAPI] Failed to extract JSON from text: {e}")
+            logger.warning(f"[RemoteAPI] Failed to extract JSON from text: {e}")
             return {}
     return {}
 
@@ -72,7 +76,7 @@ class RemoteAPIBackend(VLMBackend):
         latency_s = time.time() - t0
 
         if r.status_code != 200:
-            print(
+            logger.warning(
                 f"[RemoteAPI] Error: status={r.status_code} latency_s={latency_s:.3f}"
             )
             return {}
@@ -80,7 +84,7 @@ class RemoteAPIBackend(VLMBackend):
         try:
             data = r.json()
         except json.JSONDecodeError as e:
-            print(f"[RemoteAPI] Failed to parse response JSON: {e}")
+            logger.warning(f"[RemoteAPI] Failed to parse response JSON: {e}")
             data = {}
 
         if isinstance(data, dict):

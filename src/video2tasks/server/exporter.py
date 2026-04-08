@@ -14,8 +14,71 @@ import cv2
 from ..config import ExportConfig
 
 
+def _dedupe_preserve_order(items: List[str]) -> List[str]:
+    seen: set[str] = set()
+    ordered: List[str] = []
+    for item in items:
+        if item in seen:
+            continue
+        seen.add(item)
+        ordered.append(item)
+    return ordered
+
+
+def _contract_payload(errors: List[str]) -> Dict[str, Any]:
+    normalized_errors = _dedupe_preserve_order([str(item).strip() for item in errors if str(item).strip()])
+    return {
+        "contract_success": not normalized_errors,
+        "contract_status": "success" if not normalized_errors else "degraded",
+        "contract_errors": normalized_errors,
+    }
+
+
+def _require_render_fact(render_facts: Dict[str, Any], key: str) -> Any:
+    if key not in render_facts:
+        raise RuntimeError(f"missing_render_fact:{key}")
+    return render_facts[key]
+
+
+def _require_render_fact_bool(render_facts: Dict[str, Any], key: str) -> bool:
+    value = _require_render_fact(render_facts, key)
+    if type(value) is not bool:
+        raise RuntimeError(f"invalid_render_fact:{key}")
+    return value
+
+
+def _require_render_fact_optional_bool(render_facts: Dict[str, Any], key: str) -> bool | None:
+    value = _require_render_fact(render_facts, key)
+    if value is None:
+        return None
+    if type(value) is not bool:
+        raise RuntimeError(f"invalid_render_fact:{key}")
+    return value
+
+
+def _require_render_fact_str(render_facts: Dict[str, Any], key: str, *, allowed: set[str] | None = None) -> str:
+    value = _require_render_fact(render_facts, key)
+    if not isinstance(value, str) or not value.strip():
+        raise RuntimeError(f"invalid_render_fact:{key}")
+    normalized = value.strip()
+    if allowed is not None and normalized not in allowed:
+        raise RuntimeError(f"invalid_render_fact:{key}")
+    return normalized
+
+
+def _require_render_fact_nonnegative_int(render_facts: Dict[str, Any], key: str) -> int:
+    value = _require_render_fact(render_facts, key)
+    if type(value) is not int or value < 0:
+        raise RuntimeError(f"invalid_render_fact:{key}")
+    return value
+
+
 def _ffmpeg_exists() -> bool:
     return shutil.which("ffmpeg") is not None
+
+
+def _ffprobe_exists() -> bool:
+    return shutil.which("ffprobe") is not None
 
 
 def _pick_default_cjk_font_file() -> str:
@@ -97,6 +160,79 @@ def _segment_subtitle(segment: Dict[str, Any]) -> str:
     return _segment_instruction(segment)
 
 
+def _count_video_frames(video_path: str | Path) -> int:
+    capture = cv2.VideoCapture(str(video_path))
+    if not capture.isOpened():
+        return 0
+    frame_count = 0
+    try:
+        while True:
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                break
+            frame_count += 1
+    finally:
+        capture.release()
+    return frame_count
+
+
+def _output_has_audio_stream(video_path: str | Path) -> bool:
+    if not Path(video_path).exists() or not _ffprobe_exists():
+        return False
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "a",
+        "-show_entries",
+        "stream=index",
+        "-of",
+        "json",
+        str(video_path),
+    ]
+    try:
+        completed = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    except Exception:
+        return False
+    if completed.returncode != 0:
+        return False
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError:
+        return False
+    streams = payload.get("streams")
+    return isinstance(streams, list) and bool(streams)
+
+
+def _probe_clip_output(
+    *,
+    output_path: Path,
+    requested_frame_count: int,
+    subtitle_requested: bool,
+    render_backend: str,
+) -> Dict[str, Any]:
+    rendered_frame_count = _count_video_frames(output_path)
+    render_complete = requested_frame_count > 0 and rendered_frame_count == requested_frame_count
+    audio_preserved = _output_has_audio_stream(output_path)
+    subtitle_rendered: bool | None
+    if not subtitle_requested:
+        subtitle_rendered = False
+    elif render_backend == "ffmpeg":
+        subtitle_rendered = None
+    else:
+        subtitle_rendered = False
+    return {
+        "render_backend": render_backend,
+        "subtitle_rendered": subtitle_rendered,
+        "audio_preserved": audio_preserved,
+        "render_complete": render_complete,
+        "rendered_frame_count": rendered_frame_count,
+        "requested_frame_count": requested_frame_count,
+    }
+
+
 class ClipExporter:
     def __init__(self, export_config: ExportConfig) -> None:
         self.export_config = export_config
@@ -117,6 +253,7 @@ class ClipExporter:
         clip_paths: List[str] = []
         manifest_records: List[Dict[str, Any]] = []
         used_subtitle_fallback = False
+        clip_contract_errors: List[str] = []
 
         for index, segment in enumerate(segments):
             start_frame = int(segment.get("start_frame", 0))
@@ -128,7 +265,7 @@ class ClipExporter:
             clip_name = f"seg_{index:02d}_{_slugify(instruction)}.mp4"
             clip_path = sample_dir / clip_name
             subtitle_text = _segment_subtitle(segment) if self.export_config.subtitles.enabled else ""
-            wrote_with_subtitles = self._write_clip(
+            render_facts = self._write_clip(
                 video_path,
                 clip_path,
                 start_frame,
@@ -136,8 +273,26 @@ class ClipExporter:
                 fps,
                 subtitle_text=subtitle_text,
             )
-            if subtitle_text and not wrote_with_subtitles:
+            subtitle_requested = bool(subtitle_text)
+            subtitle_rendered = _require_render_fact_optional_bool(render_facts, "subtitle_rendered")
+            audio_preserved = _require_render_fact_bool(render_facts, "audio_preserved")
+            render_complete = _require_render_fact_bool(render_facts, "render_complete")
+            render_backend = _require_render_fact_str(render_facts, "render_backend", allowed={"ffmpeg", "opencv"})
+            record_errors: List[str] = []
+            if subtitle_requested and subtitle_rendered is False:
                 used_subtitle_fallback = True
+                record_errors.append("subtitle_not_rendered")
+            elif subtitle_requested and subtitle_rendered is None:
+                record_errors.append("subtitle_render_unverified")
+            if not audio_preserved:
+                record_errors.append("audio_not_preserved")
+            if not render_complete:
+                record_errors.append("render_incomplete")
+            clip_contract_errors.extend(record_errors)
+
+            requested_frame_count = max(0, end_frame - start_frame)
+            rendered_frame_count = _require_render_fact_nonnegative_int(render_facts, "rendered_frame_count")
+            record_contract = _contract_payload(record_errors)
 
             clip_paths.append(str(clip_path))
             manifest_records.append(
@@ -148,6 +303,15 @@ class ClipExporter:
                     "instruction": instruction,
                     "subtitle": _segment_subtitle(segment),
                     "file": clip_name,
+                    "subtitle_requested": subtitle_requested,
+                    "subtitle_rendered": subtitle_rendered,
+                    "audio_preserved": audio_preserved,
+                    "render_complete": render_complete,
+                    "render_backend": render_backend,
+                    "rendered_frame_count": rendered_frame_count,
+                    "requested_frame_count": requested_frame_count,
+                    "export_status": record_contract["contract_status"],
+                    "contract_errors": record_contract["contract_errors"],
                 }
             )
 
@@ -155,11 +319,15 @@ class ClipExporter:
             json.dumps(manifest_records, ensure_ascii=False, indent=2) + "\n",
             encoding="utf-8",
         )
+        if not clip_paths:
+            clip_contract_errors.append("no_clips_exported")
+        batch_contract = _contract_payload(clip_contract_errors)
         return {
             "manifest_path": str(manifest_path),
             "clip_paths": clip_paths,
             "clip_count": len(clip_paths),
             "used_subtitle_fallback": used_subtitle_fallback,
+            **batch_contract,
         }
 
     def _write_clip(
@@ -171,9 +339,10 @@ class ClipExporter:
         fps: float,
         *,
         subtitle_text: str = "",
-    ) -> bool:
+    ) -> Dict[str, Any]:
         subtitle_text = str(subtitle_text or "").strip()
-        if subtitle_text and _ffmpeg_exists():
+        requested_frame_count = max(0, int(end_frame) - int(start_frame))
+        if _ffmpeg_exists():
             try:
                 self._write_clip_with_ffmpeg(
                     video_path,
@@ -183,7 +352,12 @@ class ClipExporter:
                     fps,
                     subtitle_text=subtitle_text,
                 )
-                return True
+                return _probe_clip_output(
+                    output_path=output_path,
+                    requested_frame_count=requested_frame_count,
+                    subtitle_requested=bool(subtitle_text),
+                    render_backend="ffmpeg",
+                )
             except Exception:
                 pass
 
@@ -208,15 +382,22 @@ class ClipExporter:
             raise RuntimeError(f"Cannot create output video: {output_path}")
 
         capture.set(cv2.CAP_PROP_POS_FRAMES, int(start_frame))
+        rendered_frame_count = 0
         for _ in range(int(start_frame), int(end_frame)):
             ok, frame = capture.read()
             if not ok or frame is None:
                 break
             writer.write(frame)
+            rendered_frame_count += 1
 
         writer.release()
         capture.release()
-        return False
+        return _probe_clip_output(
+            output_path=output_path,
+            requested_frame_count=requested_frame_count,
+            subtitle_requested=False,
+            render_backend="opencv",
+        )
 
     def _write_clip_with_ffmpeg(
         self,
@@ -234,24 +415,6 @@ class ClipExporter:
         if duration_sec <= 1e-3:
             raise ValueError("clip duration too short")
 
-        caption_path = output_path.with_suffix(".caption.txt")
-        caption_path.write_text(_wrap_caption(subtitle_text) + "\n", encoding="utf-8")
-
-        font_file = str(self.export_config.subtitles.font_file).strip() or _pick_default_cjk_font_file()
-        x_expr, y_expr = _subtitle_xy(self.export_config.subtitles.position, margin_x=24, margin_y=24)
-        drawtext_parts = [
-            f"textfile='{_escape_filter_value(str(caption_path))}'",
-            f"fontsize={int(self.export_config.subtitles.font_size)}",
-            "fontcolor=white",
-            f"x={x_expr}",
-            f"y={y_expr}",
-            "box=1",
-            "boxcolor=black@0.45",
-            "boxborderw=8",
-        ]
-        if font_file:
-            drawtext_parts.append(f"fontfile='{_escape_filter_value(font_file)}'")
-
         cmd = [
             "ffmpeg",
             "-hide_banner",
@@ -268,8 +431,32 @@ class ClipExporter:
             "0:v:0",
             "-map",
             "0:a?",
-            "-vf",
-            "drawtext=" + ":".join(drawtext_parts),
+        ]
+
+        if subtitle_text:
+            caption_path = output_path.with_suffix(".caption.txt")
+            caption_path.write_text(_wrap_caption(subtitle_text) + "\n", encoding="utf-8")
+
+            font_file = str(self.export_config.subtitles.font_file).strip() or _pick_default_cjk_font_file()
+            x_expr, y_expr = _subtitle_xy(self.export_config.subtitles.position, margin_x=24, margin_y=24)
+            drawtext_parts = [
+                f"textfile='{_escape_filter_value(str(caption_path))}'",
+                f"fontsize={int(self.export_config.subtitles.font_size)}",
+                "fontcolor=white",
+                f"x={x_expr}",
+                f"y={y_expr}",
+                "box=1",
+                "boxcolor=black@0.45",
+                "boxborderw=8",
+            ]
+            if font_file:
+                drawtext_parts.append(f"fontfile='{_escape_filter_value(font_file)}'")
+            cmd.extend([
+                "-vf",
+                "drawtext=" + ":".join(drawtext_parts),
+            ])
+
+        cmd.extend([
             "-c:v",
             "libx264",
             "-preset",
@@ -281,7 +468,7 @@ class ClipExporter:
             "-c:a",
             "copy",
             str(output_path),
-        ]
+        ])
         subprocess.run(cmd, check=True)
 
 
@@ -308,6 +495,7 @@ class AnnotatedVideoExporter:
                 "annotated_path": str(output_path),
                 "copied_without_subtitles": True,
                 "used_subtitle_fallback": False,
+                **_contract_payload([]),
             }
 
         if not _ffmpeg_exists():
@@ -316,6 +504,7 @@ class AnnotatedVideoExporter:
                 "annotated_path": str(output_path),
                 "copied_without_subtitles": True,
                 "used_subtitle_fallback": True,
+                **_contract_payload(["subtitle_not_rendered"]),
             }
 
         safe_fps = fps if fps and fps > 1e-6 else 30.0
@@ -365,6 +554,7 @@ class AnnotatedVideoExporter:
                 "copied_without_subtitles": True,
                 "used_subtitle_fallback": True,
                 "caption_paths": caption_paths,
+                **_contract_payload(["subtitle_not_rendered"]),
             }
 
         cmd = [
@@ -399,6 +589,7 @@ class AnnotatedVideoExporter:
             "copied_without_subtitles": False,
             "used_subtitle_fallback": False,
             "caption_paths": caption_paths,
+            **_contract_payload([]),
         }
 
 
@@ -447,7 +638,19 @@ def export_sample_outputs(
             diagnostics["export_annotated_used_subtitle_fallback"] = bool(
                 annotated_result.get("used_subtitle_fallback", False)
             )
-            successes += 1
+            diagnostics["export_annotated_contract_status"] = str(
+                annotated_result.get("contract_status", "success")
+            )
+            diagnostics["export_annotated_contract_errors"] = list(
+                annotated_result.get("contract_errors", [])
+            )
+            if annotated_result.get("contract_success", True):
+                successes += 1
+            else:
+                errors.append(f"annotated:{diagnostics['export_annotated_contract_status']}")
+                diagnostics["export_annotated_error"] = ", ".join(
+                    diagnostics["export_annotated_contract_errors"]
+                ) or diagnostics["export_annotated_contract_status"]
         except Exception as exc:
             errors.append(f"annotated:{type(exc).__name__}")
             diagnostics["export_annotated_error"] = str(exc).strip() or type(exc).__name__
@@ -466,7 +669,15 @@ def export_sample_outputs(
             diagnostics["export_clips_used_subtitle_fallback"] = bool(
                 clips_result.get("used_subtitle_fallback", False)
             )
-            successes += 1
+            diagnostics["export_clips_contract_status"] = str(clips_result.get("contract_status", "success"))
+            diagnostics["export_clips_contract_errors"] = list(clips_result.get("contract_errors", []))
+            if clips_result.get("contract_success", True):
+                successes += 1
+            else:
+                errors.append(f"clips:{diagnostics['export_clips_contract_status']}")
+                diagnostics["export_clips_error"] = ", ".join(
+                    diagnostics["export_clips_contract_errors"]
+                ) or diagnostics["export_clips_contract_status"]
         except Exception as exc:
             errors.append(f"clips:{type(exc).__name__}")
             diagnostics["export_clips_error"] = str(exc).strip() or type(exc).__name__

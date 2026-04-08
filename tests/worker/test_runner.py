@@ -449,7 +449,10 @@ def test_worker_loads_images_from_paths_and_submits_dispatch_id(
                     "data": {
                         "task_id": "demo::sample_roboturk_tower_w0",
                         "dispatch_id": "d7",
-                        "image_paths": [str(image_path)],
+                        "image_transport": {
+                            "mode": "shared_fs",
+                            "image_paths": [str(image_path)],
+                        },
                         "meta": {
                             "subset": "demo",
                             "sample_id": "sample_roboturk_tower",

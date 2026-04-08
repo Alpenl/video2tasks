@@ -1,4 +1,10 @@
 import base64
+
+import cv2
+import numpy as np
+import pytest
+import video2tasks.server.windowing as windowing_module
+from video2tasks.server.task_artifacts import ArtifactPayloadValidationError, TaskArtifactWriter
 from video2tasks.server.windowing import (
     FrameExtractor,
     Window,
@@ -24,6 +30,13 @@ from video2tasks.server.windowing import (
 
 def _windowing_b64(payload: bytes) -> str:
     return base64.b64encode(payload).decode("utf-8")
+
+
+def _png_bytes(value: int = 64) -> bytes:
+    image = np.full((4, 4, 3), value, dtype=np.uint8)
+    ok, encoded = cv2.imencode(".png", image)
+    assert ok
+    return encoded.tobytes()
 
 
 def test_chunk_frame_ids_for_contact_sheets_preserves_order() -> None:
@@ -117,16 +130,18 @@ def test_frame_extractor_contact_sheets_fall_back_to_cv2_when_ffmpeg_returns_emp
 ) -> None:
     extractor = FrameExtractor.__new__(FrameExtractor)
     extractor.mp4_path = "demo.mp4"
+    ffmpeg_payload = _png_bytes(150)
+    cv2_payload = _png_bytes(200)
 
     calls = []
 
     def fake_ffmpeg(self, group, group_start_index, target_w, target_h, rows, cols):
         calls.append(("ffmpeg", list(group), group_start_index, rows, cols))
-        return b"" if group_start_index == 0 else b"ffmpeg-sheet"
+        return b"" if group_start_index == 0 else ffmpeg_payload
 
     def fake_cv2(self, group, group_start_index, target_w, target_h, compression, rows, cols):
         calls.append(("cv2", list(group), group_start_index, rows, cols))
-        return f"cv2-sheet-{group_start_index}".encode("utf-8")
+        return cv2_payload
 
     monkeypatch.setattr(FrameExtractor, "_build_contact_sheet_png_bytes_via_ffmpeg", fake_ffmpeg)
     monkeypatch.setattr(FrameExtractor, "_build_contact_sheet_png_bytes_via_cv2", fake_cv2)
@@ -138,7 +153,7 @@ def test_frame_extractor_contact_sheets_fall_back_to_cv2_when_ffmpeg_returns_emp
         contact_sheet_cols=2,
     )
 
-    assert sheets == [_windowing_b64(b"cv2-sheet-0"), _windowing_b64(b"ffmpeg-sheet")]
+    assert sheets == [_windowing_b64(cv2_payload), _windowing_b64(ffmpeg_payload)]
     assert calls == [
         ("ffmpeg", [0, 1, 2, 3], 0, 2, 2),
         ("cv2", [0, 1, 2, 3], 0, 2, 2),
@@ -146,6 +161,102 @@ def test_frame_extractor_contact_sheets_fall_back_to_cv2_when_ffmpeg_returns_emp
     ]
 
 
+def test_frame_extractor_rejects_bad_contact_sheet_payload_before_artifact_wrapping(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    extractor = FrameExtractor.__new__(FrameExtractor)
+    extractor.mp4_path = "demo.mp4"
+    extractor.artifact_writer = TaskArtifactWriter(root_dir=str(tmp_path / "tmp"))
+    extractor.last_artifact_batch = None
+    extractor._artifact_sequence = 0
+    extractor._auto_sample_id = "demo"
+
+    def fake_ffmpeg(self, group, group_start_index, target_w, target_h, rows, cols):
+        return b"not-a-png"
+
+    def fake_cv2(self, group, group_start_index, target_w, target_h, compression, rows, cols):
+        raise AssertionError("cv2 fallback should not be used when ffmpeg returns non-empty bytes")
+
+    monkeypatch.setattr(FrameExtractor, "_build_contact_sheet_png_bytes_via_ffmpeg", fake_ffmpeg)
+    monkeypatch.setattr(FrameExtractor, "_build_contact_sheet_png_bytes_via_cv2", fake_cv2)
+
+    with pytest.raises(ArtifactPayloadValidationError, match="image_decode_failed"):
+        extractor.get_many_b64_with_artifacts(
+            [0, 1, 2, 3],
+            use_contact_sheets=True,
+            contact_sheet_rows=2,
+            contact_sheet_cols=2,
+            artifact_metadata={"subset": "demo", "sample_id": "demo", "task_id": "bad_sheet"},
+            return_images=False,
+        )
+
+
+def test_frame_extractor_rejects_bad_inline_frame_payload_before_return(monkeypatch) -> None:
+    extractor = FrameExtractor.__new__(FrameExtractor)
+    extractor.mp4_path = "demo.mp4"
+    extractor.last_artifact_batch = None
+
+    def fake_read_frame_bgr(self, fid):
+        return np.zeros((4, 4, 3), dtype=np.uint8)
+
+    def fake_encode_image_720p_png_bytes(bgr, target_w, target_h, compression):
+        return b"not-a-png"
+
+    monkeypatch.setattr(FrameExtractor, "_read_frame_bgr", fake_read_frame_bgr)
+    monkeypatch.setattr(windowing_module, "encode_image_720p_png_bytes", fake_encode_image_720p_png_bytes)
+
+    with pytest.raises(ArtifactPayloadValidationError, match="image_decode_failed"):
+        extractor.get_many_b64(
+            [0],
+            use_contact_sheets=False,
+            persist_artifacts=False,
+            return_images=True,
+        )
+
+
+def test_frame_extractor_rejects_bad_inline_frame_payload_before_artifact_persist(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    extractor = FrameExtractor.__new__(FrameExtractor)
+    extractor.mp4_path = "demo.mp4"
+    extractor.artifact_writer = TaskArtifactWriter(root_dir=str(tmp_path / "tmp"))
+    extractor.last_artifact_batch = None
+    extractor._artifact_sequence = 0
+    extractor._auto_sample_id = "demo"
+
+    def fake_read_frame_bgr(self, fid):
+        return np.zeros((4, 4, 3), dtype=np.uint8)
+
+    def fake_encode_image_720p_png_bytes(bgr, target_w, target_h, compression):
+        return b"not-a-png"
+
+    monkeypatch.setattr(FrameExtractor, "_read_frame_bgr", fake_read_frame_bgr)
+    monkeypatch.setattr(windowing_module, "encode_image_720p_png_bytes", fake_encode_image_720p_png_bytes)
+
+    with pytest.raises(ArtifactPayloadValidationError, match="image_decode_failed"):
+        extractor.get_many_b64_with_artifacts(
+            [0],
+            use_contact_sheets=False,
+            artifact_metadata={"subset": "demo", "sample_id": "demo", "task_id": "bad_frame"},
+            return_images=False,
+        )
+
+
+def _selection_branch_build_input() -> tuple[list[Window], dict]:
+    windows = [Window(window_id=0, start_frame=0, end_frame=7, frame_ids=list(range(8)))]
+    by_wid = {
+        0: {
+            "window_id": 0,
+            "vlm_json": {
+                "thought": "Simple two-step sequence",
+                "transitions": [4],
+                "instructions": ["First step", "Second step"],
+            },
+        }
+    }
+    return windows, by_wid
 
 
 def test_merge_task_level_segments_merges_short_adjustments_around_same_bowl_task() -> None:
@@ -2208,17 +2319,17 @@ def test_build_segments_via_cuts_preserves_short_segments_for_recall() -> None:
     assert result["diagnostics"]["selected_segment_count"] == 3
 
 
-def test_build_segments_via_cuts_defaults_to_light_recall_output() -> None:
+def test_build_segments_via_cuts_defaults_to_merged_output_when_no_guards_trigger() -> None:
     windows = [Window(window_id=0, start_frame=0, end_frame=7, frame_ids=list(range(8)))]
     by_wid = {
         0: {
             "window_id": 0,
             "vlm_json": {
-                "thought": "Two neighboring add steps",
+                "thought": "Preparation rolls into the main move",
                 "transitions": [4],
                 "instructions": [
-                    "Add salt to the bowl",
-                    "Add pepper to the bowl",
+                    "Grasp and manipulate (prepare to move/lift) the dark blue bowl",
+                    "Pick up the blue bowl and place it onto the stack",
                 ],
             },
         }
@@ -2231,12 +2342,15 @@ def test_build_segments_via_cuts_defaults_to_light_recall_output() -> None:
         fps=30.0,
         nframes=8,
         frames_per_window=8,
+        boundary_support_threshold=2.0,
         refine_final_instructions=False,
     )
 
-    assert len(result["segments"]) == 2
-    assert result["diagnostics"]["selection_policy"] == "light_cleanup_default_recall"
-
+    assert len(result["segments"]) == 1
+    assert result["diagnostics"]["selected_segment_count"] == 1
+    assert result["diagnostics"]["merged_segment_count"] == 1
+    assert result["diagnostics"]["selected_segment_source"] == "merged"
+    assert result["diagnostics"]["selection_policy"] == "merged_default"
 
 
 def test_build_segments_via_cuts_does_not_leak_right_label_into_left_segment() -> None:
@@ -2326,5 +2440,83 @@ def test_build_segments_via_cuts_keeps_recovered_micro_boundary_in_final_output(
 
     segments = result["segments"]
     assert [segment["end_frame"] for segment in segments[:-1]] == [1, 2]
+    assert result["diagnostics"]["selected_segment_source"] == "light_cleanup"
     assert result["diagnostics"]["selection_policy"] == "light_cleanup_micro_boundary_guard"
     assert result["diagnostics"]["recovered_micro_boundary_points"] == [1]
+
+
+def test_build_segments_via_cuts_selects_light_cleanup_for_strong_boundary_guard(monkeypatch) -> None:
+    windows, by_wid = _selection_branch_build_input()
+
+    monkeypatch.setattr(
+        windowing_module,
+        "merge_task_level_segments",
+        lambda *args, **kwargs: [{"seg_id": 0, "start_frame": 0, "end_frame": 8, "instruction": "Merged step", "confidence": 1.0}],
+    )
+    monkeypatch.setattr(windowing_module, "_missing_strong_boundary_points", lambda *args, **kwargs: [4])
+    monkeypatch.setattr(windowing_module, "_missing_boundary_points", lambda *args, **kwargs: [])
+    monkeypatch.setattr(windowing_module, "_should_fallback_to_light_cleanup", lambda *args, **kwargs: False)
+
+    result = build_segments_via_cuts(
+        "sample",
+        windows,
+        by_wid,
+        fps=30.0,
+        nframes=8,
+        frames_per_window=8,
+        refine_final_instructions=False,
+    )
+
+    assert len(result["segments"]) == 2
+    assert result["diagnostics"]["selected_segment_source"] == "light_cleanup"
+    assert result["diagnostics"]["selection_policy"] == "light_cleanup_strong_boundary_guard"
+
+
+def test_build_segments_via_cuts_selects_light_cleanup_for_adaptive_fallback(monkeypatch) -> None:
+    windows, by_wid = _selection_branch_build_input()
+
+    monkeypatch.setattr(
+        windowing_module,
+        "merge_task_level_segments",
+        lambda *args, **kwargs: [{"seg_id": 0, "start_frame": 0, "end_frame": 8, "instruction": "Merged step", "confidence": 1.0}],
+    )
+    monkeypatch.setattr(windowing_module, "_missing_strong_boundary_points", lambda *args, **kwargs: [])
+    monkeypatch.setattr(windowing_module, "_missing_boundary_points", lambda *args, **kwargs: [])
+    monkeypatch.setattr(windowing_module, "_should_fallback_to_light_cleanup", lambda *args, **kwargs: True)
+
+    result = build_segments_via_cuts(
+        "sample",
+        windows,
+        by_wid,
+        fps=30.0,
+        nframes=8,
+        frames_per_window=8,
+        refine_final_instructions=False,
+    )
+
+    assert len(result["segments"]) == 2
+    assert result["diagnostics"]["selected_segment_source"] == "light_cleanup"
+    assert result["diagnostics"]["selection_policy"] == "light_cleanup_fallback"
+
+
+def test_build_segments_via_cuts_selects_light_cleanup_when_merge_returns_empty(monkeypatch) -> None:
+    windows, by_wid = _selection_branch_build_input()
+
+    monkeypatch.setattr(windowing_module, "merge_task_level_segments", lambda *args, **kwargs: [])
+    monkeypatch.setattr(windowing_module, "_missing_strong_boundary_points", lambda *args, **kwargs: [])
+    monkeypatch.setattr(windowing_module, "_missing_boundary_points", lambda *args, **kwargs: [])
+    monkeypatch.setattr(windowing_module, "_should_fallback_to_light_cleanup", lambda *args, **kwargs: False)
+
+    result = build_segments_via_cuts(
+        "sample",
+        windows,
+        by_wid,
+        fps=30.0,
+        nframes=8,
+        frames_per_window=8,
+        refine_final_instructions=False,
+    )
+
+    assert len(result["segments"]) == 2
+    assert result["diagnostics"]["selected_segment_source"] == "light_cleanup"
+    assert result["diagnostics"]["selection_policy"] == "light_cleanup_empty_merge"

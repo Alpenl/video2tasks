@@ -7,8 +7,12 @@ from PIL import Image
 from io import BytesIO
 import base64
 
+from ..logging_utils import get_logger
 from .base import VLMBackend
 from ..prompt import prompt_switch_detection as _shared_prompt_switch_detection
+
+
+logger = get_logger(__name__)
 
 
 def encode_image_to_pil(img_bgr: np.ndarray, target_w: int = 720, target_h: int = 480) -> Optional[Image.Image]:
@@ -75,8 +79,8 @@ class Qwen3VLBackend(VLMBackend):
         """Load model and processor."""
         import torch
         from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
-        
-        print(f"[Qwen3VL] Loading model from {self.model_path}...")
+
+        logger.info(f"[Qwen3VL] Loading model from {self.model_path}...")
         
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_path,
@@ -86,8 +90,8 @@ class Qwen3VLBackend(VLMBackend):
         )
         self.processor = AutoProcessor.from_pretrained(self.model_path)
         self.model.eval()
-        
-        print("[Qwen3VL] Model ready.")
+
+        logger.info("[Qwen3VL] Model ready.")
     
     def infer(self, images: List[np.ndarray], prompt: str) -> Dict[str, Any]:
         """Run inference with Qwen3-VL."""
@@ -159,6 +163,6 @@ class Qwen3VLBackend(VLMBackend):
         if self.processor is not None:
             del self.processor
             self.processor = None
-        
+
         torch.cuda.empty_cache()
-        print("[Qwen3VL] Model cleaned up.")
+        logger.info("[Qwen3VL] Model cleaned up.")

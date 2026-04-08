@@ -102,6 +102,25 @@ _PROMPT_BOUNDARY_HINT_SUPPORT_THRESHOLD = 0.45
 _PROMPT_BOUNDARY_HINT_MAX_COUNT = 24
 _SUMMARY_LEVEL_NAMES = ("coarse", "medium", "fine")
 
+# Canonical language codes used by Stage 2 subtitle localization.
+# Source instructions are always treated as English (en); localization targets only subtitles.
+_LANGUAGE_CODE_ALIASES = {
+    "zh": "zh",
+    "zh-cn": "zh",
+    "zh-hans": "zh",
+    "cn": "zh",
+    "中文": "zh",
+    "chinese": "zh",
+    "en": "en",
+    "en-us": "en",
+    "en-gb": "en",
+    "english": "en",
+}
+
+def _normalize_language_code(language: str) -> str:
+    normalized = str(language).strip().lower()
+    return _LANGUAGE_CODE_ALIASES.get(normalized, normalized)
+
 
 def _seed_instruction(segments: List[dict]) -> str:
     unique_instructions: List[str] = []
@@ -127,6 +146,8 @@ def validate_merged_ranges(
     payload: Dict[str, Any],
     segment_count: int,
     min_output_ratio: float,
+    *,
+    segment_ids: Optional[List[int]] = None,
 ) -> Tuple[Optional[List[Tuple[int, int]]], str]:
     if not isinstance(payload, dict):
         return None, "invalid_payload"
@@ -135,44 +156,88 @@ def validate_merged_ranges(
     if not isinstance(raw_ranges, list) or not raw_ranges:
         return None, "invalid_merged_ranges"
 
-    normalized: List[Tuple[int, int]] = []
-    expected_start = 0
+    expected_ids = list(segment_ids) if isinstance(segment_ids, list) else list(range(int(segment_count)))
+    if len(expected_ids) != int(segment_count):
+        expected_ids = list(range(int(segment_count)))
 
-    for item in raw_ranges:
-        if not isinstance(item, dict):
-            return None, "invalid_merged_ranges"
-        try:
-            start_seg_id = int(item.get("start_seg_id"))
-            end_seg_id = int(item.get("end_seg_id"))
-        except (TypeError, ValueError):
-            return None, "invalid_merged_ranges"
+    # If seg_id values are not unique, fall back to positional indices.
+    if len(set(expected_ids)) != len(expected_ids):
+        expected_ids = list(range(int(segment_count)))
 
-        if start_seg_id != expected_start:
-            return None, "invalid_partition"
-        if start_seg_id < 0 or end_seg_id < start_seg_id or end_seg_id >= segment_count:
-            return None, "invalid_partition"
+    id_to_index = {int(seg_id): index for index, seg_id in enumerate(expected_ids)}
 
-        normalized.append((start_seg_id, end_seg_id))
-        expected_start = end_seg_id + 1
+    def _parse_with(token_to_index) -> Tuple[Optional[List[Tuple[int, int]]], str]:
+        normalized: List[Tuple[int, int]] = []
+        expected_start_index = 0
 
-    if expected_start != segment_count:
-        return None, "incomplete_partition"
+        for item in raw_ranges:
+            if not isinstance(item, dict):
+                return None, "invalid_merged_ranges"
+            try:
+                start_token = int(item.get("start_seg_id"))
+                end_token = int(item.get("end_seg_id"))
+            except (TypeError, ValueError):
+                return None, "invalid_merged_ranges"
 
-    min_output_segments = max(1, int(math.ceil(float(segment_count) * float(min_output_ratio))))
-    if len(normalized) < min_output_segments:
-        return None, "collapsed_too_aggressively"
+            start_index = token_to_index(start_token)
+            end_index = token_to_index(end_token)
+            if start_index is None or end_index is None:
+                return None, "invalid_partition"
 
-    return normalized, "ok"
+            if start_index != expected_start_index:
+                return None, "invalid_partition"
+            if start_index < 0 or end_index < start_index or end_index >= int(segment_count):
+                return None, "invalid_partition"
+
+            normalized.append((int(start_index), int(end_index)))
+            expected_start_index = int(end_index) + 1
+
+        if expected_start_index != int(segment_count):
+            return None, "incomplete_partition"
+
+        min_output_segments = max(1, int(math.ceil(float(segment_count) * float(min_output_ratio))))
+        if len(normalized) < min_output_segments:
+            return None, "collapsed_too_aggressively"
+
+        return normalized, "ok"
+
+    def token_to_index_seg_id_first(token: int) -> Optional[int]:
+        token = int(token)
+        if token in id_to_index:
+            return id_to_index[token]
+        if 0 <= token < int(segment_count):
+            return token
+        return None
+
+    def token_to_index_index_first(token: int) -> Optional[int]:
+        token = int(token)
+        if 0 <= token < int(segment_count):
+            return token
+        return id_to_index.get(token)
+
+    # Prefer interpreting tokens as seg_id when possible (fixes common 1-based seg_id collisions).
+    parsed, reason = _parse_with(token_to_index_seg_id_first)
+    if parsed:
+        return parsed, reason
+
+    parsed, reason2 = _parse_with(token_to_index_index_first)
+    if parsed:
+        return parsed, reason2
+
+    return None, reason
 
 
 def validate_merged_partition(
     payload: Dict[str, Any],
     segment_count: int,
+    *,
+    segment_ids: Optional[List[int]] = None,
 ) -> Tuple[Optional[List[Tuple[int, int]]], str]:
     return validate_merged_ranges(
         payload,
         segment_count=segment_count,
         min_output_ratio=1.0 / float(max(1, segment_count)),
+        segment_ids=segment_ids,
     )
 
 
@@ -679,23 +744,6 @@ def _single_attempt_config(merge_config: LLMMergeConfig) -> LLMMergeConfig:
     return merge_config.model_copy(update={"max_attempts": 1})
 
 
-def _should_skip_live_summary_after_merge(merge_diagnostics: Dict[str, Any]) -> bool:
-    if bool(merge_diagnostics.get("llm_merge_applied")):
-        return False
-
-    reason = str(merge_diagnostics.get("llm_merge_reason", "")).strip()
-    if not reason:
-        return False
-
-    if reason == "empty_response":
-        return True
-
-    if reason.startswith("request_failed:") or reason.startswith("backend_init_failed:"):
-        return True
-
-    return reason.startswith("responses_") or reason.startswith("chat_completions_")
-
-
 def _attach_export_subtitles(segments: List[dict], subtitles: List[str]) -> List[dict]:
     localized_segments: List[dict] = []
     for index, segment in enumerate(segments):
@@ -713,9 +761,29 @@ def _source_instruction_subtitles(segments: List[dict]) -> List[str]:
     ]
 
 
+def _segment_id_sequence(segments: List[dict]) -> List[int]:
+    """Return the seg_id tokens that prompts/payloads are expected to reference.
+
+    If seg_id values are missing, non-integer, or duplicated, fall back to positional indices.
+    """
+
+    ids: List[int] = []
+    for index, segment in enumerate(segments):
+        try:
+            ids.append(int(segment.get("seg_id", index)))
+        except (TypeError, ValueError):
+            ids.append(int(index))
+
+    if len(set(ids)) != len(ids):
+        return list(range(len(segments)))
+    return ids
+
+
 def validate_subtitle_payload(
     payload: Dict[str, Any],
     segment_count: int,
+    *,
+    segment_ids: Optional[List[int]] = None,
 ) -> Tuple[Optional[List[str]], str]:
     if not isinstance(payload, dict):
         return None, "invalid_payload"
@@ -724,20 +792,62 @@ def validate_subtitle_payload(
     if not isinstance(raw_subtitles, list) or len(raw_subtitles) != int(segment_count):
         return None, "invalid_subtitles"
 
-    subtitles: List[str] = []
-    for expected_seg_id, item in enumerate(raw_subtitles):
-        if not isinstance(item, dict):
-            return None, "invalid_subtitles"
-        try:
-            seg_id = int(item.get("seg_id"))
-        except (TypeError, ValueError):
-            return None, "invalid_subtitles"
-        subtitle = str(item.get("subtitle", "")).strip()
-        if seg_id != expected_seg_id or not subtitle:
-            return None, "invalid_subtitles"
-        subtitles.append(subtitle)
+    expected_ids = list(segment_ids) if isinstance(segment_ids, list) else list(range(int(segment_count)))
+    if len(expected_ids) != int(segment_count):
+        expected_ids = list(range(int(segment_count)))
 
-    return subtitles, "ok"
+    if len(set(expected_ids)) != len(expected_ids):
+        expected_ids = list(range(int(segment_count)))
+
+    id_to_index = {int(seg_id): index for index, seg_id in enumerate(expected_ids)}
+
+    def _build_with(token_to_index) -> Optional[List[str]]:
+        by_index: Dict[int, str] = {}
+        for item in raw_subtitles:
+            if not isinstance(item, dict):
+                return None
+            try:
+                token = int(item.get("seg_id"))
+            except (TypeError, ValueError):
+                return None
+            subtitle = str(item.get("subtitle", "")).strip()
+            if not subtitle:
+                return None
+
+            index = token_to_index(token)
+            if index is None or not (0 <= int(index) < int(segment_count)):
+                return None
+            if int(index) in by_index:
+                return None
+            by_index[int(index)] = subtitle
+
+        if len(by_index) != int(segment_count):
+            return None
+        return [by_index[i] for i in range(int(segment_count))]
+
+    def token_to_index_seg_id_first(token: int) -> Optional[int]:
+        token = int(token)
+        if token in id_to_index:
+            return id_to_index[token]
+        if 0 <= token < int(segment_count):
+            return token
+        return None
+
+    def token_to_index_index_first(token: int) -> Optional[int]:
+        token = int(token)
+        if 0 <= token < int(segment_count):
+            return token
+        return id_to_index.get(token)
+
+    subtitles = _build_with(token_to_index_seg_id_first)
+    if subtitles is not None:
+        return subtitles, "ok"
+
+    subtitles = _build_with(token_to_index_index_first)
+    if subtitles is not None:
+        return subtitles, "ok"
+
+    return None, "invalid_subtitles"
 
 
 def _summary_range_schema() -> Dict[str, Any]:
@@ -779,42 +889,81 @@ def _validate_summary_level_partition(
     *,
     level_name: str,
     segment_count: int,
+    segment_ids: List[int],
 ) -> Tuple[Optional[List[Dict[str, Any]]], str]:
     if not isinstance(raw_items, list) or not raw_items:
         return None, f"invalid_{level_name}_ranges"
 
-    normalized: List[Dict[str, Any]] = []
-    expected_start = 0
-    for item in raw_items:
-        if not isinstance(item, dict):
-            return None, f"invalid_{level_name}_ranges"
-        try:
-            start_seg_id = int(item.get("start_seg_id"))
-            end_seg_id = int(item.get("end_seg_id"))
-        except (TypeError, ValueError):
-            return None, f"invalid_{level_name}_ranges"
+    expected_ids = list(segment_ids)
+    if len(expected_ids) != int(segment_count) or len(set(expected_ids)) != len(expected_ids):
+        expected_ids = list(range(int(segment_count)))
 
-        summary = str(item.get("summary", "")).strip()
-        if not summary:
-            return None, f"invalid_{level_name}_summary"
-        if start_seg_id != expected_start:
-            return None, f"invalid_{level_name}_partition"
-        if start_seg_id < 0 or end_seg_id < start_seg_id or end_seg_id >= segment_count:
-            return None, f"invalid_{level_name}_partition"
+    id_to_index = {int(seg_id): index for index, seg_id in enumerate(expected_ids)}
 
-        normalized.append(
-            {
-                "start_seg_id": start_seg_id,
-                "end_seg_id": end_seg_id,
-                "summary": summary,
-            }
-        )
-        expected_start = end_seg_id + 1
+    def _parse_with(token_to_index) -> Tuple[Optional[List[Dict[str, Any]]], str]:
+        normalized: List[Dict[str, Any]] = []
+        expected_start_index = 0
 
-    if expected_start != segment_count:
-        return None, f"incomplete_{level_name}_partition"
+        for item in raw_items:
+            if not isinstance(item, dict):
+                return None, f"invalid_{level_name}_ranges"
+            try:
+                start_token = int(item.get("start_seg_id"))
+                end_token = int(item.get("end_seg_id"))
+            except (TypeError, ValueError):
+                return None, f"invalid_{level_name}_ranges"
 
-    return normalized, "ok"
+            summary = str(item.get("summary", "")).strip()
+            if not summary:
+                return None, f"invalid_{level_name}_summary"
+
+            start_index = token_to_index(start_token)
+            end_index = token_to_index(end_token)
+            if start_index is None or end_index is None:
+                return None, f"invalid_{level_name}_partition"
+
+            if start_index != expected_start_index:
+                return None, f"invalid_{level_name}_partition"
+            if start_index < 0 or end_index < start_index or end_index >= int(segment_count):
+                return None, f"invalid_{level_name}_partition"
+
+            normalized.append(
+                {
+                    "start_seg_id": int(start_index),
+                    "end_seg_id": int(end_index),
+                    "summary": summary,
+                }
+            )
+            expected_start_index = int(end_index) + 1
+
+        if expected_start_index != int(segment_count):
+            return None, f"incomplete_{level_name}_partition"
+
+        return normalized, "ok"
+
+    def token_to_index_seg_id_first(token: int) -> Optional[int]:
+        token = int(token)
+        if token in id_to_index:
+            return id_to_index[token]
+        if 0 <= token < int(segment_count):
+            return token
+        return None
+
+    def token_to_index_index_first(token: int) -> Optional[int]:
+        token = int(token)
+        if 0 <= token < int(segment_count):
+            return token
+        return id_to_index.get(token)
+
+    parsed, reason = _parse_with(token_to_index_seg_id_first)
+    if parsed:
+        return parsed, reason
+
+    parsed, reason2 = _parse_with(token_to_index_index_first)
+    if parsed:
+        return parsed, reason2
+
+    return None, reason
 
 
 def _ranges_are_nested(
@@ -839,9 +988,13 @@ def validate_summary_partitions(
     payload: Dict[str, Any],
     segment_count: int,
     enabled_level_names: List[str],
+    *,
+    segment_ids: Optional[List[int]] = None,
 ) -> Tuple[Optional[Dict[str, List[Dict[str, Any]]]], str]:
     if not isinstance(payload, dict):
         return None, "invalid_payload"
+
+    expected_ids = list(segment_ids) if isinstance(segment_ids, list) else list(range(int(segment_count)))
 
     normalized: Dict[str, List[Dict[str, Any]]] = {}
     for level_name in enabled_level_names:
@@ -849,6 +1002,7 @@ def validate_summary_partitions(
             payload.get(level_name),
             level_name=level_name,
             segment_count=segment_count,
+            segment_ids=expected_ids,
         )
         if not partition:
             return None, reason
@@ -867,8 +1021,8 @@ def _identity_summary_partitions(
 ) -> Dict[str, List[Dict[str, Any]]]:
     finest_partition = [
         {
-            "start_seg_id": int(segment.get("seg_id", index)),
-            "end_seg_id": int(segment.get("seg_id", index)),
+            "start_seg_id": int(index),
+            "end_seg_id": int(index),
             "summary": str(segment.get("instruction", "")).strip() or "Unknown task step",
         }
         for index, segment in enumerate(segments)
@@ -930,52 +1084,6 @@ def build_task_hierarchy(
     }
 
 
-def _build_identity_summary_fallback(
-    segments: List[dict],
-    merge_config: LLMMergeConfig,
-    *,
-    reason: str,
-    attempted: bool,
-) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    input_segments = [dict(segment) for segment in segments if isinstance(segment, dict)]
-    enabled_levels = [int(value) for value in merge_config.summary_levels]
-    enabled_level_names = _enabled_summary_level_names(enabled_levels)
-    input_count = len(input_segments)
-    diagnostics: Dict[str, Any] = {
-        "llm_summary_enabled": bool(merge_config.enabled and enabled_level_names),
-        "llm_summary_attempted": attempted,
-        "llm_summary_applied": False,
-        "llm_summary_fallback_used": False,
-        "llm_summary_reason": "disabled",
-        "llm_summary_model": str(merge_config.model),
-        "llm_summary_input_segment_count": input_count,
-        "llm_summary_levels": enabled_levels,
-        "llm_summary_enabled_level_names": enabled_level_names,
-    }
-
-    if not merge_config.enabled:
-        return None, diagnostics
-    if not enabled_level_names:
-        diagnostics["llm_summary_reason"] = "no_summary_levels_enabled"
-        return None, diagnostics
-    if input_count == 0:
-        diagnostics["llm_summary_reason"] = "empty_input"
-        return None, diagnostics
-
-    partitions = _identity_summary_partitions(input_segments, enabled_level_names)
-    hierarchy = build_task_hierarchy(input_segments, partitions, enabled_levels)
-    diagnostics["llm_summary_fallback_used"] = True
-    diagnostics["llm_summary_reason"] = reason
-    diagnostics["llm_summary_fallback_reason"] = reason
-    diagnostics["llm_summary_output_level_counts"] = {
-        level_name: len(partitions[level_name])
-        for level_name in hierarchy.get("enabled_level_names", [])
-    }
-    diagnostics["llm_summary_root_level"] = str(hierarchy.get("root_level", ""))
-    diagnostics["llm_summary_root_count"] = len(hierarchy.get("roots", []))
-    return hierarchy, diagnostics
-
-
 def _boundary_after_seg_ids_from_ranges(merged_ranges: List[Tuple[int, int]]) -> List[int]:
     return [int(end_seg_id) for _, end_seg_id in merged_ranges[:-1]]
 
@@ -1012,6 +1120,7 @@ def _build_merge_candidate(
     merged_ranges, validation_reason = validate_merged_partition(
         payload,
         segment_count=input_count,
+        segment_ids=_segment_id_sequence(input_segments),
     )
     if not merged_ranges:
         return None, validation_reason
@@ -1408,6 +1517,11 @@ def run_llm_summary_pass(
         "llm_summary_model": str(merge_config.model),
         "llm_summary_input_segment_count": input_count,
         "llm_summary_levels": enabled_levels,
+        "llm_summary_levels_named": {
+            "coarse": enabled_levels[0],
+            "medium": enabled_levels[1],
+            "fine": enabled_levels[2],
+        },
         "llm_summary_enabled_level_names": enabled_level_names,
     }
 
@@ -1500,6 +1614,7 @@ def run_llm_summary_pass(
         payload,
         segment_count=input_count,
         enabled_level_names=enabled_level_names,
+        segment_ids=_segment_id_sequence(input_segments),
     )
     if not partitions:
         return _apply_summary_output(
@@ -1530,9 +1645,13 @@ def run_export_subtitle_localization_pass(
 
     input_segments = [dict(segment) for segment in segments if isinstance(segment, dict)]
     input_count = len(input_segments)
-    normalized_language = str(target_language).strip().lower()
+    requested_language = _normalize_language_code(target_language)
+    output_language = "en"
     diagnostics: Dict[str, Any] = {
-        "export_subtitle_language": normalized_language,
+        "export_subtitle_requested_language": requested_language,
+        # Actual output language for segment["export_subtitle"].
+        "export_subtitle_language": output_language,
+        "export_subtitle_output_language": output_language,
         "export_subtitle_attempted": False,
         "export_subtitle_applied": False,
         "export_subtitle_fallback_used": False,
@@ -1542,15 +1661,19 @@ def run_export_subtitle_localization_pass(
     }
 
     source_subtitles = _source_instruction_subtitles(input_segments)
+    if not merge_config.enabled:
+        diagnostics["export_subtitle_reason"] = "disabled"
+        return _attach_export_subtitles(input_segments, source_subtitles), diagnostics
+
     if input_count == 0:
         diagnostics["export_subtitle_reason"] = "empty_input"
         return input_segments, diagnostics
 
-    if normalized_language == "en":
+    if requested_language == "en":
         diagnostics["export_subtitle_reason"] = "source_instruction_reused"
         return _attach_export_subtitles(input_segments, source_subtitles), diagnostics
 
-    if normalized_language != "zh":
+    if requested_language != "zh":
         diagnostics["export_subtitle_reason"] = "unsupported_language"
         diagnostics["export_subtitle_fallback_used"] = True
         return _attach_export_subtitles(input_segments, source_subtitles), diagnostics
@@ -1578,7 +1701,7 @@ def run_export_subtitle_localization_pass(
         return _attach_export_subtitles(input_segments, source_subtitles), diagnostics
 
     diagnostics["export_subtitle_attempted"] = True
-    prompt = prompt_segment_subtitles(input_segments, normalized_language)
+    prompt = prompt_segment_subtitles(input_segments, requested_language)
     subtitle_request_config = _single_attempt_config(merge_config)
     payload, request_reason, request_error, request_attempt_count, adapter_diagnostics_attempts = _request_structured_payload(
         resolved_backend,
@@ -1600,7 +1723,11 @@ def run_export_subtitle_localization_pass(
         return _attach_export_subtitles(input_segments, source_subtitles), diagnostics
 
     thought = str(payload.get("thought", "")).strip()
-    subtitles, validation_reason = validate_subtitle_payload(payload, input_count)
+    subtitles, validation_reason = validate_subtitle_payload(
+        payload,
+        input_count,
+        segment_ids=_segment_id_sequence(input_segments),
+    )
     if not subtitles:
         diagnostics["export_subtitle_reason"] = validation_reason
         diagnostics["export_subtitle_fallback_used"] = True
@@ -1609,6 +1736,9 @@ def run_export_subtitle_localization_pass(
         return _attach_export_subtitles(input_segments, source_subtitles), diagnostics
 
     diagnostics["export_subtitle_applied"] = True
+    output_language = "zh"
+    diagnostics["export_subtitle_language"] = output_language
+    diagnostics["export_subtitle_output_language"] = output_language
     diagnostics["export_subtitle_reason"] = "applied"
     if thought:
         diagnostics["export_subtitle_thought"] = thought
@@ -1621,6 +1751,18 @@ def run_llm_postprocess_pass(
     merge_config: LLMMergeConfig,
     backend: Any = None,
 ) -> Tuple[List[dict], Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Legacy Stage 2 API.
+
+    Returns:
+      - cleaned_segments: merge output (or original segments on merge failure)
+      - task_hierarchy: optional summary hierarchy
+      - diagnostics: merged diagnostics from merge + summary
+
+    Notes:
+      - Summary is independent from merge: merge failures do not suppress summary.
+      - Subtitle localization is intentionally not part of this legacy return shape.
+    """
+
     cleaned_segments, merge_diagnostics = run_llm_merge_pass(
         sample_id,
         segments,
@@ -1628,21 +1770,210 @@ def run_llm_postprocess_pass(
         backend=backend,
     )
 
-    if _should_skip_live_summary_after_merge(merge_diagnostics):
-        task_hierarchy, summary_diagnostics = _build_identity_summary_fallback(
-            cleaned_segments,
-            merge_config,
-            reason=f"skipped_after_merge_failure:{merge_diagnostics.get('llm_merge_reason', 'unknown')}",
-            attempted=False,
-        )
-    else:
-        task_hierarchy, summary_diagnostics = run_llm_summary_pass(
-            sample_id,
-            cleaned_segments,
-            merge_config,
-            backend=backend,
-        )
+    task_hierarchy, summary_diagnostics = run_llm_summary_pass(
+        sample_id,
+        cleaned_segments,
+        merge_config,
+        backend=backend,
+    )
 
     diagnostics = dict(merge_diagnostics)
     diagnostics.update(summary_diagnostics)
     return cleaned_segments, task_hierarchy, diagnostics
+
+
+def run_llm_subtitle_localization_pass(
+    sample_id: str,
+    segments: List[dict],
+    merge_config: LLMMergeConfig,
+    target_language: str,
+    backend: Any = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Stage 2 subtitle localization pass.
+
+    This is a Stage 2 artifact producer (independent of exporter). It returns a
+    stable, persistable list of subtitle items aligned to the provided segments.
+
+    Contract:
+      - `items[i]["seg_id"] == i` and `items[i]["subtitle"]` is non-empty.
+      - `source instruction` remains English; `language=en` reuses instructions.
+    """
+
+    del sample_id
+    input_segments = [dict(segment) for segment in segments if isinstance(segment, dict)]
+    input_count = len(input_segments)
+    requested_language = _normalize_language_code(target_language)
+    output_language = "en"
+    diagnostics: Dict[str, Any] = {
+        "llm_subtitle_requested_language": requested_language,
+        # Actual output language for items[].subtitle. Source instructions are always English.
+        "llm_subtitle_language": output_language,
+        "llm_subtitle_output_language": output_language,
+        "llm_subtitle_attempted": False,
+        "llm_subtitle_applied": False,
+        "llm_subtitle_fallback_used": False,
+        "llm_subtitle_reason": "disabled",
+        "llm_subtitle_model": str(merge_config.model),
+        "llm_subtitle_segment_count": input_count,
+    }
+
+    source_subtitles = _source_instruction_subtitles(input_segments)
+
+    def _items_from(subtitles: List[str]) -> List[Dict[str, Any]]:
+        return [
+            {"seg_id": int(index), "subtitle": str(subtitle).strip() or "Unknown task step"}
+            for index, subtitle in enumerate(subtitles)
+        ]
+
+    if not merge_config.enabled:
+        diagnostics["llm_subtitle_reason"] = "disabled"
+        return _items_from(source_subtitles), diagnostics
+
+    if input_count == 0:
+        diagnostics["llm_subtitle_reason"] = "empty_input"
+        return [], diagnostics
+
+    if requested_language == "en":
+        diagnostics["llm_subtitle_reason"] = "source_instruction_reused"
+        return _items_from(source_subtitles), diagnostics
+
+    if requested_language != "zh":
+        diagnostics["llm_subtitle_reason"] = "unsupported_language"
+        diagnostics["llm_subtitle_fallback_used"] = True
+        return _items_from(source_subtitles), diagnostics
+
+    if merge_config.backend != "openai":
+        diagnostics["llm_subtitle_reason"] = "unsupported_backend"
+        diagnostics["llm_subtitle_fallback_used"] = True
+        return _items_from(source_subtitles), diagnostics
+
+    try:
+        resolved_backend = backend or OpenAIBackend(
+            api_key=merge_config.api_key,
+            model=merge_config.model,
+            base_url=merge_config.base_url,
+            timeout_sec=merge_config.timeout_sec,
+            organization=merge_config.organization,
+            project=merge_config.project,
+            reasoning_effort=merge_config.reasoning_effort,
+            max_output_tokens=merge_config.max_output_tokens,
+        )
+    except Exception as exc:
+        diagnostics["llm_subtitle_reason"] = f"backend_init_failed:{type(exc).__name__}"
+        diagnostics["llm_subtitle_error"] = str(exc).strip() or type(exc).__name__
+        diagnostics["llm_subtitle_fallback_used"] = True
+        return _items_from(source_subtitles), diagnostics
+
+    diagnostics["llm_subtitle_attempted"] = True
+    prompt = prompt_segment_subtitles(input_segments, requested_language)
+    subtitle_request_config = _single_attempt_config(merge_config)
+    payload, request_reason, request_error, request_attempt_count, adapter_diagnostics_attempts = _request_structured_payload(
+        resolved_backend,
+        prompt,
+        subtitle_request_config,
+        schema_name="segment_subtitle_result",
+        schema=_SUBTITLE_RESULT_SCHEMA,
+    )
+    diagnostics["llm_subtitle_request_attempt_count"] = int(request_attempt_count)
+    if adapter_diagnostics_attempts:
+        diagnostics["llm_subtitle_adapter_diagnostics_attempts"] = adapter_diagnostics_attempts
+        diagnostics["llm_subtitle_adapter_diagnostics"] = copy.deepcopy(adapter_diagnostics_attempts[-1])
+
+    if not payload:
+        diagnostics["llm_subtitle_reason"] = request_reason
+        diagnostics["llm_subtitle_fallback_used"] = True
+        if request_error:
+            diagnostics["llm_subtitle_error"] = request_error
+        return _items_from(source_subtitles), diagnostics
+
+    thought = str(payload.get("thought", "")).strip()
+    subtitles, validation_reason = validate_subtitle_payload(
+        payload,
+        input_count,
+        segment_ids=_segment_id_sequence(input_segments),
+    )
+    if not subtitles:
+        diagnostics["llm_subtitle_reason"] = validation_reason
+        diagnostics["llm_subtitle_fallback_used"] = True
+        if thought:
+            diagnostics["llm_subtitle_thought"] = thought
+        return _items_from(source_subtitles), diagnostics
+
+    diagnostics["llm_subtitle_applied"] = True
+    output_language = "zh"
+    diagnostics["llm_subtitle_language"] = output_language
+    diagnostics["llm_subtitle_output_language"] = output_language
+    diagnostics["llm_subtitle_reason"] = "applied"
+    if thought:
+        diagnostics["llm_subtitle_thought"] = thought
+    return _items_from(subtitles), diagnostics
+
+
+def run_llm_stage2_pass(
+    sample_id: str,
+    segments: List[dict],
+    merge_config: LLMMergeConfig,
+    *,
+    target_language: str = "en",
+    backend: Any = None,
+) -> Dict[str, Any]:
+    """Stable Stage 2 artifact envelope.
+
+    This is the module-side contract intended for app integration: it cleanly
+    separates merge / summary / subtitle artifacts with independent diagnostics.
+
+    Output is JSON-serializable by construction.
+    """
+
+    cleaned_segments, merge_diagnostics = run_llm_merge_pass(
+        sample_id,
+        segments,
+        merge_config,
+        backend=backend,
+    )
+
+    task_hierarchy, summary_diagnostics = run_llm_summary_pass(
+        sample_id,
+        cleaned_segments,
+        merge_config,
+        backend=backend,
+    )
+
+    subtitle_items, subtitle_diagnostics = run_llm_subtitle_localization_pass(
+        sample_id,
+        cleaned_segments,
+        merge_config,
+        target_language=target_language,
+        backend=backend,
+    )
+
+    requested_language = _normalize_language_code(target_language)
+    output_language = str(subtitle_diagnostics.get("llm_subtitle_language", "en")).strip().lower()
+    if output_language not in ("en", "zh"):
+        output_language = "en"
+    return {
+        "stage": "stage2",
+        "version": 2,
+        "merge": {
+            "applied": bool(merge_diagnostics.get("llm_merge_applied", False)),
+            "segments": cleaned_segments,
+            "diagnostics": merge_diagnostics,
+        },
+        "summary": {
+            "applied": bool(summary_diagnostics.get("llm_summary_applied", False)),
+            "hierarchy": task_hierarchy,
+            "diagnostics": summary_diagnostics,
+        },
+        "subtitles": {
+            # Requested language is what the caller asked for (canonicalized).
+            "requested_language": requested_language,
+            "target_language": requested_language,
+            # language/output_language always describe items[].subtitle.
+            "language": output_language,
+            "output_language": output_language,
+            "source_instruction_language": "en",
+            "applied": bool(subtitle_diagnostics.get("llm_subtitle_applied", False)),
+            "items": subtitle_items,
+            "diagnostics": subtitle_diagnostics,
+        },
+    }

@@ -5,15 +5,15 @@ import json
 import time
 import glob
 import threading
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastapi import FastAPI
-from pydantic import BaseModel, Field
+from fastapi import Body, FastAPI, HTTPException
 import uvicorn
 
 from ..config import Config, DatasetConfig
+from ..logging_utils import configure_logging, get_logger
 from ..prompt import boundary_refinement_candidate_positions
 from .windowing import (
     read_video_info, build_windows, FrameExtractor,
@@ -24,18 +24,20 @@ from .windowing import (
 )
 from .exporter import export_sample_outputs
 from .llm_merge import run_export_subtitle_localization_pass, run_llm_postprocess_pass
+from .run_manifest import ensure_run_manifest, run_manifest_path
+from .protocol import (
+    InlineImageTransport,
+    JobEnvelope,
+    ProtocolValidationError,
+    ResultEnvelope,
+    SharedFSImageTransport,
+)
+from .runtime import ThreadRuntime
 from .task_artifacts import TaskArtifactWriter
 from ..vlm.base import normalize_task_window_result
 
 
-class SubmitModel(BaseModel):
-    """Model for job result submission."""
-    task_id: str
-    dispatch_id: str = ""
-    vlm_output: str = ""
-    vlm_json: Dict[str, Any] = Field(default_factory=dict)
-    latency_s: float = 0.0
-    meta: Dict[str, Any] = Field(default_factory=dict)
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -46,6 +48,7 @@ class DatasetCtx:
     data_dir: str
     run_dir: str
     samples_dir: str
+    run_dir_nonempty_before_prepare: bool
     sample_ids: List[str]
 
 
@@ -55,6 +58,7 @@ def parse_datasets(config: Config) -> List[DatasetCtx]:
     for ds in config.datasets:
         data_dir = Path(ds.root) / ds.subset
         run_dir = Path(config.run.base_dir) / ds.subset / config.run.run_id
+        run_dir_nonempty_before_prepare = run_dir.exists() and any(run_dir.iterdir())
         samples_dir = run_dir / "samples"
         samples_dir.mkdir(parents=True, exist_ok=True)
         
@@ -70,16 +74,17 @@ def parse_datasets(config: Config) -> List[DatasetCtx]:
             data_dir=str(data_dir),
             run_dir=str(run_dir),
             samples_dir=str(samples_dir),
+            run_dir_nonempty_before_prepare=run_dir_nonempty_before_prepare,
             sample_ids=sample_ids
         ))
     return ctxs
 
 
 def _requeue_empty_result(
-    job_queue: List[Dict[str, Any]],
+    job_queue: List[Any],
     retry_counts: Dict[str, int],
     task_id: str,
-    job: Optional[Dict[str, Any]],
+    job: Optional[Any],
     max_retries_per_job: int = 0,
 ) -> tuple[int, bool]:
     if not job:
@@ -92,6 +97,38 @@ def _requeue_empty_result(
 
     job_queue.append(job)
     return attempt, True
+
+
+def _job_payload_task_id(job: Any) -> str:
+    if isinstance(job, JobEnvelope):
+        return job.task_id
+    if isinstance(job, dict):
+        return str(job.get("task_id", "")).strip()
+    return ""
+
+
+
+def _job_payload_meta(job: Any) -> Dict[str, Any]:
+    if isinstance(job, JobEnvelope):
+        return dict(job.meta)
+    if isinstance(job, dict):
+        raw_meta = job.get("meta", {})
+        if isinstance(raw_meta, dict):
+            return dict(raw_meta)
+    return {}
+
+
+
+def _coerce_job_envelope(job: Any) -> JobEnvelope:
+    if isinstance(job, JobEnvelope):
+        return job
+    return JobEnvelope.parse_payload(job)
+
+
+
+def _job_queue_contains_task_id(job_queue: List[Any], task_id: str) -> bool:
+    return any(_job_payload_task_id(job) == task_id for job in job_queue)
+
 
 
 def _logical_frame_count_from_meta(meta: Dict[str, Any]) -> Optional[int]:
@@ -111,8 +148,96 @@ def _logical_frame_count_from_meta(meta: Dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _merge_result_meta(authoritative_meta: Dict[str, Any], worker_meta: Dict[str, Any], dispatch_id: str) -> Dict[str, Any]:
+    merged = dict(authoritative_meta)
+    for key, value in worker_meta.items():
+        if key not in merged:
+            merged[key] = value
+    merged["dispatch_id"] = dispatch_id
+    return merged
+
+
+
+def _clone_shared_fs_transport(transport: SharedFSImageTransport) -> SharedFSImageTransport:
+    return SharedFSImageTransport(
+        image_paths=list(transport.image_paths),
+        artifact_manifest_path=transport.artifact_manifest_path,
+    )
+
+
+
+def _repeat_artifact_reuse_key(
+    *,
+    meta: Dict[str, Any],
+    frame_ids: List[int],
+    artifact_image_kind: str,
+    target_width: int,
+    target_height: int,
+    png_compression: int,
+    use_contact_sheets: bool,
+    contact_sheet_rows: int,
+    contact_sheet_cols: int,
+) -> Optional[Tuple[Any, ...]]:
+    if not use_contact_sheets:
+        return None
+
+    window_id = meta.get("window_id")
+    if window_id is None:
+        return None
+
+    try:
+        normalized_window_id = int(window_id)
+    except (TypeError, ValueError):
+        return None
+
+    return (
+        str(meta.get("subset", "")),
+        str(meta.get("sample_id", "")),
+        str(meta.get("job_type", "")),
+        str(meta.get("window_pass", "coarse") or "coarse"),
+        normalized_window_id,
+        tuple(int(frame_id) for frame_id in frame_ids),
+        str(artifact_image_kind),
+        int(target_width),
+        int(target_height),
+        int(png_compression),
+        int(contact_sheet_rows),
+        int(contact_sheet_cols),
+    )
+
+
+
+def _normalize_submitted_vlm_json(vlm_json: Dict[str, Any], authoritative_meta: Dict[str, Any]) -> Dict[str, Any]:
+    logical_frame_count = _logical_frame_count_from_meta(authoritative_meta)
+    max_transition_index = (logical_frame_count - 1) if logical_frame_count and logical_frame_count > 0 else None
+
+    allowed_transition_indices = None
+    if str(authoritative_meta.get("job_type", "window_boundary")) == "boundary_refinement":
+        if logical_frame_count and logical_frame_count > 0:
+            allowed_transition_indices = boundary_refinement_candidate_positions(logical_frame_count)
+
+    return normalize_task_window_result(
+        vlm_json,
+        max_transition_index=max_transition_index,
+        allowed_transition_indices=allowed_transition_indices,
+    )
+
+
+
+def _logical_frame_count_from_record(record: Dict[str, Any]) -> Optional[int]:
+    if not isinstance(record, dict):
+        return None
+
+    logical_frame_count = _logical_frame_count_from_meta(record)
+    if logical_frame_count and logical_frame_count > 0:
+        return logical_frame_count
+
+    return _logical_frame_count_from_meta(record.get("meta", {}))
+
+
+
 def _normalize_loaded_window_vlm_json(record: Dict[str, Any]) -> Dict[str, Any]:
-    logical_frame_count = _logical_frame_count_from_meta(record.get("meta", {}))
+    logical_frame_count = _logical_frame_count_from_record(record)
     max_transition_index = (logical_frame_count - 1) if logical_frame_count and logical_frame_count > 0 else None
     return normalize_task_window_result(
         record.get("vlm_json", {}),
@@ -125,7 +250,7 @@ def _normalize_loaded_boundary_refinement_vlm_json(record: Dict[str, Any]) -> Di
     if isinstance(frame_ids, list) and frame_ids:
         logical_frame_count = len(frame_ids)
     else:
-        logical_frame_count = _logical_frame_count_from_meta(record.get("meta", {}))
+        logical_frame_count = _logical_frame_count_from_record(record)
 
     max_transition_index = (logical_frame_count - 1) if logical_frame_count and logical_frame_count > 0 else None
     allowed_transition_indices = (
@@ -155,6 +280,7 @@ def _final_exit_code(states: Dict[str, Dict[str, Any]]) -> int:
 
 def create_app(config: Config) -> FastAPI:
     """Create and configure FastAPI application."""
+    configure_logging(config.logging.level)
     app = FastAPI(title="Video2Tasks Server")
     
     # Initialize dataset contexts
@@ -164,14 +290,37 @@ def create_app(config: Config) -> FastAPI:
     
     # Thread-safe job management
     queue_lock = threading.Lock()
-    job_queue: List[Dict[str, Any]] = []
+    job_queue: List[Any] = []
     inflight: Dict[str, Dict[str, Any]] = {}
     timeout_retry_counts: Dict[str, int] = {}
     empty_retry_counts: Dict[str, int] = {}
     dispatch_counts: Dict[str, int] = {}
     completed_dispatch_ids: Dict[str, str] = {}
+    step_a_repeat_artifact_reuse_caches: Dict[
+        Tuple[str, str],
+        Dict[Tuple[Any, ...], SharedFSImageTransport],
+    ] = {}
     artifact_root_dir = os.getenv("VIDEO2TASKS_TMP_DIR", "tmp").strip() or "tmp"
     task_artifact_writer = TaskArtifactWriter(root_dir=artifact_root_dir)
+    run_manifest_paths: Dict[str, str] = {}
+    run_manifest_status_by_subset: Dict[str, Dict[str, Any]] = {}
+
+    for ctx in dataset_ctxs:
+        manifest_status = ensure_run_manifest(
+            run_dir=ctx.run_dir,
+            subset=ctx.subset,
+            data_root=ctx.data_root,
+            config=config,
+            force_resume=bool(config.run.force_resume),
+            run_dir_nonempty_before_start=bool(ctx.run_dir_nonempty_before_prepare),
+        )
+        run_manifest_paths[ctx.subset] = str(run_manifest_path(ctx.run_dir))
+        run_manifest_status_by_subset[ctx.subset] = manifest_status.model_dump(mode="json")
+        if manifest_status.resume.force_resume and manifest_status.resume.mismatch_fields:
+            logger.warning(
+                f"[Resume-Override] subset={ctx.subset} action={manifest_status.action} "
+                f"mismatches={manifest_status.resume.mismatch_fields}"
+            )
     
     # Per-sample locks
     _sample_locks: Dict[str, threading.Lock] = {}
@@ -427,6 +576,57 @@ def create_app(config: Config) -> FastAPI:
             with open(failure_report_path(samples_dir, sample_id), "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
 
+    def _clear_sample_jobs(subset: str, sample_id: str) -> None:
+        removed_task_ids: set[str] = set()
+        with queue_lock:
+            retained_jobs: List[Any] = []
+            for job in job_queue:
+                meta = _job_payload_meta(job)
+                if str(meta.get("subset", "")) == subset and str(meta.get("sample_id", "")) == sample_id:
+                    task_id = _job_payload_task_id(job)
+                    if task_id:
+                        removed_task_ids.add(task_id)
+                    continue
+                retained_jobs.append(job)
+            if len(retained_jobs) != len(job_queue):
+                job_queue[:] = retained_jobs
+
+            inflight_task_ids = [
+                str(task_id)
+                for task_id, info in inflight.items()
+                if str(_job_payload_meta(info.get("job")).get("subset", "")) == subset
+                and str(_job_payload_meta(info.get("job")).get("sample_id", "")) == sample_id
+            ]
+            for task_id in inflight_task_ids:
+                inflight.pop(task_id, None)
+                removed_task_ids.add(task_id)
+
+            for task_id in removed_task_ids:
+                timeout_retry_counts.pop(task_id, None)
+                empty_retry_counts.pop(task_id, None)
+                dispatch_counts.pop(task_id, None)
+                completed_dispatch_ids.pop(task_id, None)
+
+    def _clear_step_a_repeat_artifact_reuse_cache(subset: str, sample_id: str) -> None:
+        step_a_repeat_artifact_reuse_caches.pop((subset, sample_id), None)
+
+    def _fail_sample(
+        state: Dict[str, Any],
+        subset: str,
+        sample_id: str,
+        reason: str,
+        details: Optional[Dict[str, Any]] = None,
+        *,
+        log_message: str = "",
+    ) -> None:
+        _clear_sample_jobs(subset, sample_id)
+        _clear_step_a_repeat_artifact_reuse_cache(subset, sample_id)
+        _persist_sample_failure(subset, sample_id, reason, details)
+        state["sample_status"][sample_id] = 4
+        state["cur_idx"] += 1
+        if log_message:
+            logger.error(log_message)
+
     def _mark_task_terminal_failure(
         task_id: str,
         dispatch_id: str,
@@ -453,7 +653,28 @@ def create_app(config: Config) -> FastAPI:
         frame_ids: List[int],
         meta: Dict[str, Any],
         artifact_image_kind: str,
-    ) -> Dict[str, Any]:
+        repeat_artifact_reuse_cache: Optional[Dict[Tuple[Any, ...], SharedFSImageTransport]] = None,
+    ) -> JobEnvelope:
+        cache_key = _repeat_artifact_reuse_key(
+            meta=meta,
+            frame_ids=frame_ids,
+            artifact_image_kind=artifact_image_kind,
+            target_width=config.windowing.target_width,
+            target_height=config.windowing.target_height,
+            png_compression=config.windowing.png_compression,
+            use_contact_sheets=config.windowing.use_contact_sheets,
+            contact_sheet_rows=config.windowing.contact_sheet_rows,
+            contact_sheet_cols=config.windowing.contact_sheet_cols,
+        )
+        if repeat_artifact_reuse_cache is not None and cache_key is not None:
+            cached_transport = repeat_artifact_reuse_cache.get(cache_key)
+            if cached_transport is not None:
+                return JobEnvelope(
+                    task_id=task_id,
+                    meta=dict(meta),
+                    image_transport=_clone_shared_fs_transport(cached_transport),
+                )
+
         images, artifact_batch = extractor.get_many_b64_with_artifacts(
             frame_ids,
             config.windowing.target_width,
@@ -466,16 +687,20 @@ def create_app(config: Config) -> FastAPI:
             artifact_image_kind=artifact_image_kind,
             return_images=getattr(extractor, "artifact_writer", None) is None,
         )
-        job = {
-            "task_id": task_id,
-            "meta": dict(meta),
-        }
         if artifact_batch is not None and artifact_batch.records:
-            job["image_paths"] = [record.path for record in artifact_batch.records]
-            job["artifact_manifest_path"] = artifact_batch.manifest_path
+            image_transport = SharedFSImageTransport(
+                image_paths=[record.path for record in artifact_batch.records],
+                artifact_manifest_path=artifact_batch.manifest_path,
+            )
+            if repeat_artifact_reuse_cache is not None and cache_key is not None:
+                repeat_artifact_reuse_cache.setdefault(cache_key, _clone_shared_fs_transport(image_transport))
         else:
-            job["images"] = images
-        return job
+            image_transport = InlineImageTransport(images=images)
+        return JobEnvelope(
+            task_id=task_id,
+            meta=dict(meta),
+            image_transport=image_transport,
+        )
 
     app.state.job_queue = job_queue
     app.state.inflight = inflight
@@ -485,28 +710,35 @@ def create_app(config: Config) -> FastAPI:
     app.state.completed_dispatch_ids = completed_dispatch_ids
     app.state.task_artifact_writer = task_artifact_writer
     app.state.samples_dir_by_subset = samples_dir_by_subset
+    app.state.run_manifest_paths = run_manifest_paths
+    app.state.run_manifest_status_by_subset = run_manifest_status_by_subset
 
     @app.get("/get_job")
     def get_job() -> Dict[str, Any]:
         with queue_lock:
             if not job_queue:
                 return {"status": "empty"}
-            base_job = job_queue.pop(0)
-            task_id = str(base_job["task_id"])
+            base_job_payload = job_queue.pop(0)
+            try:
+                base_job = _coerce_job_envelope(base_job_payload)
+            except ProtocolValidationError as exc:
+                raise HTTPException(status_code=500, detail=f"invalid queued job payload: {exc}") from exc
+            task_id = base_job.task_id
             dispatch_counts[task_id] = dispatch_counts.get(task_id, 0) + 1
             dispatch_id = f"d{dispatch_counts[task_id]}"
-            job_meta = dict(base_job.get("meta", {}))
-            job_meta["dispatch_id"] = dispatch_id
-            dispatched_job = dict(base_job)
-            dispatched_job["dispatch_id"] = dispatch_id
-            dispatched_job["meta"] = job_meta
+            dispatched_job = base_job.with_dispatch(dispatch_id)
             inflight[task_id] = {"ts": time.time(), "job": base_job, "dispatch_id": dispatch_id}
-            return {"status": "ok", "data": dispatched_job}
+            return {"status": "ok", "data": dispatched_job.model_dump_payload()}
     
     @app.post("/submit_result")
-    def submit_result(res: SubmitModel) -> Dict[str, str]:
+    def submit_result(payload: Dict[str, Any] = Body(...)) -> Dict[str, str]:
+        try:
+            res = ResultEnvelope.parse_payload(payload)
+        except ProtocolValidationError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
         tid = res.task_id
-        dispatch_id = str(res.dispatch_id or res.meta.get("dispatch_id", "")).strip()
+        dispatch_id = res.resolved_dispatch_id
 
         with queue_lock:
             accepted_dispatch_id = completed_dispatch_ids.get(tid)
@@ -524,19 +756,11 @@ def create_app(config: Config) -> FastAPI:
 
             job_info = inflight.pop(tid)
 
-        result_meta = dict(job_info["job"].get("meta", {}))
-        result_meta.update(dict(res.meta))
-        result_meta["dispatch_id"] = dispatch_id
-
-        logical_frame_count = int(result_meta.get("logical_frame_count") or 0)
-        if logical_frame_count <= 0:
-            frame_ids = result_meta.get("frame_ids", [])
-            if isinstance(frame_ids, list) and frame_ids:
-                logical_frame_count = len(frame_ids)
-        max_transition_index = max(0, logical_frame_count - 1) if logical_frame_count > 0 else None
-        normalized_vlm_json = normalize_task_window_result(
+        authoritative_meta = _job_payload_meta(job_info["job"])
+        result_meta = _merge_result_meta(authoritative_meta, dict(res.meta), dispatch_id)
+        normalized_vlm_json = _normalize_submitted_vlm_json(
             res.vlm_json,
-            max_transition_index=max_transition_index,
+            authoritative_meta,
         )
 
         if not normalized_vlm_json:
@@ -551,13 +775,13 @@ def create_app(config: Config) -> FastAPI:
                 limit = config.server.max_empty_retries_per_job
                 limit_label = "inf" if limit <= 0 else str(limit)
                 if requeued:
-                    print(
+                    logger.warning(
                         f"[Warn] Task {tid} empty or invalid, re-queueing to tail "
                         f"(empty attempt {attempt}/{limit_label})"
                     )
                     return {"status": "retry_triggered"}
 
-            print(
+            logger.error(
                 f"[Err] Task {tid} empty or invalid retry budget exhausted "
                 f"(empty attempt {attempt}/{limit_label}); recording terminal empty result"
             )
@@ -582,7 +806,7 @@ def create_app(config: Config) -> FastAPI:
         return {"status": "ok"}
     
     # Producer loop
-    def producer_loop():
+    def producer_loop(stop_event: threading.Event):
         # Compute progress totals
         total = sum(len(ctx.sample_ids) for ctx in dataset_ctxs)
         progress_total = config.progress.total_override if config.progress.total_override > 0 else total
@@ -593,7 +817,7 @@ def create_app(config: Config) -> FastAPI:
                 if Path(done_marker_path(ctx.samples_dir, sid)).exists():
                     done += 1
         
-        print(
+        logger.info(
             f"[Server] Started. IMG=PNG, "
             f"FIXED={config.windowing.target_width}x{config.windowing.target_height}, "
             f"FRAMES_PER_WINDOW={config.windowing.frames_per_window}\n"
@@ -612,7 +836,7 @@ def create_app(config: Config) -> FastAPI:
         dataset_idx = 0
         global_done = done
         
-        while True:
+        while not stop_event.is_set():
             # Check inflight timeouts
             now = time.time()
             exhausted_timeouts: List[tuple[str, str, Dict[str, Any], int, str]] = []
@@ -631,15 +855,15 @@ def create_app(config: Config) -> FastAPI:
                     limit_label = "inf" if limit <= 0 else str(limit)
                     if limit <= 0 or attempt <= limit:
                         job_queue.append(job)
-                        print(
+                        logger.warning(
                             f"[Warn] Task {tid} timed out, re-queueing to tail "
                             f"(timeout attempt {attempt}/{limit_label})"
                         )
                     else:
-                        exhausted_timeouts.append((tid, dispatch_id, dict(job.get("meta", {})), attempt, limit_label))
+                        exhausted_timeouts.append((tid, dispatch_id, _job_payload_meta(job), attempt, limit_label))
 
             for tid, dispatch_id, meta, attempt, limit_label in exhausted_timeouts:
-                print(
+                logger.error(
                     f"[Err] Task {tid} timed out and exhausted retry budget "
                     f"(timeout attempt {attempt}/{limit_label}); recording terminal timeout result"
                 )
@@ -656,14 +880,15 @@ def create_app(config: Config) -> FastAPI:
                     failed_samples = _count_failed_samples(states)
                     exit_code = _final_exit_code(states)
                     if failed_samples:
-                        print(
+                        logger.warning(
                             f"[All Done] {global_done}/{progress_total} succeeded, "
                             f"{failed_samples} failed. Exiting with code {exit_code}."
                         )
                     else:
-                        print(f"[All Done] {global_done}/{progress_total}. Exiting.")
+                        logger.info(f"[All Done] {global_done}/{progress_total}. Exiting.")
                     os._exit(exit_code)
-                time.sleep(1.0)
+                if stop_event.wait(1.0):
+                    break
                 continue
             
             ctx = dataset_ctxs[dataset_idx]
@@ -676,9 +901,10 @@ def create_app(config: Config) -> FastAPI:
             if cur_idx >= len(sample_ids):
                 with queue_lock:
                     if not job_queue and not inflight:
-                        print(f"[Dataset] Completed {ctx.subset}. Switching to next...")
+                        logger.info(f"[Dataset] Completed {ctx.subset}. Switching to next...")
                         dataset_idx += 1
-                time.sleep(0.2)
+                if stop_event.wait(0.2):
+                    break
                 continue
             
             # Produce jobs if queue not full
@@ -691,12 +917,14 @@ def create_app(config: Config) -> FastAPI:
                 
                 # Skip if already done
                 if Path(done_marker_path(ctx.samples_dir, sid)).exists():
+                    _clear_step_a_repeat_artifact_reuse_cache(ctx.subset, sid)
                     sample_status[sid] = 3
                     st["cur_idx"] += 1
                     time.sleep(0.01)
                     continue
 
                 if Path(failed_marker_path(ctx.samples_dir, sid)).exists():
+                    _clear_step_a_repeat_artifact_reuse_cache(ctx.subset, sid)
                     sample_status[sid] = 4
                     st["cur_idx"] += 1
                     time.sleep(0.01)
@@ -705,7 +933,17 @@ def create_app(config: Config) -> FastAPI:
                 # Find video
                 mp4s = list(s_dir.glob("Frame_*.mp4"))
                 if not mp4s:
-                    st["cur_idx"] += 1
+                    _fail_sample(
+                        st,
+                        ctx.subset,
+                        sid,
+                        "missing_input_video",
+                        {
+                            "sample_dir": str(s_dir),
+                            "expected_glob": "Frame_*.mp4",
+                        },
+                        log_message=f"[Fail] {ctx.subset}/{sid}: missing Frame_*.mp4 input",
+                    )
                     time.sleep(0.01)
                     continue
                 mp4 = str(mp4s[0])
@@ -726,7 +964,8 @@ def create_app(config: Config) -> FastAPI:
                         # Load completed windows
                         window_results, failed_window_results = load_window_results(ctx.samples_dir, sid)
                         if failed_window_results:
-                            _persist_sample_failure(
+                            _fail_sample(
+                                st,
                                 ctx.subset,
                                 sid,
                                 "window_boundary_failed",
@@ -737,15 +976,17 @@ def create_app(config: Config) -> FastAPI:
                                         for wid, record in sorted(failed_window_results.items())
                                     },
                                 },
+                                log_message=f"[Fail] {ctx.subset}/{sid}: terminal window failure before finalize",
                             )
-                            sample_status[sid] = 4
-                            st["cur_idx"] += 1
-                            print(f"[Fail] {ctx.subset}/{sid}: terminal window failure before finalize")
                             time.sleep(0.01)
                             continue
 
                         done_wids = _completed_window_ids(window_results)
                         repeat_target = max(1, int(config.windowing.window_repeat_count))
+                        repeat_artifact_reuse_cache = step_a_repeat_artifact_reuse_caches.setdefault(
+                            (ctx.subset, sid),
+                            {},
+                        )
 
                         with FrameExtractor(mp4, artifact_writer=task_artifact_writer) as extractor:
                             cnt = 0
@@ -766,7 +1007,7 @@ def create_app(config: Config) -> FastAPI:
 
                                     active = False
                                     with queue_lock:
-                                        if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
+                                        if _job_queue_contains_task_id(job_queue, tid) or tid in inflight:
                                             active = True
 
                                     if active:
@@ -799,6 +1040,7 @@ def create_app(config: Config) -> FastAPI:
                                             "window_contact_sheet"
                                             if config.windowing.use_contact_sheets else "window_frame"
                                         ),
+                                        repeat_artifact_reuse_cache=repeat_artifact_reuse_cache,
                                     )
 
                                     with queue_lock:
@@ -812,13 +1054,23 @@ def create_app(config: Config) -> FastAPI:
                                     break
                         
                         if cnt == 0 and _all_windows_completed(windows, window_results):
+                            _clear_step_a_repeat_artifact_reuse_cache(ctx.subset, sid)
                             sample_status[sid] = 2
                     
                     except Exception as e:
-                        print(f"[Err] {ctx.subset}/{sid}: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        st["cur_idx"] += 1
+                        logger.exception(f"[Err] {ctx.subset}/{sid}: {e}")
+                        _fail_sample(
+                            st,
+                            ctx.subset,
+                            sid,
+                            "step_a_exception",
+                            {
+                                "phase": "step_a",
+                                "error": str(e).strip() or type(e).__name__,
+                                "exception_type": type(e).__name__,
+                            },
+                            log_message=f"[Fail] {ctx.subset}/{sid}: Step A crashed",
+                        )
                 
                 # Step B: Finalize
                 if sample_status[sid] == 2:
@@ -833,7 +1085,8 @@ def create_app(config: Config) -> FastAPI:
                         
                         by_wid, failed_window_results = load_window_results(ctx.samples_dir, sid)
                         if failed_window_results:
-                            _persist_sample_failure(
+                            _fail_sample(
+                                st,
                                 ctx.subset,
                                 sid,
                                 "window_boundary_failed",
@@ -844,10 +1097,8 @@ def create_app(config: Config) -> FastAPI:
                                         for wid, record in sorted(failed_window_results.items())
                                     },
                                 },
+                                log_message=f"[Fail] {ctx.subset}/{sid}: terminal window failure blocks finalize",
                             )
-                            sample_status[sid] = 4
-                            st["cur_idx"] += 1
-                            print(f"[Fail] {ctx.subset}/{sid}: terminal window failure blocks finalize")
                             time.sleep(0.01)
                             continue
 
@@ -866,32 +1117,6 @@ def create_app(config: Config) -> FastAPI:
                                     refinement_frames,
                                 )
                                 if refinement_windows:
-                                    failed_refinement = [
-                                        refinement_window
-                                        for refinement_window in refinement_windows
-                                        if refinement_window.window_id in failed_window_results
-                                    ]
-                                    if failed_refinement:
-                                        _persist_sample_failure(
-                                            ctx.subset,
-                                            sid,
-                                            "refinement_window_failed",
-                                            {
-                                                "failed_window_ids": [int(window.window_id) for window in failed_refinement],
-                                                "errors": {
-                                                    str(window.window_id): str(
-                                                        failed_window_results.get(window.window_id, {}).get("terminal_error", "unknown")
-                                                    )
-                                                    for window in failed_refinement
-                                                },
-                                            },
-                                        )
-                                        sample_status[sid] = 4
-                                        st["cur_idx"] += 1
-                                        print(f"[Fail] {ctx.subset}/{sid}: terminal refinement window failure blocks finalize")
-                                        time.sleep(0.01)
-                                        continue
-
                                     completed_refinement = _completed_window_ids(by_wid)
                                     missing_refinement = [
                                         refinement_window
@@ -915,7 +1140,7 @@ def create_app(config: Config) -> FastAPI:
                                                     tid = f"{ctx.subset}::{sid}_rw{refinement_window.window_id}_r{repeat_index}"
                                                     active = False
                                                     with queue_lock:
-                                                        if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
+                                                        if _job_queue_contains_task_id(job_queue, tid) or tid in inflight:
                                                             active = True
 
                                                     if active:
@@ -969,7 +1194,7 @@ def create_app(config: Config) -> FastAPI:
                                         time.sleep(0.05)
                                         continue
 
-                            print(f"[Finalize] {ctx.subset}/{sid}...")
+                            logger.info(f"[Finalize] {ctx.subset}/{sid}...")
 
                             provisional_res = build_segments_via_cuts(
                                 sid, windows + refinement_windows, by_wid, fps, nframes,
@@ -982,24 +1207,41 @@ def create_app(config: Config) -> FastAPI:
                                 refine_final_instructions=config.windowing.refine_final_instructions,
                             )
                             if not provisional_res.get("segments"):
-                                _persist_sample_failure(
+                                _fail_sample(
+                                    st,
                                     ctx.subset,
                                     sid,
                                     "finalize_empty_segments",
                                     {
+                                        "phase": "cuts",
                                         "window_count": len(windows),
                                         "completed_window_count": len(by_wid),
                                     },
+                                    log_message=f"[Fail] {ctx.subset}/{sid}: finalize produced no segments",
                                 )
-                                sample_status[sid] = 4
-                                st["cur_idx"] += 1
-                                print(f"[Fail] {ctx.subset}/{sid}: finalize produced no segments")
                                 time.sleep(0.01)
                                 continue
 
                             final_res = provisional_res
                             if config.windowing.enable_boundary_refinement:
                                 boundary_results, boundary_failures = load_boundary_refinement_results(ctx.samples_dir, sid)
+                                if boundary_failures:
+                                    _fail_sample(
+                                        st,
+                                        ctx.subset,
+                                        sid,
+                                        "boundary_refinement_failed",
+                                        {
+                                            "failed_boundary_ids": [int(boundary_id) for boundary_id in sorted(boundary_failures)],
+                                            "errors": {
+                                                str(boundary_id): str(record.get("terminal_error", "unknown"))
+                                                for boundary_id, record in sorted(boundary_failures.items())
+                                            },
+                                        },
+                                        log_message=f"[Fail] {ctx.subset}/{sid}: terminal boundary refinement failure blocks finalize",
+                                    )
+                                    time.sleep(0.01)
+                                    continue
                                 boundary_refinement_frames = (
                                     config.windowing.boundary_refinement_frames_per_window
                                     or config.windowing.frames_per_window
@@ -1026,7 +1268,7 @@ def create_app(config: Config) -> FastAPI:
                                             tid = f"{ctx.subset}::{sid}_b{boundary_id}"
                                             active = False
                                             with queue_lock:
-                                                if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
+                                                if _job_queue_contains_task_id(job_queue, tid) or tid in inflight:
                                                     active = True
 
                                             if active:
@@ -1097,6 +1339,23 @@ def create_app(config: Config) -> FastAPI:
 
                             if config.windowing.segment_labeling_mode == "deferred":
                                 label_results, label_failures = load_segment_label_results(ctx.samples_dir, sid)
+                                if label_failures:
+                                    _fail_sample(
+                                        st,
+                                        ctx.subset,
+                                        sid,
+                                        "segment_label_failed",
+                                        {
+                                            "failed_segment_ids": [int(segment_id) for segment_id in sorted(label_failures)],
+                                            "errors": {
+                                                str(segment_id): str(record.get("terminal_error", "unknown"))
+                                                for segment_id, record in sorted(label_failures.items())
+                                            },
+                                        },
+                                        log_message=f"[Fail] {ctx.subset}/{sid}: terminal deferred labeling failure blocks finalize",
+                                    )
+                                    time.sleep(0.01)
+                                    continue
                                 missing_segments = [
                                     segment
                                     for segment in final_res.get("segments", [])
@@ -1112,7 +1371,7 @@ def create_app(config: Config) -> FastAPI:
                                             tid = f"{ctx.subset}::{sid}_seg{seg_id}"
                                             active = False
                                             with queue_lock:
-                                                if any(j["task_id"] == tid for j in job_queue) or tid in inflight:
+                                                if _job_queue_contains_task_id(job_queue, tid) or tid in inflight:
                                                     active = True
 
                                             if active:
@@ -1193,33 +1452,40 @@ def create_app(config: Config) -> FastAPI:
                                 final_res["task_hierarchy"] = task_hierarchy
                             diagnostics = dict(final_res.get("diagnostics", {}))
                             diagnostics.update(llm_postprocess_diagnostics)
+                            final_res["diagnostics"] = diagnostics
+                            if not final_res.get("segments"):
+                                _fail_sample(
+                                    st,
+                                    ctx.subset,
+                                    sid,
+                                    "finalize_empty_segments",
+                                    {
+                                        "phase": "postprocess",
+                                        "window_count": len(windows),
+                                        "completed_window_count": len(by_wid),
+                                    },
+                                    log_message=f"[Fail] {ctx.subset}/{sid}: finalize produced no segments after postprocess",
+                                )
+                                time.sleep(0.01)
+                                continue
 
                             export_segments = [
                                 dict(segment)
                                 for segment in final_res.get("segments", [])
                                 if isinstance(segment, dict)
                             ]
-                            if bool(config.export.enabled) and bool(config.export.subtitles.enabled):
-                                subtitle_segments, subtitle_localization_diagnostics = run_export_subtitle_localization_pass(
-                                    sid,
-                                    export_segments,
-                                    config.llm_merge,
-                                    str(config.export.subtitles.language),
-                                )
-                                export_segments = subtitle_segments
-                            else:
-                                subtitle_localization_diagnostics = {
-                                    "export_subtitle_language": str(config.export.subtitles.language),
-                                    "export_subtitle_attempted": False,
-                                    "export_subtitle_applied": False,
-                                    "export_subtitle_fallback_used": False,
-                                    "export_subtitle_reason": (
-                                        "export_disabled"
-                                        if not bool(config.export.enabled)
-                                        else "subtitles_disabled"
-                                    ),
-                                    "export_subtitle_segment_count": len(export_segments),
-                                }
+                            subtitle_segments, subtitle_localization_diagnostics = run_export_subtitle_localization_pass(
+                                sid,
+                                export_segments,
+                                config.llm_merge,
+                                str(config.export.subtitles.language),
+                            )
+                            export_segments = subtitle_segments
+                            final_res["segments"] = [
+                                dict(segment)
+                                for segment in export_segments
+                                if isinstance(segment, dict)
+                            ]
                             diagnostics.update(subtitle_localization_diagnostics)
 
                             try:
@@ -1260,16 +1526,31 @@ def create_app(config: Config) -> FastAPI:
                             
                             if not already_done:
                                 global_done += 1
-                            print(f"[Progress] {global_done}/{progress_total} (finished: {ctx.subset}/{sid})")
-                    
+                            logger.info(f"[Progress] {global_done}/{progress_total} (finished: {ctx.subset}/{sid})")
+
                     except Exception as e:
-                        print(f"[Err-Finalize] {ctx.subset}/{sid}: {e}")
+                        logger.error(f"[Err-Finalize] {ctx.subset}/{sid}: {e}")
+                        _fail_sample(
+                            st,
+                            ctx.subset,
+                            sid,
+                            "finalize_exception",
+                            {
+                                "phase": "finalize",
+                                "error": str(e).strip() or type(e).__name__,
+                                "exception_type": type(e).__name__,
+                            },
+                            log_message=f"[Fail] {ctx.subset}/{sid}: finalize crashed",
+                        )
             
-            time.sleep(0.1)
-    
-    # Start producer thread
-    producer_thread = threading.Thread(target=producer_loop, daemon=True)
-    producer_thread.start()
+            if stop_event.wait(0.1):
+                break
+
+    app.state.runtime = ThreadRuntime(
+        name="video2tasks-producer",
+        target=producer_loop,
+        daemon=True,
+    )
     
     return app
 
@@ -1277,9 +1558,15 @@ def create_app(config: Config) -> FastAPI:
 def run_server(config: Config) -> None:
     """Run the server with given configuration."""
     app = create_app(config)
-    uvicorn.run(
-        app,
-        host=config.server.host,
-        port=config.server.port,
-        log_level=config.logging.level.lower()
-    )
+    runtime = app.state.runtime
+    runtime.start()
+    try:
+        uvicorn.run(
+            app,
+            host=config.server.host,
+            port=config.server.port,
+            log_level=config.logging.level.lower()
+        )
+    finally:
+        runtime.stop()
+        runtime.join()

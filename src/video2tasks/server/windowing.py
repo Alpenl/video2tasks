@@ -10,8 +10,12 @@ import cv2
 import base64
 import subprocess
 
-from .task_artifacts import ArtifactBatch, TaskArtifactWriter
+from ..logging_utils import get_logger
+from .task_artifacts import ArtifactBatch, TaskArtifactWriter, validate_image_payloads_or_raise
 from ..vlm.base import normalize_task_window_result
+
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -720,7 +724,7 @@ class FrameExtractor:
         if proc.returncode != 0:
             stderr = proc.stderr.decode('utf-8', errors='replace').strip()
             if stderr:
-                print(f"[FrameExtractor] ffmpeg contact sheet failed: {stderr}")
+                logger.warning(f"[FrameExtractor] ffmpeg contact sheet failed: {stderr}")
             return b""
         return bytes(proc.stdout or b"")
 
@@ -891,13 +895,14 @@ class FrameExtractor:
                 ) if bgr is not None else b""
 
             image_payloads = [frame_payload_map.get(fid, b"") for fid in frame_ids]
+            frame_groups = [[int(fid)] for fid in frame_ids]
+            source_tags = ["cv2_frame" if frame_payload_map.get(fid, b"") else "missing" for fid in frame_ids]
+            validate_image_payloads_or_raise(image_payloads, source_tags=source_tags)
             images = [
-                base64.b64encode(payload).decode("utf-8") if payload else ""
+                base64.b64encode(payload).decode("utf-8")
                 for payload in image_payloads
             ] if return_images else []
             if persist_artifacts:
-                frame_groups = [[int(fid)] for fid in frame_ids]
-                source_tags = ["cv2_frame" if frame_payload_map.get(fid, b"") else "missing" for fid in frame_ids]
                 self._persist_intermediate_artifacts(
                     image_payloads=image_payloads,
                     frame_groups=frame_groups,
@@ -939,8 +944,10 @@ class FrameExtractor:
                 source = "cv2" if payload else "missing"
             image_payloads.append(payload)
             source_tags.append(source)
-            if return_images:
-                images.append(base64.b64encode(payload).decode("utf-8") if payload else "")
+
+        validate_image_payloads_or_raise(image_payloads, source_tags=source_tags)
+        if return_images:
+            images = [base64.b64encode(payload).decode("utf-8") for payload in image_payloads]
 
         if persist_artifacts:
             self._persist_intermediate_artifacts(
@@ -2547,24 +2554,30 @@ def build_segments_via_cuts(
         min_segments=adaptive_merge_min_segments,
         collapse_ratio=adaptive_merge_collapse_ratio,
     )
-    use_light_fallback = (
-        bool(missing_strong_boundaries_if_merged)
-        or bool(missing_recovered_micro_boundaries_if_merged)
-        or adaptive_light_fallback
-    )
-    final_output = light_segments
+
+    if not merged_segments:
+        final_output = light_segments
+        selected_segment_source = "light_cleanup"
+        selection_policy = "light_cleanup_empty_merge"
+    elif missing_strong_boundaries_if_merged:
+        final_output = light_segments
+        selected_segment_source = "light_cleanup"
+        selection_policy = "light_cleanup_strong_boundary_guard"
+    elif missing_recovered_micro_boundaries_if_merged:
+        final_output = light_segments
+        selected_segment_source = "light_cleanup"
+        selection_policy = "light_cleanup_micro_boundary_guard"
+    elif adaptive_light_fallback:
+        final_output = light_segments
+        selected_segment_source = "light_cleanup"
+        selection_policy = "light_cleanup_fallback"
+    else:
+        final_output = merged_segments
+        selected_segment_source = "merged"
+        selection_policy = "merged_default"
 
     if refine_final_instructions:
         final_output = refine_segment_instructions(final_output, light_segments)
-
-    if missing_strong_boundaries_if_merged:
-        selection_policy = "light_cleanup_strong_boundary_guard"
-    elif missing_recovered_micro_boundaries_if_merged:
-        selection_policy = "light_cleanup_micro_boundary_guard"
-    elif adaptive_light_fallback:
-        selection_policy = "light_cleanup_fallback"
-    else:
-        selection_policy = "light_cleanup_default_recall"
 
     return {
         "sample_id": sample_id,
@@ -2574,6 +2587,7 @@ def build_segments_via_cuts(
             "light_segment_count": len(light_segments),
             "merged_segment_count": len(merged_segments),
             "selected_segment_count": len(final_output),
+            "selected_segment_source": selected_segment_source,
             "selection_policy": selection_policy,
             "strong_boundary_count": len(strong_boundary_points),
             "strong_boundary_points": strong_boundary_points,
