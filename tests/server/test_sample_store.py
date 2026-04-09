@@ -175,6 +175,62 @@ def test_sample_store_failure_writes_sample_runtime_when_provided(tmp_path: Path
 
     assert json.loads((sample_dir / "sample_runtime.json").read_text(encoding="utf-8")) == runtime_payload
 
+def test_sample_store_failure_publishes_failed_marker_after_required_artifacts(tmp_path: Path, monkeypatch) -> None:
+    store = _make_store(tmp_path)
+    sample_dir = Path(store.sample_out_dir("demo", "sample"))
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    runtime_payload = {
+        "sample_id": "sample",
+        "subset": "demo",
+        "terminal_state": "failed",
+        "stages": {
+            "required": ["stage1_segments", "export"],
+            "completed": ["stage1_segments"],
+            "pending": ["export"],
+        },
+        "fallback": {"applied": False, "reasons": [], "fields": {}},
+        "retry": {
+            "total_retries": 0,
+            "empty_result_retries": 0,
+            "timeout_retries": 0,
+            "dispatch_count": 1,
+        },
+        "export": {
+            "required": True,
+            "enabled": True,
+            "attempted": True,
+            "status": "failed",
+            "reason": "failed",
+        },
+        "failure": {
+            "reason": "export_failed",
+            "report_path": "failure.json",
+        },
+    }
+
+    write_order: list[str] = []
+    original_write_json = store._write_json
+
+    def recording_write_json(path: str, payload: dict) -> None:
+        failed_marker = Path(store.failed_marker_path("demo", "sample"))
+        assert not failed_marker.exists()
+        write_order.append(Path(path).name)
+        original_write_json(path, payload)
+
+    monkeypatch.setattr(store, "_write_json", recording_write_json)
+
+    store.persist_sample_failure(
+        "demo",
+        "sample",
+        "export_failed",
+        {"stage": "export"},
+        sample_runtime=runtime_payload,
+    )
+
+    assert write_order == ["failure.json", "sample_runtime.json"]
+    assert (sample_dir / ".FAILED").exists()
+
 
 def test_sample_store_finalize_success_rejects_missing_required_stage_completion(tmp_path: Path) -> None:
     store = _make_store(tmp_path)

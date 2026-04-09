@@ -1774,6 +1774,7 @@ def create_app(config: Config) -> FastAPI:
                                             "stage": "export",
                                             "required_stages": list(required_stages),
                                             "completed_stages": list(completed_stages),
+                                            "diagnostics": dict(diagnostics),
                                             "export_enabled": bool(export_diagnostics.get("export_enabled", bool(config.export.enabled))),
                                             "export_attempted": bool(export_diagnostics.get("export_attempted", bool(config.export.enabled))),
                                             "export_mode": str(export_diagnostics.get("export_mode", str(config.export.mode))).strip(),

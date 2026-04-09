@@ -1368,6 +1368,76 @@ def test_required_export_failure_marks_sample_failed_without_done(tmp_path, monk
         "errors": ["clips:degraded"],
     }
 
+def test_required_export_failure_preserves_stage2_runtime_fallback_details(tmp_path, monkeypatch) -> None:
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, llm_merge={"enabled": True}, export={"enabled": True})
+    _seed_completed_window_result(sample_out_dir)
+
+    _install_basic_finalize_mocks(monkeypatch)
+    monkeypatch.setattr(
+        app_module,
+        "run_llm_stage2_pass",
+        lambda _sid, segments, _config, **_kwargs: _stage2_result(
+            segments,
+            subtitle_items=[{"seg_id": 0, "subtitle": "Add potatoes"}],
+            summary_diagnostics={"llm_summary_applied": True},
+            subtitle_diagnostics={
+                "llm_subtitle_requested_language": "zh",
+                "llm_subtitle_language": "en",
+                "llm_subtitle_output_language": "en",
+                "llm_subtitle_fallback_used": True,
+                "llm_subtitle_reason": "request_failed:RuntimeError",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "export_sample_outputs",
+        lambda **_kwargs: {
+            "export_enabled": True,
+            "export_attempted": True,
+            "export_mode": "clips",
+            "export_reason": "failed",
+            "export_errors": ["clips:degraded"],
+            "export_clips_contract_status": "degraded",
+        },
+    )
+
+    _, _, sample_out_dir = _make_dataset_app(
+        tmp_path,
+        with_mp4=True,
+        llm_merge={"enabled": True},
+        export={"enabled": True},
+    )
+    failed_marker = sample_out_dir / ".FAILED"
+    done_marker = sample_out_dir / ".DONE"
+    failure_report = sample_out_dir / "failure.json"
+
+    _wait_until(lambda: failed_marker.exists() or done_marker.exists())
+    _wait_until(lambda: failure_report.exists())
+
+    assert failed_marker.exists()
+    assert not done_marker.exists()
+
+    report = _read_json(failure_report)
+    assert report["details"]["diagnostics"]["llm_subtitle_fallback_used"] is True
+    assert report["details"]["diagnostics"]["llm_subtitle_reason"] == "request_failed:RuntimeError"
+    assert report["details"]["diagnostics"]["export_reason"] == "failed"
+
+    sample_runtime = _read_json(sample_out_dir / "sample_runtime.json")
+    assert sample_runtime["fallback"]["fields"]["llm_subtitle_fallback_used"] is True
+    assert sample_runtime["export"] == {
+        "required": True,
+        "enabled": True,
+        "attempted": True,
+        "status": "failed",
+        "reason": "failed",
+        "mode": "clips",
+        "errors": ["clips:degraded"],
+    }
+
+
 def test_finalize_exception_marks_sample_failed_without_done_marker(tmp_path, monkeypatch) -> None:
     sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
     sample_out_dir.mkdir(parents=True, exist_ok=True)

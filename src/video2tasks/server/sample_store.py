@@ -320,10 +320,10 @@ class SampleStore:
                     Path(stale_path).unlink()
                 except FileNotFoundError:
                     pass
-            Path(self.failed_marker_path(subset, sample_id)).touch()
             self._write_json(self.failure_report_path(subset, sample_id), payload)
             if sample_runtime is not None:
                 self._write_json(self.sample_runtime_path(subset, sample_id), sample_runtime)
+            Path(self.failed_marker_path(subset, sample_id)).touch()
 
     def persist_sample_payload(self, subset: str, sample_id: str, payload: Dict[str, Any]) -> None:
         with self._get_sample_lock(subset, sample_id):
