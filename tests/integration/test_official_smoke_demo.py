@@ -124,12 +124,16 @@ def test_official_smoke_demo_contract(tmp_path: Path) -> None:
     done_marker = sample_out_dir / ".DONE"
     failed_marker = sample_out_dir / ".FAILED"
     segments_path = sample_out_dir / "segments.json"
+    sample_runtime_path = sample_out_dir / "sample_runtime.json"
     run_manifest_path = run_dir / "run_manifest.json"
+    run_summary_path = run_dir / "run_summary.json"
 
     assert done_marker.exists(), f"Missing done marker: {done_marker}"
     assert not failed_marker.exists(), f"Unexpected failed marker: {failed_marker}"
     assert segments_path.exists(), f"Missing sample segments output: {segments_path}"
+    assert sample_runtime_path.exists(), f"Missing sample runtime evidence: {sample_runtime_path}"
     assert run_manifest_path.exists(), f"Missing run manifest: {run_manifest_path}"
+    assert run_summary_path.exists(), f"Missing run summary evidence: {run_summary_path}"
 
     segments_payload = json.loads(segments_path.read_text(encoding="utf-8"))
     assert segments_payload.get("sample_id") == sample_id
@@ -141,6 +145,19 @@ def test_official_smoke_demo_contract(tmp_path: Path) -> None:
     for required_key in ("seg_id", "start_frame", "end_frame", "instruction"):
         assert required_key in first_segment
 
+    sample_runtime_payload = json.loads(sample_runtime_path.read_text(encoding="utf-8"))
+    assert sample_runtime_payload.get("schema_version") == 1
+    assert sample_runtime_payload.get("subset") == subset
+    assert sample_runtime_payload.get("sample_id") == sample_id
+    assert sample_runtime_payload.get("terminal_state") == "done"
+    assert isinstance(sample_runtime_payload.get("stages"), dict)
+    assert isinstance(sample_runtime_payload["stages"].get("required"), list)
+    assert isinstance(sample_runtime_payload["stages"].get("completed"), list)
+    assert isinstance(sample_runtime_payload.get("fallback"), dict)
+    assert isinstance(sample_runtime_payload.get("retry"), dict)
+    assert isinstance(sample_runtime_payload.get("export"), dict)
+    assert sample_runtime_payload.get("failure") is None
+
     run_manifest_payload = json.loads(run_manifest_path.read_text(encoding="utf-8"))
     assert run_manifest_payload.get("schema_version") == 1
     assert run_manifest_payload.get("subset") == subset
@@ -148,3 +165,14 @@ def test_official_smoke_demo_contract(tmp_path: Path) -> None:
     assert isinstance(run_manifest_payload.get("required_stages"), list)
     assert len(run_manifest_payload["required_stages"]) >= 1
     assert run_manifest_payload["backend_summary"]["stage1"]["backend"] == "dummy"
+
+    run_summary_payload = json.loads(run_summary_path.read_text(encoding="utf-8"))
+    assert run_summary_payload.get("schema_version") == 1
+    assert run_summary_payload.get("subset") == subset
+    assert run_summary_payload.get("run_id") == test_run_id
+    assert isinstance(run_summary_payload.get("required_stages"), list)
+    assert run_summary_payload.get("sample_counts") == {"total": 1, "done": 1, "failed": 0, "pending": 0}
+    assert isinstance(run_summary_payload.get("fallback"), dict)
+    assert isinstance(run_summary_payload.get("retry"), dict)
+    assert isinstance(run_summary_payload.get("export"), dict)
+    assert run_summary_payload.get("failure_reasons") == {}
