@@ -1344,4 +1344,5 @@ def test_app_finalize_writes_stage2_subtitle_fallback_back_to_segments_json(tmp_
 
     sample_runtime = json.loads((sample_out_dir / "sample_runtime.json").read_text(encoding="utf-8"))
     assert sample_runtime["fallback"]["fields"]["llm_subtitle_fallback_used"] is True
-    assert sample_runtime["fallback"]["reasons"] == []
+    assert sample_runtime["fallback"]["fields"]["llm_subtitle_fallback_reason"] == "request_failed:RuntimeError"
+    assert sample_runtime["fallback"]["reasons"] == ["request_failed:RuntimeError"]

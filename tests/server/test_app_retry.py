@@ -5,6 +5,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import pytest
 from fastapi.testclient import TestClient
 
 import video2tasks.server.app as app_module
@@ -1099,6 +1100,70 @@ def test_create_app_backfills_failed_runtime_with_export_failure_details(tmp_pat
     assert run_summary["failure_reasons"] == {"export_failed": 1}
 
 
+def test_create_app_backfills_failed_runtime_with_stage2_diagnostics(tmp_path) -> None:
+    sample_id = "sample"
+    sample_dir = Path(tmp_path) / "data" / "demo" / sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, llm_merge={"enabled": True}, export={"enabled": True})
+
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / sample_id
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    (sample_out_dir / ".FAILED").write_text("", encoding="utf-8")
+    (sample_out_dir / "failure.json").write_text(
+        json.dumps(
+            {
+                "subset": "demo",
+                "sample_id": sample_id,
+                "reason": "export_failed",
+                "details": {
+                    "stage": "export",
+                    "required_stages": ["stage1_segments", "stage2_text", "export"],
+                    "completed_stages": ["stage1_segments", "stage2_text"],
+                    "diagnostics": {
+                        "llm_subtitle_fallback_used": True,
+                        "llm_subtitle_reason": "request_failed:RuntimeError",
+                        "export_enabled": True,
+                        "export_attempted": True,
+                        "export_mode": "clips",
+                        "export_reason": "failed",
+                        "export_errors": ["clips:degraded"],
+                    },
+                    "export_enabled": True,
+                    "export_attempted": True,
+                    "export_mode": "clips",
+                    "export_reason": "failed",
+                    "export_errors": ["clips:degraded"],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    _make_dataset_app(
+        tmp_path,
+        with_mp4=False,
+        llm_merge={"enabled": True},
+        export={"enabled": True},
+        start_runtime=False,
+    )
+
+    sample_runtime = _read_json(sample_out_dir / "sample_runtime.json")
+    run_summary = _read_json(Path(tmp_path) / "demo" / "testrun" / "run_summary.json")
+
+    assert sample_runtime["failure"]["details"]["diagnostics"]["llm_subtitle_reason"] == "request_failed:RuntimeError"
+    assert sample_runtime["fallback"] == {
+        "applied": True,
+        "reasons": ["request_failed:RuntimeError"],
+        "fields": {
+            "llm_subtitle_fallback_used": True,
+            "llm_subtitle_fallback_reason": "request_failed:RuntimeError",
+        },
+    }
+    assert run_summary["fallback"]["applied_sample_count"] == 1
+    assert run_summary["fallback"]["reason_counts"] == {"request_failed:RuntimeError": 1}
+
+
 def test_done_marker_writes_after_stage1_when_stage1_is_only_required_stage(tmp_path, monkeypatch) -> None:
     entered = threading.Event()
     release = threading.Event()
@@ -1209,6 +1274,25 @@ def test_done_marker_waits_for_stage2_required_stage_completion(tmp_path, monkey
     release.set()
     _wait_until(lambda: done_marker.exists())
     assert not failed_marker.exists()
+
+
+def test_create_app_rejects_force_resume_when_stage2_manifest_contract_conflicts_with_live_config(tmp_path) -> None:
+    sample_id = "sample"
+    sample_dir = Path(tmp_path) / "data" / "demo" / sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, llm_merge={"enabled": True})
+
+    subset = "demo"
+    data_root = tmp_path / "data"
+    config = Config(
+        datasets=[{"root": str(data_root), "subset": subset}],
+        run={"base_dir": str(tmp_path), "run_id": "testrun", "force_resume": True},
+        server={"auto_exit_after_all_done": False},
+        llm_merge={"enabled": False},
+    )
+
+    with pytest.raises(ValueError, match="manifest requires stage2_text"):
+        create_app(config)
 
 def test_done_marker_waits_for_export_required_stage_completion_when_enabled(tmp_path, monkeypatch) -> None:
     sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"

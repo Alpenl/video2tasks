@@ -292,6 +292,24 @@ def create_app(config: Config) -> FastAPI:
     run_manifest_status_by_subset: Dict[str, Dict[str, Any]] = {}
 
     for ctx in dataset_ctxs:
+        manifest_file = run_manifest_path(ctx.run_dir)
+        previous_required_stages: list[str] = []
+        if manifest_file.exists():
+            try:
+                previous_manifest = load_run_manifest(manifest_file)
+                previous_required_stages = [
+                    str(stage).strip()
+                    for stage in previous_manifest.required_stages
+                    if str(stage).strip()
+                ]
+            except Exception:
+                previous_required_stages = []
+
+        if bool(config.run.force_resume) and ("stage2_text" in previous_required_stages) and not bool(config.llm_merge.enabled):
+            raise ValueError(
+                f"Cannot force-resume subset={ctx.subset}: manifest requires stage2_text but current llm_merge.enabled=false"
+            )
+
         manifest_status = ensure_run_manifest(
             run_dir=ctx.run_dir,
             subset=ctx.subset,
@@ -300,7 +318,7 @@ def create_app(config: Config) -> FastAPI:
             force_resume=bool(config.run.force_resume),
             run_dir_nonempty_before_start=bool(ctx.run_dir_nonempty_before_prepare),
         )
-        run_manifest_paths[ctx.subset] = str(run_manifest_path(ctx.run_dir))
+        run_manifest_paths[ctx.subset] = str(manifest_file)
         run_manifest_status_by_subset[ctx.subset] = manifest_status.model_dump(mode="json")
         if manifest_status.resume.force_resume and manifest_status.resume.mismatch_fields:
             logger.warning(
@@ -478,6 +496,21 @@ def create_app(config: Config) -> FastAPI:
         )
         write_run_summary(run_dir, summary)
 
+    def _runtime_diagnostics_payload(diagnostics: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = dict(diagnostics or {})
+        for key, value in list(payload.items()):
+            if not key.endswith("_fallback_used") or not bool(value):
+                continue
+            prefix = key[: -len("_fallback_used")]
+            reason_key = f"{prefix}_fallback_reason"
+            if str(payload.get(reason_key, "")).strip():
+                continue
+            legacy_reason_key = f"{prefix}_reason"
+            legacy_reason = str(payload.get(legacy_reason_key, "")).strip()
+            if legacy_reason:
+                payload[reason_key] = legacy_reason
+        return payload
+
     def _build_sample_runtime(
         subset: str,
         sample_id: str,
@@ -495,7 +528,7 @@ def create_app(config: Config) -> FastAPI:
             terminal_state=terminal_state,
             required_stages=required_stages,
             completed_stages=completed_stages,
-            diagnostics=dict(diagnostics or {}),
+            diagnostics=_runtime_diagnostics_payload(diagnostics),
             retry_summary=_sample_retry_summary(subset, sample_id),
             failure_reason=failure_reason,
             failure_details=dict(failure_details or {}),
@@ -530,12 +563,14 @@ def create_app(config: Config) -> FastAPI:
         if Path(failed_marker_path(subset, sample_id)).exists():
             report = _read_json_object(failure_report_path(subset, sample_id))
             details = dict(report.get("details", {}))
+            diagnostics = dict(details.get("diagnostics", {})) if isinstance(details.get("diagnostics", {}), dict) else {}
             runtime_payload = _build_sample_runtime(
                 subset,
                 sample_id,
                 terminal_state="failed",
                 required_stages=list(details.get("required_stages", required_stages)),
                 completed_stages=list(details.get("completed_stages", [])),
+                diagnostics=diagnostics,
                 failure_reason=str(report.get("reason", "")).strip(),
                 failure_details=details,
             )
