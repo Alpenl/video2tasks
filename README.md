@@ -369,7 +369,7 @@ Additional rules:
 - `sample_runtime.json` + `run_summary.json` are the operator runtime-evidence layer. They exist for operator decisions and auditing, not as a replacement for the final segmentation result.
 - `segments.json.diagnostics` is still dual-written during the P0 compatibility window, but it is compatibility shadow data, not the canonical runtime evidence location.
 
-For endpoint wobble triage (and how to separate endpoint volatility from code/data failures), see [Endpoint Volatility Runbook](docs/runbooks/endpoint-volatility.md).
+For endpoint volatility triage (and how to separate endpoint volatility from code/data failures), see [Endpoint Volatility Runbook](docs/runbooks/endpoint-volatility.md).
 
 ---
 
