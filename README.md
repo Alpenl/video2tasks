@@ -340,6 +340,7 @@ Common sections in the full config model:
 
 - `<run_dir>/samples/<sample_id>/windows.jsonl`: Stage 1 window-level raw results (append-only).
 - `<run_dir>/samples/<sample_id>/segments.json`: sample result-layer output. It only carries segmentation + Stage 2 text artifacts (merge/summary/subtitle-localization results). Runtime/export/fallback/retry state is not segmentation truth.
+  App integration uses `run_llm_stage2_pass(...)` as the canonical Stage 2 contract. Export only consumes Stage 2 output already written here, or falls back to source instructions when Stage 2 is disabled.
   Source instructions are always English. Subtitle localization changes subtitle text only.
 - `<run_dir>/samples/<sample_id>/sample_runtime.json`: sample-level operator evidence. It is the canonical runtime artifact for terminal state, required-stage completion, fallback summary, retry summary, export summary, and failure reference.
 - `<run_dir>/samples/<sample_id>/.DONE` / `<run_dir>/samples/<sample_id>/.FAILED`: sample terminal markers.

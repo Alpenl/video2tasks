@@ -23,7 +23,7 @@ from .windowing import (
     sample_segment_frame_ids,
 )
 from .exporter import export_sample_outputs
-from .llm_merge import run_export_subtitle_localization_pass, run_llm_postprocess_pass
+from .llm_merge import attach_stage2_subtitles_to_segments, run_llm_stage2_pass
 from .job_builder import ArtifactReuseEntry, JobBuilder
 from .run_manifest import ensure_run_manifest, load_run_manifest, run_manifest_path
 from .run_summary import build_run_summary, build_sample_runtime_record, write_run_summary
@@ -798,37 +798,36 @@ def create_app(config: Config) -> FastAPI:
         return global_done
 
     def _apply_stage2_text_writeback(sample_id: str, final_res: Dict[str, Any]) -> Dict[str, Any]:
-        cleaned_segments, task_hierarchy, llm_postprocess_diagnostics = run_llm_postprocess_pass(
+        stage2_res = run_llm_stage2_pass(
             sample_id,
             final_res.get("segments", []),
             config.llm_merge,
+            target_language=str(config.export.subtitles.language),
         )
-        next_res = dict(final_res)
-        next_res["segments"] = cleaned_segments
-        if task_hierarchy is not None:
-            next_res["task_hierarchy"] = task_hierarchy
-        diagnostics = dict(next_res.get("diagnostics", {}))
-        diagnostics.update(llm_postprocess_diagnostics)
-        next_res["diagnostics"] = diagnostics
 
-        export_segments = [
+        merge_payload = dict(stage2_res.get("merge", {}))
+        summary_payload = dict(stage2_res.get("summary", {}))
+        subtitles_payload = dict(stage2_res.get("subtitles", {}))
+
+        cleaned_segments = [
             dict(segment)
-            for segment in next_res.get("segments", [])
+            for segment in merge_payload.get("segments", [])
             if isinstance(segment, dict)
         ]
-        subtitle_segments, subtitle_localization_diagnostics = run_export_subtitle_localization_pass(
-            sample_id,
-            export_segments,
-            config.llm_merge,
-            str(config.export.subtitles.language),
+        next_res = dict(final_res)
+        next_res["segments"] = attach_stage2_subtitles_to_segments(
+            cleaned_segments,
+            subtitles_payload.get("items", []),
         )
-        next_res["segments"] = [
-            dict(segment)
-            for segment in subtitle_segments
-            if isinstance(segment, dict)
-        ]
+
+        task_hierarchy = summary_payload.get("hierarchy")
+        if isinstance(task_hierarchy, dict):
+            next_res["task_hierarchy"] = dict(task_hierarchy)
+
         diagnostics = dict(next_res.get("diagnostics", {}))
-        diagnostics.update(subtitle_localization_diagnostics)
+        diagnostics.update(dict(merge_payload.get("diagnostics", {})))
+        diagnostics.update(dict(summary_payload.get("diagnostics", {})))
+        diagnostics.update(dict(subtitles_payload.get("diagnostics", {})))
         next_res["diagnostics"] = diagnostics
         return next_res
 
@@ -1677,7 +1676,7 @@ def create_app(config: Config) -> FastAPI:
                                     progress_total=progress_total,
                                 )
 
-                            stage2_writeback_required = early_done or "stage2_text" in required_stages or "export" in required_stages
+                            stage2_writeback_required = bool(config.llm_merge.enabled) and (early_done or "stage2_text" in required_stages)
                             if stage2_writeback_required:
                                 try:
                                     stage2_res = _apply_stage2_text_writeback(sid, final_res)

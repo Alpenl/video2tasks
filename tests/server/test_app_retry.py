@@ -235,6 +235,41 @@ def _append_jsonl_record(path: Path, record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + '\n')
 
 
+def _stage2_result(
+    segments: list[dict],
+    *,
+    hierarchy: dict | None = None,
+    subtitle_items: list[dict] | None = None,
+    merge_diagnostics: dict | None = None,
+    summary_diagnostics: dict | None = None,
+    subtitle_diagnostics: dict | None = None,
+) -> dict:
+    return {
+        "stage": "stage2",
+        "version": 2,
+        "merge": {
+            "applied": bool((merge_diagnostics or {}).get("llm_merge_applied", False)),
+            "segments": [dict(segment) for segment in segments],
+            "diagnostics": dict(merge_diagnostics or {}),
+        },
+        "summary": {
+            "applied": bool((summary_diagnostics or {}).get("llm_summary_applied", False)),
+            "hierarchy": None if hierarchy is None else dict(hierarchy),
+            "diagnostics": dict(summary_diagnostics or {}),
+        },
+        "subtitles": {
+            "requested_language": str((subtitle_diagnostics or {}).get("llm_subtitle_requested_language", "en")),
+            "target_language": str((subtitle_diagnostics or {}).get("llm_subtitle_requested_language", "en")),
+            "language": str((subtitle_diagnostics or {}).get("llm_subtitle_language", "en")),
+            "output_language": str((subtitle_diagnostics or {}).get("llm_subtitle_output_language", "en")),
+            "source_instruction_language": "en",
+            "applied": bool((subtitle_diagnostics or {}).get("llm_subtitle_applied", False)),
+            "items": [dict(item) for item in (subtitle_items or [])],
+            "diagnostics": dict(subtitle_diagnostics or {}),
+        },
+    }
+
+
 def _seed_completed_window_result(
     sample_out_dir: Path,
     *,
@@ -1065,22 +1100,18 @@ def test_create_app_backfills_failed_runtime_with_export_failure_details(tmp_pat
 
 
 def test_done_marker_writes_after_stage1_when_stage1_is_only_required_stage(tmp_path, monkeypatch) -> None:
-    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
-    sample_out_dir.mkdir(parents=True, exist_ok=True)
-    _seed_dataset_run_manifest(tmp_path, required_stages=["stage1_segments"])
-    _seed_completed_window_result(sample_out_dir)
-
     entered = threading.Event()
     release = threading.Event()
 
     _install_basic_finalize_mocks(monkeypatch)
 
-    def paused_postprocess(_sid, segments, _config):
+    def paused_stage2(_sid, segments, _config, *, target_language="en", backend=None):
+        del target_language, backend
         entered.set()
         assert release.wait(2.0)
-        return (
+        return _stage2_result(
             segments,
-            {
+            hierarchy={
                 "roots": [
                     {
                         "level": "coarse",
@@ -1091,25 +1122,33 @@ def test_done_marker_writes_after_stage1_when_stage1_is_only_required_stage(tmp_
                     }
                 ]
             },
-            {"llm_summary_applied": True},
+            subtitle_items=[{"seg_id": 0, "subtitle": "Add potatoes"}],
+            summary_diagnostics={"llm_summary_applied": True},
+            subtitle_diagnostics={
+                "llm_subtitle_requested_language": "zh",
+                "llm_subtitle_language": "en",
+                "llm_subtitle_output_language": "en",
+                "llm_subtitle_fallback_used": True,
+                "llm_subtitle_reason": "source_instruction_reused",
+            },
         )
 
-    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", paused_postprocess)
-    monkeypatch.setattr(
-        app_module,
-        "run_export_subtitle_localization_pass",
-        lambda _sid, segments, _config, _target_language: (
-            [dict(segment, export_subtitle="Add potatoes") for segment in segments],
-            {"export_subtitle_fallback_used": True},
-        ),
-    )
+    monkeypatch.setattr(app_module, "run_llm_stage2_pass", paused_stage2)
     monkeypatch.setattr(
         app_module,
         "export_sample_outputs",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("export should not run when not required")),
     )
 
-    _, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True)
+    app, _, sample_out_dir = _make_dataset_app(
+        tmp_path,
+        with_mp4=True,
+        llm_merge={"enabled": True},
+        start_runtime=False,
+    )
+    _seed_completed_window_result(sample_out_dir)
+    _override_required_stages(app, ["stage1_segments"])
+    _start_runtime(app)
     done_marker = sample_out_dir / ".DONE"
     failed_marker = sample_out_dir / ".FAILED"
 
@@ -1134,7 +1173,6 @@ def test_done_marker_writes_after_stage1_when_stage1_is_only_required_stage(tmp_
     assert done_marker.exists()
     assert not failed_marker.exists()
 
-
 def test_done_marker_waits_for_stage2_required_stage_completion(tmp_path, monkeypatch) -> None:
     sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
     sample_out_dir.mkdir(parents=True, exist_ok=True)
@@ -1146,12 +1184,13 @@ def test_done_marker_waits_for_stage2_required_stage_completion(tmp_path, monkey
 
     _install_basic_finalize_mocks(monkeypatch)
 
-    def paused_postprocess(_sid, segments, _config):
+    def paused_stage2(_sid, segments, _config, *, target_language="en", backend=None):
+        del target_language, backend
         entered.set()
         assert release.wait(2.0)
-        return segments, None, {}
+        return _stage2_result(segments, subtitle_items=[{"seg_id": 0, "subtitle": "Add potatoes"}])
 
-    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", paused_postprocess)
+    monkeypatch.setattr(app_module, "run_llm_stage2_pass", paused_stage2)
     monkeypatch.setattr(
         app_module,
         "export_sample_outputs",
@@ -1171,7 +1210,6 @@ def test_done_marker_waits_for_stage2_required_stage_completion(tmp_path, monkey
     _wait_until(lambda: done_marker.exists())
     assert not failed_marker.exists()
 
-
 def test_done_marker_waits_for_export_required_stage_completion_when_enabled(tmp_path, monkeypatch) -> None:
     sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
     sample_out_dir.mkdir(parents=True, exist_ok=True)
@@ -1180,11 +1218,17 @@ def test_done_marker_waits_for_export_required_stage_completion_when_enabled(tmp
 
     entered = threading.Event()
     release = threading.Event()
+    export_inputs: list[list[dict]] = []
 
     _install_basic_finalize_mocks(monkeypatch)
-    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", lambda _sid, segments, _config: (segments, None, {}))
+    monkeypatch.setattr(
+        app_module,
+        "run_llm_stage2_pass",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Stage 2 must not run when llm_merge is disabled")),
+    )
 
     def paused_export(**_kwargs):
+        export_inputs.append([dict(segment) for segment in _kwargs["segments"]])
         entered.set()
         assert release.wait(2.0)
         return {
@@ -1203,11 +1247,13 @@ def test_done_marker_waits_for_export_required_stage_completion_when_enabled(tmp
 
     assert not done_marker.exists()
     assert not failed_marker.exists()
+    assert export_inputs
+    assert export_inputs[0][0]["instruction"] == "Add potatoes"
+    assert "export_subtitle" not in export_inputs[0][0]
 
     release.set()
     _wait_until(lambda: done_marker.exists())
     assert not failed_marker.exists()
-
 
 def test_done_marker_does_not_wait_for_optional_export_when_manifest_does_not_require_it(tmp_path, monkeypatch) -> None:
     sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
@@ -1216,7 +1262,11 @@ def test_done_marker_does_not_wait_for_optional_export_when_manifest_does_not_re
     _seed_completed_window_result(sample_out_dir)
 
     _install_basic_finalize_mocks(monkeypatch)
-    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", lambda _sid, segments, _config: (segments, None, {}))
+    monkeypatch.setattr(
+        app_module,
+        "run_llm_stage2_pass",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("optional Stage 2 should not run when llm_merge is disabled")),
+    )
     monkeypatch.setattr(
         app_module,
         "export_sample_outputs",
@@ -1238,7 +1288,6 @@ def test_done_marker_does_not_wait_for_optional_export_when_manifest_does_not_re
 
     assert done_marker.exists()
     assert not failed_marker.exists()
-
 
 def test_step_a_exception_marks_sample_failed(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(app_module, "read_video_info", lambda _mp4: (30.0, 16))
@@ -1266,18 +1315,26 @@ def test_required_export_failure_marks_sample_failed_without_done(tmp_path, monk
     _seed_completed_window_result(sample_out_dir)
 
     _install_basic_finalize_mocks(monkeypatch)
-    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", lambda _sid, segments, _config: (segments, None, {}))
+    export_inputs: list[list[dict]] = []
+    monkeypatch.setattr(
+        app_module,
+        "run_llm_stage2_pass",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Stage 2 must not run when llm_merge is disabled")),
+    )
     monkeypatch.setattr(
         app_module,
         "export_sample_outputs",
-        lambda **_kwargs: {
-            "export_enabled": True,
-            "export_attempted": True,
-            "export_mode": "clips",
-            "export_reason": "failed",
-            "export_errors": ["clips:degraded"],
-            "export_clips_contract_status": "degraded",
-        },
+        lambda **_kwargs: (
+            export_inputs.append([dict(segment) for segment in _kwargs["segments"]]),
+            {
+                "export_enabled": True,
+                "export_attempted": True,
+                "export_mode": "clips",
+                "export_reason": "failed",
+                "export_errors": ["clips:degraded"],
+                "export_clips_contract_status": "degraded",
+            },
+        )[1],
     )
 
     _, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True, export={"enabled": True})
@@ -1288,6 +1345,8 @@ def test_required_export_failure_marks_sample_failed_without_done(tmp_path, monk
 
     assert failed_marker.exists()
     assert not done_marker.exists()
+    assert export_inputs
+    assert "export_subtitle" not in export_inputs[0][0]
     report = _read_json(sample_out_dir / "failure.json")
     assert report["reason"] == "export_failed"
     assert report["details"]["stage"] == "export"
@@ -1308,7 +1367,6 @@ def test_required_export_failure_marks_sample_failed_without_done(tmp_path, monk
         "mode": "clips",
         "errors": ["clips:degraded"],
     }
-
 
 def test_finalize_exception_marks_sample_failed_without_done_marker(tmp_path, monkeypatch) -> None:
     sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
@@ -1387,11 +1445,6 @@ def test_reload_validation_uses_persisted_logical_frame_count_layout(tmp_path, m
     )
     monkeypatch.setattr(
         app_module,
-        "run_llm_postprocess_pass",
-        lambda _sid, segments, _config: (segments, None, {}),
-    )
-    monkeypatch.setattr(
-        app_module,
         "export_sample_outputs",
         lambda **_kwargs: {"export_enabled": False, "export_attempted": False},
     )
@@ -1400,12 +1453,14 @@ def test_reload_validation_uses_persisted_logical_frame_count_layout(tmp_path, m
     _, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True)
     failed_marker = sample_out_dir / ".FAILED"
     done_marker = sample_out_dir / ".DONE"
+    failure_report = sample_out_dir / "failure.json"
 
     _wait_until(lambda: failed_marker.exists() or done_marker.exists())
+    _wait_until(lambda: failure_report.exists())
 
     assert failed_marker.exists()
     assert not done_marker.exists()
-    report = _read_json(sample_out_dir / "failure.json")
+    report = _read_json(failure_report)
     assert report["reason"] == "window_boundary_failed"
     assert report["details"]["errors"] == {"0": "invalid_vlm_json"}
 
@@ -1417,7 +1472,11 @@ def test_postprocess_empty_result_marks_sample_failed_without_done(tmp_path, mon
     _seed_completed_window_result(sample_out_dir)
 
     _install_basic_finalize_mocks(monkeypatch)
-    monkeypatch.setattr(app_module, 'run_llm_postprocess_pass', lambda _sid, _segments, _config: ([], None, {}))
+    monkeypatch.setattr(
+        app_module,
+        'run_llm_stage2_pass',
+        lambda _sid, _segments, _config, **_kwargs: _stage2_result([], subtitle_items=[]),
+    )
     monkeypatch.setattr(
         app_module,
         'export_sample_outputs',
@@ -1438,6 +1497,70 @@ def test_postprocess_empty_result_marks_sample_failed_without_done(tmp_path, mon
     assert report['reason'] == 'finalize_empty_segments'
     assert report['details']['phase'] == 'postprocess'
 
+
+def test_export_consumes_stage2_subtitles_when_stage2_enabled(tmp_path, monkeypatch) -> None:
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, llm_merge={"enabled": True}, export={"enabled": True})
+    _seed_completed_window_result(sample_out_dir)
+
+    export_inputs: list[list[dict]] = []
+    stage2_calls: list[str] = []
+
+    _install_basic_finalize_mocks(monkeypatch)
+
+    def fake_stage2(_sid, segments, _config, *, target_language="en", backend=None):
+        del backend
+        stage2_calls.append(str(target_language))
+        return _stage2_result(
+            segments,
+            subtitle_items=[{"seg_id": 0, "subtitle": "加土豆"}],
+            subtitle_diagnostics={
+                "llm_subtitle_requested_language": "zh",
+                "llm_subtitle_language": "zh",
+                "llm_subtitle_output_language": "zh",
+                "llm_subtitle_attempted": True,
+                "llm_subtitle_applied": True,
+                "llm_subtitle_reason": "applied",
+            },
+        )
+
+    monkeypatch.setattr(app_module, "run_llm_stage2_pass", fake_stage2)
+    monkeypatch.setattr(
+        app_module,
+        "export_sample_outputs",
+        lambda **kwargs: (
+            export_inputs.append([dict(segment) for segment in kwargs["segments"]]),
+            {
+                "export_enabled": True,
+                "export_attempted": True,
+                "export_mode": "annotated",
+                "export_reason": "applied",
+            },
+        )[1],
+    )
+
+    _, _, sample_out_dir = _make_dataset_app(
+        tmp_path,
+        with_mp4=True,
+        llm_merge={"enabled": True},
+        export={"enabled": True, "subtitles": {"enabled": True, "language": "zh"}},
+    )
+    done_marker = sample_out_dir / ".DONE"
+    failed_marker = sample_out_dir / ".FAILED"
+
+    _wait_until(lambda: done_marker.exists() or failed_marker.exists())
+
+    assert done_marker.exists()
+    assert not failed_marker.exists()
+    assert stage2_calls == ["zh"]
+    assert export_inputs
+    assert export_inputs[0][0]["export_subtitle"] == "加土豆"
+
+    payload = _read_json(sample_out_dir / "segments.json")
+    assert payload["segments"][0]["export_subtitle"] == "加土豆"
+    sample_runtime = _read_json(sample_out_dir / "sample_runtime.json")
+    assert sample_runtime["export"]["status"] == "applied"
 
 def test_step_a_invalid_artifact_fails_sample_before_dispatch(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(app_module, "read_video_info", lambda _mp4: (30.0, 16))
@@ -1486,7 +1609,6 @@ def test_boundary_refinement_terminal_failure_blocks_done(tmp_path, monkeypatch)
         ],
     )
     monkeypatch.setattr(app_module, 'apply_boundary_refinement_results', lambda segments, *_args, **_kwargs: segments)
-    monkeypatch.setattr(app_module, 'run_llm_postprocess_pass', lambda _sid, segments, _config: (segments, None, {}))
     monkeypatch.setattr(app_module, 'export_sample_outputs', lambda **_kwargs: {'export_enabled': False, 'export_attempted': False})
 
     _, _, sample_out_dir = _make_dataset_app(
@@ -1513,7 +1635,6 @@ def test_deferred_label_invalid_artifact_fails_sample_before_dispatch(tmp_path, 
     _seed_completed_window_result(sample_out_dir)
 
     _install_basic_finalize_mocks(monkeypatch)
-    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", lambda _sid, segments, _config: (segments, None, {}))
     monkeypatch.setattr(app_module, "FrameExtractor", _InvalidArtifactFrameExtractor)
 
     _, _, sample_out_dir = _make_dataset_app(
@@ -1553,7 +1674,6 @@ def test_deferred_label_terminal_failure_blocks_done(tmp_path, monkeypatch) -> N
     )
 
     _install_basic_finalize_mocks(monkeypatch)
-    monkeypatch.setattr(app_module, 'run_llm_postprocess_pass', lambda _sid, segments, _config: (segments, None, {}))
     monkeypatch.setattr(app_module, 'apply_deferred_segment_labels', lambda segments, _labels: segments)
     monkeypatch.setattr(app_module, 'export_sample_outputs', lambda **_kwargs: {'export_enabled': False, 'export_attempted': False})
 

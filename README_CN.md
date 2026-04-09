@@ -340,6 +340,7 @@ v2t-worker --config config.yaml
 
 - `<run_dir>/samples/<sample_id>/windows.jsonl`：Stage 1 每个窗口的原始结果（append-only）。
 - `<run_dir>/samples/<sample_id>/segments.json`：样本结果层产物。只承载 segmentation + Stage 2 文本产物（merge/summary/字幕本地化结果）。runtime/export/fallback/retry 状态不属于最终切分真相。
+  app 侧通过 `run_llm_stage2_pass(...)` 接入 canonical Stage 2 契约；export 只消费这里已经写回的 Stage 2 输出，或者在 Stage 2 关闭时回退到 source instruction。
   source instruction 永远是英文；字幕本地化只改变字幕文本。
 - `<run_dir>/samples/<sample_id>/sample_runtime.json`：样本级 operator 证据。它是 canonical runtime artifact，承载终态、required-stage 完成情况、fallback 概况、retry 概况、export 概况，以及 failure 引用。
 - `<run_dir>/samples/<sample_id>/.DONE` / `<run_dir>/samples/<sample_id>/.FAILED`：样本终态标记。

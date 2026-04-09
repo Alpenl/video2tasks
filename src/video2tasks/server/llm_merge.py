@@ -1634,6 +1634,35 @@ def run_llm_summary_pass(
     )
 
 
+def attach_stage2_subtitles_to_segments(
+    segments: List[dict],
+    subtitle_items: List[Dict[str, Any]],
+) -> List[dict]:
+    """Attach canonical Stage 2 subtitle items onto segments for app/export consumers.
+
+    The Stage 2 envelope keeps subtitle localization separate from segment rows. The
+    app still persists `segments.json` as the formal result-layer artifact, so it
+    materializes `subtitles.items[]` onto `segment["export_subtitle"]` here.
+
+    Invalid or incomplete subtitle items fall back to source instructions.
+    """
+
+    input_segments = [dict(segment) for segment in segments if isinstance(segment, dict)]
+    source_subtitles = _source_instruction_subtitles(input_segments)
+    payload = {
+        "thought": "",
+        "subtitles": [dict(item) for item in subtitle_items if isinstance(item, dict)],
+    }
+    subtitles, _reason = validate_subtitle_payload(
+        payload,
+        len(input_segments),
+        segment_ids=_segment_id_sequence(input_segments),
+    )
+    if not subtitles:
+        subtitles = source_subtitles
+    return _attach_export_subtitles(input_segments, subtitles)
+
+
 def run_export_subtitle_localization_pass(
     sample_id: str,
     segments: List[dict],
@@ -1751,7 +1780,11 @@ def run_llm_postprocess_pass(
     merge_config: LLMMergeConfig,
     backend: Any = None,
 ) -> Tuple[List[dict], Optional[Dict[str, Any]], Dict[str, Any]]:
-    """Legacy Stage 2 API.
+    """Legacy Stage 2 API kept as a compatibility facade.
+
+    App-side orchestration should use `run_llm_stage2_pass(...)` as the canonical
+    Stage 2 contract. This wrapper remains for module consumers that still expect
+    the older merge+summary tuple shape.
 
     Returns:
       - cleaned_segments: merge output (or original segments on merge failure)

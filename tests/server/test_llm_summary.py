@@ -1134,7 +1134,42 @@ def _wait_until(predicate, *, timeout: float = 3.0, interval: float = 0.02) -> N
     assert predicate()
 
 
-def _make_stage2_writeback_app(tmp_path: Path, monkeypatch, *, subtitle_pass):
+def _stage2_envelope(
+    segments: list[dict],
+    *,
+    hierarchy: dict | None,
+    subtitle_items: list[dict],
+    merge_diagnostics: dict | None = None,
+    summary_diagnostics: dict | None = None,
+    subtitle_diagnostics: dict | None = None,
+) -> dict:
+    return {
+        "stage": "stage2",
+        "version": 2,
+        "merge": {
+            "applied": bool((merge_diagnostics or {}).get("llm_merge_applied", False)),
+            "segments": [dict(segment) for segment in segments],
+            "diagnostics": dict(merge_diagnostics or {}),
+        },
+        "summary": {
+            "applied": bool((summary_diagnostics or {}).get("llm_summary_applied", False)),
+            "hierarchy": None if hierarchy is None else dict(hierarchy),
+            "diagnostics": dict(summary_diagnostics or {}),
+        },
+        "subtitles": {
+            "requested_language": str((subtitle_diagnostics or {}).get("llm_subtitle_requested_language", "en")),
+            "target_language": str((subtitle_diagnostics or {}).get("llm_subtitle_requested_language", "en")),
+            "language": str((subtitle_diagnostics or {}).get("llm_subtitle_language", "en")),
+            "output_language": str((subtitle_diagnostics or {}).get("llm_subtitle_output_language", "en")),
+            "source_instruction_language": "en",
+            "applied": bool((subtitle_diagnostics or {}).get("llm_subtitle_applied", False)),
+            "items": [dict(item) for item in subtitle_items],
+            "diagnostics": dict(subtitle_diagnostics or {}),
+        },
+    }
+
+
+def _make_stage2_writeback_app(tmp_path: Path, monkeypatch, *, stage2_pass):
     subset = "demo"
     sample_id = "sample"
 
@@ -1181,12 +1216,35 @@ def _make_stage2_writeback_app(tmp_path: Path, monkeypatch, *, subtitle_pass):
             ]
         },
     )
+    monkeypatch.setattr(app_module, "run_llm_stage2_pass", stage2_pass)
     monkeypatch.setattr(
         app_module,
-        "run_llm_postprocess_pass",
-        lambda _sid, segments, _config: (
+        "export_sample_outputs",
+        lambda **_kwargs: {"export_enabled": False, "export_attempted": False},
+    )
+    monkeypatch.setattr(app_module, "FrameExtractor", _NoopFrameExtractorForAppStage2)
+
+    config = Config(
+        datasets=[{"root": str(data_root), "subset": subset}],
+        run={"base_dir": str(tmp_path), "run_id": "testrun", "force_resume": True},
+        server={"auto_exit_after_all_done": False},
+        llm_merge={"enabled": True},
+        export={"enabled": False, "subtitles": {"enabled": False, "language": "zh"}},
+    )
+    app = create_app(config)
+    app.state.runtime.start()
+    return sample_out_dir
+
+
+def test_app_finalize_writes_stage2_localized_subtitles_back_to_segments_json(tmp_path, monkeypatch) -> None:
+    stage2_calls: list[str] = []
+
+    def fake_stage2_pass(_sid, segments, _config, *, target_language="en", backend=None):
+        del backend
+        stage2_calls.append(str(target_language))
+        return _stage2_envelope(
             segments,
-            {
+            hierarchy={
                 "enabled_levels": [1, 0, 0],
                 "enabled_level_names": ["coarse"],
                 "root_level": "coarse",
@@ -1200,46 +1258,22 @@ def _make_stage2_writeback_app(tmp_path: Path, monkeypatch, *, subtitle_pass):
                     }
                 ],
             },
-            {"llm_merge_applied": False, "llm_summary_applied": True},
-        ),
-    )
-    monkeypatch.setattr(app_module, "run_export_subtitle_localization_pass", subtitle_pass)
-    monkeypatch.setattr(
-        app_module,
-        "export_sample_outputs",
-        lambda **_kwargs: {"export_enabled": False, "export_attempted": False},
-    )
-    monkeypatch.setattr(app_module, "FrameExtractor", _NoopFrameExtractorForAppStage2)
+            subtitle_items=[{"seg_id": 0, "subtitle": "拿起碗"}],
+            merge_diagnostics={"llm_merge_applied": False},
+            summary_diagnostics={"llm_summary_applied": True},
+            subtitle_diagnostics={
+                "llm_subtitle_requested_language": "zh",
+                "llm_subtitle_language": "zh",
+                "llm_subtitle_output_language": "zh",
+                "llm_subtitle_attempted": True,
+                "llm_subtitle_applied": True,
+                "llm_subtitle_fallback_used": False,
+                "llm_subtitle_reason": "applied",
+                "llm_subtitle_segment_count": len(segments),
+            },
+        )
 
-    config = Config(
-        datasets=[{"root": str(data_root), "subset": subset}],
-        run={"base_dir": str(tmp_path), "run_id": "testrun", "force_resume": True},
-        server={"auto_exit_after_all_done": False},
-        export={"enabled": False, "subtitles": {"enabled": False, "language": "zh"}},
-    )
-    app = create_app(config)
-    app.state.runtime.start()
-    return sample_out_dir
-
-
-def test_app_finalize_writes_stage2_localized_subtitles_back_to_segments_json(tmp_path, monkeypatch) -> None:
-    subtitle_calls: list[str] = []
-
-    def fake_subtitle_pass(_sid, segments, _config, target_language):
-        subtitle_calls.append(str(target_language))
-        localized = [dict(segment, export_subtitle="拿起碗") for segment in segments]
-        return localized, {
-            "export_subtitle_requested_language": "zh",
-            "export_subtitle_language": "zh",
-            "export_subtitle_output_language": "zh",
-            "export_subtitle_attempted": True,
-            "export_subtitle_applied": True,
-            "export_subtitle_fallback_used": False,
-            "export_subtitle_reason": "applied",
-            "export_subtitle_segment_count": len(localized),
-        }
-
-    sample_out_dir = _make_stage2_writeback_app(tmp_path, monkeypatch, subtitle_pass=fake_subtitle_pass)
+    sample_out_dir = _make_stage2_writeback_app(tmp_path, monkeypatch, stage2_pass=fake_stage2_pass)
 
     done_marker = sample_out_dir / ".DONE"
     failed_marker = sample_out_dir / ".FAILED"
@@ -1247,32 +1281,53 @@ def test_app_finalize_writes_stage2_localized_subtitles_back_to_segments_json(tm
 
     assert done_marker.exists()
     assert not failed_marker.exists()
-    assert subtitle_calls == ["zh"]
+    assert stage2_calls == ["zh"]
 
     result = json.loads((sample_out_dir / "segments.json").read_text(encoding="utf-8"))
     assert result["segments"][0]["instruction"] == "Pick up bowl"
     assert result["segments"][0]["export_subtitle"] == "拿起碗"
     assert result["task_hierarchy"]["roots"][0]["summary"] == "Pick up bowl"
+    assert result["diagnostics"]["llm_subtitle_reason"] == "applied"
 
 
 def test_app_finalize_writes_stage2_subtitle_fallback_back_to_segments_json(tmp_path, monkeypatch) -> None:
-    subtitle_calls: list[str] = []
+    stage2_calls: list[str] = []
 
-    def fake_subtitle_pass(_sid, segments, _config, target_language):
-        subtitle_calls.append(str(target_language))
-        fallback = [dict(segment, export_subtitle=str(segment.get("instruction", "")).strip()) for segment in segments]
-        return fallback, {
-            "export_subtitle_requested_language": "zh",
-            "export_subtitle_language": "en",
-            "export_subtitle_output_language": "en",
-            "export_subtitle_attempted": True,
-            "export_subtitle_applied": False,
-            "export_subtitle_fallback_used": True,
-            "export_subtitle_reason": "request_failed:RuntimeError",
-            "export_subtitle_segment_count": len(fallback),
-        }
+    def fake_stage2_pass(_sid, segments, _config, *, target_language="en", backend=None):
+        del backend
+        stage2_calls.append(str(target_language))
+        return _stage2_envelope(
+            segments,
+            hierarchy={
+                "enabled_levels": [1, 0, 0],
+                "enabled_level_names": ["coarse"],
+                "root_level": "coarse",
+                "roots": [
+                    {
+                        "level": "coarse",
+                        "start_seg_id": 0,
+                        "end_seg_id": 0,
+                        "summary": "Pick up bowl",
+                        "children": [],
+                    }
+                ],
+            },
+            subtitle_items=[{"seg_id": 0, "subtitle": "Pick up bowl"}],
+            merge_diagnostics={"llm_merge_applied": False},
+            summary_diagnostics={"llm_summary_applied": True},
+            subtitle_diagnostics={
+                "llm_subtitle_requested_language": "zh",
+                "llm_subtitle_language": "en",
+                "llm_subtitle_output_language": "en",
+                "llm_subtitle_attempted": True,
+                "llm_subtitle_applied": False,
+                "llm_subtitle_fallback_used": True,
+                "llm_subtitle_reason": "request_failed:RuntimeError",
+                "llm_subtitle_segment_count": len(segments),
+            },
+        )
 
-    sample_out_dir = _make_stage2_writeback_app(tmp_path, monkeypatch, subtitle_pass=fake_subtitle_pass)
+    sample_out_dir = _make_stage2_writeback_app(tmp_path, monkeypatch, stage2_pass=fake_stage2_pass)
 
     done_marker = sample_out_dir / ".DONE"
     failed_marker = sample_out_dir / ".FAILED"
@@ -1280,9 +1335,13 @@ def test_app_finalize_writes_stage2_subtitle_fallback_back_to_segments_json(tmp_
 
     assert done_marker.exists()
     assert not failed_marker.exists()
-    assert subtitle_calls == ["zh"]
+    assert stage2_calls == ["zh"]
 
     result = json.loads((sample_out_dir / "segments.json").read_text(encoding="utf-8"))
     assert result["segments"][0]["instruction"] == "Pick up bowl"
     assert result["segments"][0]["export_subtitle"] == "Pick up bowl"
-    assert result["diagnostics"]["export_subtitle_reason"] == "request_failed:RuntimeError"
+    assert result["diagnostics"]["llm_subtitle_reason"] == "request_failed:RuntimeError"
+
+    sample_runtime = json.loads((sample_out_dir / "sample_runtime.json").read_text(encoding="utf-8"))
+    assert sample_runtime["fallback"]["fields"]["llm_subtitle_fallback_used"] is True
+    assert sample_runtime["fallback"]["reasons"] == []
