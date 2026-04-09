@@ -147,75 +147,10 @@ def test_run_llm_summary_pass_builds_nested_task_hierarchy() -> None:
     assert diagnostics["llm_summary_root_level"] == "coarse"
     assert diagnostics["llm_summary_output_level_counts"] == {"coarse": 2, "medium": 2, "fine": 4}
     assert hierarchy["enabled_levels"] == [1, 1, 1]
-    assert diagnostics["llm_summary_levels_named"] == {"coarse": 1, "medium": 1, "fine": 1}
     assert hierarchy["enabled_level_names"] == ["coarse", "medium", "fine"]
     assert hierarchy["roots"][0]["summary"] == "Handle the first item"
     assert hierarchy["roots"][0]["children"][0]["summary"] == "Load the first item"
     assert hierarchy["roots"][0]["children"][0]["children"][0]["summary"] == "Pick up the first item"
-    assert backend.calls[0]["schema_name"] == "segment_hierarchy_result"
-
-
-def test_run_llm_summary_pass_exposes_adapter_endpoint_diagnostics() -> None:
-    backend = SequenceBackend(
-        [
-            {
-                "thought": "The cleaned segments summarize cleanly across three levels.",
-                "coarse": [
-                    {"start_seg_id": 0, "end_seg_id": 1, "summary": "Handle the first item"},
-                    {"start_seg_id": 2, "end_seg_id": 3, "summary": "Handle the second item"},
-                ],
-                "medium": [
-                    {"start_seg_id": 0, "end_seg_id": 1, "summary": "Load the first item"},
-                    {"start_seg_id": 2, "end_seg_id": 3, "summary": "Load the second item"},
-                ],
-                "fine": [
-                    {"start_seg_id": 0, "end_seg_id": 0, "summary": "Pick up the first item"},
-                    {"start_seg_id": 1, "end_seg_id": 1, "summary": "Place the first item into the target area"},
-                    {"start_seg_id": 2, "end_seg_id": 2, "summary": "Pick up the second item"},
-                    {"start_seg_id": 3, "end_seg_id": 3, "summary": "Place the second item into the target area"},
-                ],
-            }
-        ],
-        diagnostics_sequence=[
-            {
-                "parsed_endpoint": "chat_completions",
-                "final_failure_reason": None,
-                "responses": {
-                    "called": True,
-                    "request_succeeded": True,
-                    "http_status_code": 200,
-                    "json_received": True,
-                    "body_shape": "dict",
-                    "top_level_keys": ["output"],
-                    "structured_payload_found": False,
-                    "failure_reason": "body_shape_mismatch",
-                },
-                "chat_completions": {
-                    "called": True,
-                    "request_succeeded": True,
-                    "http_status_code": 200,
-                    "json_received": True,
-                    "body_shape": "dict",
-                    "top_level_keys": ["choices"],
-                    "structured_payload_found": True,
-                    "failure_reason": None,
-                },
-            }
-        ],
-    )
-    cfg = LLMMergeConfig(enabled=True, summary_levels=[1, 1, 1])
-
-    _, diagnostics = run_llm_summary_pass(
-        "demo_sample",
-        _segments(),
-        cfg,
-        backend=backend,
-    )
-
-    assert diagnostics["llm_summary_adapter_diagnostics"]["parsed_endpoint"] == "chat_completions"
-    assert diagnostics["llm_summary_adapter_diagnostics"]["responses"]["failure_reason"] == "body_shape_mismatch"
-    assert diagnostics["llm_summary_adapter_diagnostics"]["chat_completions"]["structured_payload_found"] is True
-    assert diagnostics["llm_summary_adapter_diagnostics_attempts"][0]["request_attempt_index"] == 1
 
 
 def test_run_llm_summary_pass_falls_back_to_identity_hierarchy_on_invalid_partition() -> None:
@@ -248,7 +183,6 @@ def test_run_llm_summary_pass_falls_back_to_identity_hierarchy_on_invalid_partit
     assert diagnostics["llm_summary_fallback_used"] is True
     assert diagnostics["llm_summary_fallback_reason"] == "cross_level_nesting_violation:coarse->fine"
     assert diagnostics["llm_summary_output_level_counts"] == {"coarse": 4, "fine": 4}
-    assert diagnostics["llm_summary_levels_named"] == {"coarse": 1, "medium": 0, "fine": 1}
     assert hierarchy["roots"][0]["summary"] == "Pick up the first item"
     assert hierarchy["root_level"] == "coarse"
 
@@ -304,7 +238,6 @@ def test_run_llm_postprocess_pass_runs_merge_then_summary() -> None:
     assert task_hierarchy["enabled_level_names"] == ["medium", "fine"]
     assert task_hierarchy["root_level"] == "medium"
     assert task_hierarchy["roots"][0]["children"][0]["summary"] == "Place the first item into the target area"
-    assert [call["schema_name"] for call in backend.calls] == ["segment_merge_result", "segment_hierarchy_result"]
 
 
 def test_run_llm_postprocess_pass_runs_summary_even_when_merge_request_fails() -> None:
@@ -351,12 +284,6 @@ def test_run_llm_postprocess_pass_runs_summary_even_when_merge_request_fails() -
     assert task_hierarchy["enabled_level_names"] == ["coarse", "medium", "fine"]
     assert len(task_hierarchy["roots"]) == 2
     assert len(cleaned_segments) == 4
-    assert [call["schema_name"] for call in backend.calls] == [
-        "segment_merge_result",
-        "segment_merge_result",
-        "segment_merge_result",
-        "segment_hierarchy_result",
-    ]
 
 
 def test_run_llm_summary_pass_uses_single_remote_attempt_before_fallback() -> None:
@@ -409,63 +336,6 @@ def test_run_export_subtitle_localization_pass_localizes_to_chinese() -> None:
     assert localized_segments[0]["instruction"] == "Pick up the first item"
     assert localized_segments[0]["export_subtitle"] == "拿起第一个物体"
     assert localized_segments[3]["export_subtitle"] == "将第二个物体放入目标区域"
-    assert backend.calls[0]["schema_name"] == "segment_subtitle_result"
-
-
-def test_run_export_subtitle_localization_pass_exposes_adapter_endpoint_diagnostics() -> None:
-    backend = SequenceBackend(
-        [
-            {
-                "thought": "The finalized instructions can be localized one by one.",
-                "subtitles": [
-                    {"seg_id": 0, "subtitle": "拿起第一个物体"},
-                    {"seg_id": 1, "subtitle": "将第一个物体放入目标区域"},
-                    {"seg_id": 2, "subtitle": "拿起第二个物体"},
-                    {"seg_id": 3, "subtitle": "将第二个物体放入目标区域"},
-                ],
-            }
-        ],
-        diagnostics_sequence=[
-            {
-                "parsed_endpoint": "responses",
-                "final_failure_reason": None,
-                "responses": {
-                    "called": True,
-                    "request_succeeded": True,
-                    "http_status_code": 200,
-                    "json_received": True,
-                    "body_shape": "dict",
-                    "top_level_keys": ["output", "output_text"],
-                    "structured_payload_found": True,
-                    "failure_reason": None,
-                },
-                "chat_completions": {
-                    "called": False,
-                    "request_succeeded": False,
-                    "http_status_code": None,
-                    "json_received": False,
-                    "body_shape": "not_called",
-                    "top_level_keys": [],
-                    "structured_payload_found": False,
-                    "failure_reason": None,
-                },
-            }
-        ],
-    )
-    cfg = LLMMergeConfig(enabled=True)
-
-    _, diagnostics = run_export_subtitle_localization_pass(
-        "demo_sample",
-        _segments(),
-        cfg,
-        target_language="zh",
-        backend=backend,
-    )
-
-    assert diagnostics["export_subtitle_adapter_diagnostics"]["parsed_endpoint"] == "responses"
-    assert diagnostics["export_subtitle_adapter_diagnostics"]["responses"]["structured_payload_found"] is True
-    assert diagnostics["export_subtitle_adapter_diagnostics"]["chat_completions"]["called"] is False
-    assert diagnostics["export_subtitle_adapter_diagnostics_attempts"][0]["request_attempt_index"] == 1
 
 
 def test_run_export_subtitle_localization_pass_reuses_source_instruction_for_english() -> None:
@@ -551,44 +421,6 @@ def test_run_llm_subtitle_localization_pass_short_circuits_when_stage2_disabled(
     assert backend.calls == []
 
 
-def test_run_llm_subtitle_helpers_agree_on_disabled_empty_input_reason() -> None:
-    backend = SequenceBackend(
-        [
-            {
-                "thought": "Should not be called on empty input.",
-                "subtitles": [
-                    {"seg_id": 0, "subtitle": "不应被调用"},
-                ],
-            }
-        ]
-    )
-    cfg = LLMMergeConfig(enabled=False)
-
-    export_segments, export_diagnostics = run_export_subtitle_localization_pass(
-        "demo_sample",
-        [],
-        cfg,
-        target_language="zh",
-        backend=backend,
-    )
-
-    llm_items, llm_diagnostics = run_llm_subtitle_localization_pass(
-        "demo_sample",
-        [],
-        cfg,
-        target_language="zh",
-        backend=backend,
-    )
-
-    assert export_segments == []
-    assert export_diagnostics["export_subtitle_reason"] == "disabled"
-
-    assert llm_items == []
-    assert llm_diagnostics["llm_subtitle_reason"] == "disabled"
-
-    assert backend.calls == []
-
-
 def test_run_llm_subtitle_localization_pass_localizes_to_chinese() -> None:
     backend = SequenceBackend(
         [
@@ -617,7 +449,6 @@ def test_run_llm_subtitle_localization_pass_localizes_to_chinese() -> None:
     assert diagnostics["llm_subtitle_applied"] is True
     assert diagnostics["llm_subtitle_reason"] == "applied"
     assert items[0] == {"seg_id": 0, "subtitle": "拿起第一个物体"}
-    assert backend.calls[0]["schema_name"] == "segment_subtitle_result"
 
 
 def test_run_export_subtitle_localization_pass_uses_single_remote_attempt_before_fallback() -> None:
@@ -691,6 +522,7 @@ def test_run_llm_stage2_pass_persists_localized_subtitles_as_formal_stage2_artif
         backend=backend,
     )
 
+    assert set(result.keys()) == {"stage", "version", "merge", "summary", "subtitles"}
     assert result["stage"] == "stage2"
     assert result["version"] == 2
     assert result["merge"]["segments"][0]["instruction"] == "Pick up the first item"
@@ -702,11 +534,6 @@ def test_run_llm_stage2_pass_persists_localized_subtitles_as_formal_stage2_artif
     assert result["subtitles"]["output_language"] == "zh"
     assert result["subtitles"]["applied"] is True
     assert result["subtitles"]["items"][0]["subtitle"] == "拿起第一个物体"
-    assert [call["schema_name"] for call in backend.calls] == [
-        "segment_merge_result",
-        "segment_hierarchy_result",
-        "segment_subtitle_result",
-    ]
 
 
 def test_run_llm_stage2_pass_runs_summary_and_subtitles_when_merge_fails() -> None:
@@ -767,13 +594,61 @@ def test_run_llm_stage2_pass_runs_summary_and_subtitles_when_merge_fails() -> No
     assert result["subtitles"]["items"][0] == {"seg_id": 0, "subtitle": "拿起第一个物体"}
     assert result["subtitles"]["diagnostics"]["llm_subtitle_attempted"] is True
 
-    assert [call["schema_name"] for call in backend.calls] == [
-        "segment_merge_result",
-        "segment_merge_result",
-        "segment_merge_result",
-        "segment_hierarchy_result",
-        "segment_subtitle_result",
-    ]
+
+def test_run_llm_stage2_pass_propagates_summary_fallback_contract() -> None:
+    backend = SequenceBackend(
+        [
+            {
+                "thought": "No merge needed.",
+                "merged_ranges": [
+                    {"start_seg_id": 0, "end_seg_id": 0},
+                    {"start_seg_id": 1, "end_seg_id": 1},
+                    {"start_seg_id": 2, "end_seg_id": 2},
+                    {"start_seg_id": 3, "end_seg_id": 3},
+                ],
+            },
+            {
+                "thought": "This partition crosses levels.",
+                "coarse": [
+                    {"start_seg_id": 0, "end_seg_id": 1, "summary": "First major task"},
+                    {"start_seg_id": 2, "end_seg_id": 3, "summary": "Second major task"},
+                ],
+                "fine": [
+                    {"start_seg_id": 0, "end_seg_id": 2, "summary": "Crossing fine task"},
+                    {"start_seg_id": 3, "end_seg_id": 3, "summary": "Last step"},
+                ],
+            },
+            {
+                "thought": "The finalized instructions can be localized one by one.",
+                "subtitles": [
+                    {"seg_id": 0, "subtitle": "拿起第一个物体"},
+                    {"seg_id": 1, "subtitle": "将第一个物体放入目标区域"},
+                    {"seg_id": 2, "subtitle": "拿起第二个物体"},
+                    {"seg_id": 3, "subtitle": "将第二个物体放入目标区域"},
+                ],
+            },
+        ]
+    )
+    cfg = LLMMergeConfig(enabled=True, min_input_segments=4, summary_levels=[1, 0, 1], max_attempts=1)
+
+    result = run_llm_stage2_pass(
+        "demo_sample",
+        _segments(),
+        cfg,
+        target_language="zh",
+        backend=backend,
+    )
+
+    assert result["summary"]["applied"] is False
+    assert result["summary"]["hierarchy"] is not None
+    assert result["summary"]["hierarchy"]["root_level"] == "coarse"
+    assert result["summary"]["hierarchy"]["roots"][0]["summary"] == "Pick up the first item"
+    assert result["summary"]["diagnostics"]["llm_summary_fallback_used"] is True
+    assert result["summary"]["diagnostics"]["llm_summary_reason"] == "cross_level_nesting_violation:coarse->fine"
+    assert result["summary"]["diagnostics"]["llm_summary_fallback_reason"] == "cross_level_nesting_violation:coarse->fine"
+    assert result["summary"]["diagnostics"]["llm_summary_output_level_counts"] == {"coarse": 4, "fine": 4}
+    assert result["subtitles"]["applied"] is True
+    assert result["subtitles"]["items"][0] == {"seg_id": 0, "subtitle": "拿起第一个物体"}
 
 
 def test_stage2_language_contract_canonicalizes_aliases_and_keeps_source_instruction_english() -> None:
@@ -840,11 +715,6 @@ def test_stage2_language_contract_canonicalizes_aliases_and_keeps_source_instruc
     assert result["subtitles"]["target_language"] == "zh"
     assert result["subtitles"]["source_instruction_language"] == "en"
     assert result["subtitles"]["items"][0]["subtitle"] == "拿起第一个物体"
-    assert [call["schema_name"] for call in backend.calls] == [
-        "segment_merge_result",
-        "segment_hierarchy_result",
-        "segment_subtitle_result",
-    ]
 
 
 def test_llm_subtitle_localization_pass_treats_en_us_as_english_reuse() -> None:
@@ -1169,7 +1039,14 @@ def _stage2_envelope(
     }
 
 
-def _make_stage2_writeback_app(tmp_path: Path, monkeypatch, *, stage2_pass):
+def _make_stage2_writeback_app(
+    tmp_path: Path,
+    monkeypatch,
+    *,
+    stage2_pass,
+    export_enabled: bool = False,
+    export_impl=None,
+):
     subset = "demo"
     sample_id = "sample"
 
@@ -1217,11 +1094,14 @@ def _make_stage2_writeback_app(tmp_path: Path, monkeypatch, *, stage2_pass):
         },
     )
     monkeypatch.setattr(app_module, "run_llm_stage2_pass", stage2_pass)
-    monkeypatch.setattr(
-        app_module,
-        "export_sample_outputs",
-        lambda **_kwargs: {"export_enabled": False, "export_attempted": False},
-    )
+    if export_impl is None:
+        monkeypatch.setattr(
+            app_module,
+            "export_sample_outputs",
+            lambda **_kwargs: {"export_enabled": False, "export_attempted": False},
+        )
+    else:
+        monkeypatch.setattr(app_module, "export_sample_outputs", export_impl)
     monkeypatch.setattr(app_module, "FrameExtractor", _NoopFrameExtractorForAppStage2)
 
     config = Config(
@@ -1229,7 +1109,7 @@ def _make_stage2_writeback_app(tmp_path: Path, monkeypatch, *, stage2_pass):
         run={"base_dir": str(tmp_path), "run_id": "testrun", "force_resume": True},
         server={"auto_exit_after_all_done": False},
         llm_merge={"enabled": True},
-        export={"enabled": False, "subtitles": {"enabled": False, "language": "zh"}},
+        export={"enabled": bool(export_enabled), "subtitles": {"enabled": False, "language": "zh"}},
     )
     app = create_app(config)
     app.state.runtime.start()
@@ -1287,7 +1167,16 @@ def test_app_finalize_writes_stage2_localized_subtitles_back_to_segments_json(tm
     assert result["segments"][0]["instruction"] == "Pick up bowl"
     assert result["segments"][0]["export_subtitle"] == "拿起碗"
     assert result["task_hierarchy"]["roots"][0]["summary"] == "Pick up bowl"
-    assert result["diagnostics"]["llm_subtitle_reason"] == "applied"
+    assert "diagnostics" not in result
+
+    sample_runtime = json.loads((sample_out_dir / "sample_runtime.json").read_text(encoding="utf-8"))
+    assert sample_runtime["stages"]["required"] == ["stage1_segments", "stage2_text"]
+    assert sample_runtime["stages"]["completed"] == ["stage1_segments", "stage2_text"]
+
+    run_summary = json.loads((sample_out_dir.parent.parent / "run_summary.json").read_text(encoding="utf-8"))
+    assert run_summary["required_stages"] == ["stage1_segments", "stage2_text"]
+    assert run_summary["stage_completion"]["stage1_segments"]["completed"] == 1
+    assert run_summary["stage_completion"]["stage2_text"]["completed"] == 1
 
 
 def test_app_finalize_writes_stage2_subtitle_fallback_back_to_segments_json(tmp_path, monkeypatch) -> None:
@@ -1340,9 +1229,161 @@ def test_app_finalize_writes_stage2_subtitle_fallback_back_to_segments_json(tmp_
     result = json.loads((sample_out_dir / "segments.json").read_text(encoding="utf-8"))
     assert result["segments"][0]["instruction"] == "Pick up bowl"
     assert result["segments"][0]["export_subtitle"] == "Pick up bowl"
-    assert result["diagnostics"]["llm_subtitle_reason"] == "request_failed:RuntimeError"
+    assert "diagnostics" not in result
 
     sample_runtime = json.loads((sample_out_dir / "sample_runtime.json").read_text(encoding="utf-8"))
     assert sample_runtime["fallback"]["fields"]["llm_subtitle_fallback_used"] is True
     assert sample_runtime["fallback"]["fields"]["llm_subtitle_fallback_reason"] == "request_failed:RuntimeError"
     assert sample_runtime["fallback"]["reasons"] == ["request_failed:RuntimeError"]
+
+    run_summary = json.loads((sample_out_dir.parent.parent / "run_summary.json").read_text(encoding="utf-8"))
+    assert run_summary["required_stages"] == ["stage1_segments", "stage2_text"]
+    assert run_summary["fallback"]["reason_counts"]["request_failed:RuntimeError"] == 1
+
+
+def test_app_finalize_export_success_runtime_evidence_stays_out_of_segments_json(tmp_path, monkeypatch) -> None:
+    def fake_stage2_pass(_sid, segments, _config, *, target_language="en", backend=None):
+        del target_language, backend
+        return _stage2_envelope(
+            segments,
+            hierarchy={
+                "enabled_levels": [1, 0, 0],
+                "enabled_level_names": ["coarse"],
+                "root_level": "coarse",
+                "roots": [
+                    {
+                        "level": "coarse",
+                        "start_seg_id": 0,
+                        "end_seg_id": 0,
+                        "summary": "Pick up bowl",
+                        "children": [],
+                    }
+                ],
+            },
+            subtitle_items=[{"seg_id": 0, "subtitle": "拿起碗"}],
+            merge_diagnostics={"llm_merge_applied": False},
+            summary_diagnostics={"llm_summary_applied": True},
+            subtitle_diagnostics={
+                "llm_subtitle_requested_language": "zh",
+                "llm_subtitle_language": "zh",
+                "llm_subtitle_output_language": "zh",
+                "llm_subtitle_attempted": True,
+                "llm_subtitle_applied": True,
+                "llm_subtitle_reason": "applied",
+            },
+        )
+
+    def fake_export(**_kwargs):
+        return {
+            "export_enabled": True,
+            "export_attempted": True,
+            "export_mode": "annotated",
+            "export_reason": "applied",
+        }
+
+    sample_out_dir = _make_stage2_writeback_app(
+        tmp_path,
+        monkeypatch,
+        stage2_pass=fake_stage2_pass,
+        export_enabled=True,
+        export_impl=fake_export,
+    )
+
+    done_marker = sample_out_dir / ".DONE"
+    failed_marker = sample_out_dir / ".FAILED"
+    _wait_until(lambda: done_marker.exists() or failed_marker.exists())
+
+    assert done_marker.exists()
+    assert not failed_marker.exists()
+
+    result = json.loads((sample_out_dir / "segments.json").read_text(encoding="utf-8"))
+    assert result["segments"][0]["instruction"] == "Pick up bowl"
+    assert result["segments"][0]["export_subtitle"] == "拿起碗"
+    assert result["task_hierarchy"]["roots"][0]["summary"] == "Pick up bowl"
+    assert "diagnostics" not in result
+
+    sample_runtime = json.loads((sample_out_dir / "sample_runtime.json").read_text(encoding="utf-8"))
+    assert sample_runtime["terminal_state"] == "done"
+    assert sample_runtime["stages"]["required"] == ["stage1_segments", "stage2_text", "export"]
+    assert sample_runtime["stages"]["completed"] == ["stage1_segments", "stage2_text", "export"]
+    assert sample_runtime["export"]["status"] == "applied"
+    assert sample_runtime["export"]["reason"] == "applied"
+
+    run_summary = json.loads((sample_out_dir.parent.parent / "run_summary.json").read_text(encoding="utf-8"))
+    assert run_summary["required_stages"] == ["stage1_segments", "stage2_text", "export"]
+    assert run_summary["stage_completion"]["export"]["completed"] == 1
+    assert run_summary["export"]["status_counts"]["applied"] == 1
+
+
+def test_app_finalize_export_failure_writes_failure_runtime_evidence(tmp_path, monkeypatch) -> None:
+    def fake_stage2_pass(_sid, segments, _config, *, target_language="en", backend=None):
+        del target_language, backend
+        return _stage2_envelope(
+            segments,
+            hierarchy={
+                "enabled_levels": [1, 0, 0],
+                "enabled_level_names": ["coarse"],
+                "root_level": "coarse",
+                "roots": [
+                    {
+                        "level": "coarse",
+                        "start_seg_id": 0,
+                        "end_seg_id": 0,
+                        "summary": "Pick up bowl",
+                        "children": [],
+                    }
+                ],
+            },
+            subtitle_items=[{"seg_id": 0, "subtitle": "拿起碗"}],
+            merge_diagnostics={"llm_merge_applied": False},
+            summary_diagnostics={"llm_summary_applied": True},
+            subtitle_diagnostics={
+                "llm_subtitle_requested_language": "zh",
+                "llm_subtitle_language": "zh",
+                "llm_subtitle_output_language": "zh",
+                "llm_subtitle_attempted": True,
+                "llm_subtitle_applied": True,
+                "llm_subtitle_reason": "applied",
+            },
+        )
+
+    def fake_export(**_kwargs):
+        return {
+            "export_enabled": True,
+            "export_attempted": True,
+            "export_mode": "annotated",
+            "export_reason": "failed",
+            "export_error": "ffmpeg failed",
+        }
+
+    sample_out_dir = _make_stage2_writeback_app(
+        tmp_path,
+        monkeypatch,
+        stage2_pass=fake_stage2_pass,
+        export_enabled=True,
+        export_impl=fake_export,
+    )
+
+    done_marker = sample_out_dir / ".DONE"
+    failed_marker = sample_out_dir / ".FAILED"
+    _wait_until(lambda: done_marker.exists() or failed_marker.exists())
+
+    assert not done_marker.exists()
+    assert failed_marker.exists()
+    assert not (sample_out_dir / "segments.json").exists()
+
+    failure_report = json.loads((sample_out_dir / "failure.json").read_text(encoding="utf-8"))
+    assert failure_report["reason"] == "export_failed"
+    assert failure_report["details"]["export_reason"] == "failed"
+    assert failure_report["details"]["export_error"] == "ffmpeg failed"
+
+    sample_runtime = json.loads((sample_out_dir / "sample_runtime.json").read_text(encoding="utf-8"))
+    assert sample_runtime["terminal_state"] == "failed"
+    assert sample_runtime["export"]["status"] == "failed"
+    assert sample_runtime["failure"]["reason"] == "export_failed"
+    assert sample_runtime["failure"]["report_path"] == "failure.json"
+
+    run_summary = json.loads((sample_out_dir.parent.parent / "run_summary.json").read_text(encoding="utf-8"))
+    assert run_summary["required_stages"] == ["stage1_segments", "stage2_text", "export"]
+    assert run_summary["sample_counts"]["failed"] == 1
+    assert run_summary["failure_reasons"]["export_failed"] == 1

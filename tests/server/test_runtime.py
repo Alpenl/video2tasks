@@ -67,6 +67,28 @@ def test_app_runtime_start_runs_producer_explicitly(tmp_path, monkeypatch) -> No
     assert not runtime.is_alive()
 
 
+def test_app_runtime_uses_app_module_monkeypatches_applied_after_create_app(tmp_path, monkeypatch) -> None:
+    config = _make_dataset_config(tmp_path)
+    app = create_app(config)
+    entered = threading.Event()
+
+    monkeypatch.setattr(app_module, "read_video_info", lambda _mp4: (30.0, 16))
+
+    def mark_build_windows(*_args, **_kwargs):
+        entered.set()
+        return [Window(window_id=0, start_frame=0, end_frame=15, frame_ids=[0, 5, 10, 15])]
+
+    monkeypatch.setattr(app_module, "build_windows", mark_build_windows)
+
+    runtime = app.state.runtime
+    runtime.start()
+    assert entered.wait(1.0)
+
+    runtime.stop()
+    runtime.join(timeout=2.0)
+    assert not runtime.is_alive()
+
+
 def test_thread_runtime_supports_explicit_stop_and_join() -> None:
     started = threading.Event()
     stopped = threading.Event()

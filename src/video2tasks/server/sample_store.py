@@ -24,6 +24,12 @@ def _normalize_stage_names(stages: Iterable[str]) -> tuple[str, ...]:
     return tuple(normalized)
 
 
+def _result_payload_for_segments(payload: Dict[str, Any]) -> Dict[str, Any]:
+    sanitized = dict(payload)
+    sanitized.pop("diagnostics", None)
+    return sanitized
+
+
 class SampleStore:
     """Resolve sample output paths and persist/reload sample artifacts."""
 
@@ -327,7 +333,10 @@ class SampleStore:
 
     def persist_sample_payload(self, subset: str, sample_id: str, payload: Dict[str, Any]) -> None:
         with self._get_sample_lock(subset, sample_id):
-            self._write_json(self.segments_path(subset, sample_id), payload)
+            self._write_json(
+                self.segments_path(subset, sample_id),
+                _result_payload_for_segments(payload),
+            )
 
     def finalize_sample_success(
         self,
@@ -350,11 +359,7 @@ class SampleStore:
             missing_rendered = ", ".join(missing_required_stages)
             raise ValueError(f"missing required stages: {missing_rendered}")
 
-        payload_to_persist = dict(payload)
-        diagnostics = dict(payload_to_persist.get("diagnostics", {}))
-        diagnostics["required_stages"] = list(normalized_required_stages)
-        diagnostics["completed_stages"] = list(normalized_completed_stages)
-        payload_to_persist["diagnostics"] = diagnostics
+        payload_to_persist = _result_payload_for_segments(payload)
 
         with self._get_sample_lock(subset, sample_id):
             self._write_json(self.segments_path(subset, sample_id), payload_to_persist)

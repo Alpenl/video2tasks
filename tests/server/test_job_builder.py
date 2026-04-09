@@ -1,6 +1,5 @@
-import video2tasks.server.app as app_module
-
 from video2tasks.server.job_builder import JobBuilder
+from video2tasks.server.protocol import InlineImageTransport, SharedFSImageTransport
 from video2tasks.server.windowing import BoundaryRefinementWindow, Window
 
 
@@ -23,6 +22,15 @@ class _ArtifactExtractor:
         )
 
 
+class _InlineOnlyExtractor:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def get_many_b64_with_artifacts(self, *_args, **_kwargs):
+        self.calls += 1
+        return ["data:image/png;base64,Zm9v"], None
+
+
 def _make_builder() -> JobBuilder:
     return JobBuilder(
         target_width=720,
@@ -34,7 +42,7 @@ def _make_builder() -> JobBuilder:
     )
 
 
-def test_build_window_job_reuses_cached_artifact_with_explicit_producer_consumer_fields() -> None:
+def test_build_window_job_reuses_cached_shared_fs_artifact_and_tracks_provenance() -> None:
     extractor = _ArtifactExtractor()
     builder = _make_builder()
     window = Window(window_id=0, start_frame=0, end_frame=15, frame_ids=[0, 5, 10, 15])
@@ -66,18 +74,19 @@ def test_build_window_job_reuses_cached_artifact_with_explicit_producer_consumer
     )
 
     assert extractor.calls == 1
+    assert isinstance(first_job.image_transport, SharedFSImageTransport)
+    assert isinstance(second_job.image_transport, SharedFSImageTransport)
+    assert first_job.image_transport.mode == "shared_fs"
+    assert second_job.image_transport.mode == "shared_fs"
+    assert second_job.source_count == 1
     assert first_job.meta["artifact_reuse"] is False
     assert second_job.meta["artifact_reuse"] is True
     assert second_job.meta["artifact_producer_task_id"] == "demo::sample_w0_r0"
     assert second_job.meta["artifact_consumer_task_id"] == "demo::sample_w0_r1"
-    assert second_job.meta["artifact_reuse_group"] == first_job.meta["artifact_reuse_group"]
-    assert (
-        second_job.image_transport.artifact_manifest_path
-        == first_job.image_transport.artifact_manifest_path
-    )
+    assert second_job.image_transport.artifact_manifest_path == first_job.image_transport.artifact_manifest_path
 
 
-def test_build_window_job_reuse_group_excludes_refinement_pass() -> None:
+def test_build_window_job_does_not_reuse_artifact_across_window_passes() -> None:
     extractor = _ArtifactExtractor()
     builder = _make_builder()
     coarse_window = Window(window_id=0, start_frame=0, end_frame=15, frame_ids=[0, 5, 10, 15])
@@ -111,13 +120,15 @@ def test_build_window_job_reuse_group_excludes_refinement_pass() -> None:
     )
 
     assert extractor.calls == 2
-    assert refinement_job.meta["artifact_reuse"] is False
     assert refinement_job.meta["window_pass"] == "refinement"
+    assert refinement_job.meta["artifact_reuse"] is False
+    assert refinement_job.meta["artifact_producer_task_id"] == "demo::sample_rw0_r0"
 
 
-def test_build_window_job_reuse_group_changes_with_reuse_boundary_inputs() -> None:
+def test_build_window_job_does_not_reuse_artifact_when_frame_sampling_changes() -> None:
     extractor = _ArtifactExtractor()
     builder = _make_builder()
+    reuse_cache = {}
 
     first_job = builder.build_window_boundary_job(
         extractor,
@@ -129,6 +140,7 @@ def test_build_window_job_reuse_group_changes_with_reuse_boundary_inputs() -> No
         nframes=16,
         repeat_index=0,
         repeat_count=1,
+        reuse_cache=reuse_cache,
     )
     second_job = builder.build_window_boundary_job(
         extractor,
@@ -140,12 +152,18 @@ def test_build_window_job_reuse_group_changes_with_reuse_boundary_inputs() -> No
         nframes=16,
         repeat_index=0,
         repeat_count=1,
+        reuse_cache=reuse_cache,
     )
 
-    assert first_job.meta["artifact_reuse_group"] != second_job.meta["artifact_reuse_group"]
+    assert extractor.calls == 2
+    assert first_job.meta["artifact_reuse"] is False
+    assert second_job.meta["artifact_reuse"] is False
+    assert second_job.meta["artifact_producer_task_id"] == "demo::sample_w0_shifted_r0"
+    assert second_job.meta["artifact_consumer_task_id"] == "demo::sample_w0_shifted_r0"
+    assert second_job.image_transport.artifact_manifest_path != first_job.image_transport.artifact_manifest_path
 
 
-def test_build_boundary_refinement_and_segment_label_jobs_include_transport_metadata() -> None:
+def test_build_boundary_refinement_and_segment_jobs_emit_shared_fs_transport_contract() -> None:
     extractor = _ArtifactExtractor()
     builder = _make_builder()
 
@@ -171,14 +189,61 @@ def test_build_boundary_refinement_and_segment_label_jobs_include_transport_meta
         frame_ids=[20, 25, 30, 35],
     )
 
+    assert boundary_job.task_id == "demo::sample_b3"
+    assert segment_job.task_id == "demo::sample_seg7"
     assert boundary_job.meta["job_type"] == "boundary_refinement"
-    assert boundary_job.meta["artifact_reuse"] is False
-    assert boundary_job.meta["artifact_producer_task_id"] == "demo::sample_b3"
     assert segment_job.meta["job_type"] == "segment_label"
+    assert boundary_job.meta["artifact_reuse"] is False
+    assert segment_job.meta["artifact_reuse"] is False
+    assert boundary_job.meta["artifact_consumer_task_id"] == "demo::sample_b3"
     assert segment_job.meta["artifact_consumer_task_id"] == "demo::sample_seg7"
+    assert isinstance(boundary_job.image_transport, SharedFSImageTransport)
+    assert isinstance(segment_job.image_transport, SharedFSImageTransport)
+    assert boundary_job.image_transport.mode == "shared_fs"
+    assert segment_job.image_transport.mode == "shared_fs"
+    assert boundary_job.image_transport.artifact_manifest_path
+    assert segment_job.image_transport.artifact_manifest_path
 
 
-def test_app_no_longer_exposes_legacy_job_builder_helpers() -> None:
-    assert not hasattr(app_module, "_clone_shared_fs_transport")
-    assert not hasattr(app_module, "_repeat_artifact_reuse_key")
-    assert not hasattr(app_module, "_build_job_payload")
+def test_build_window_job_uses_inline_transport_without_artifacts_and_skips_reuse() -> None:
+    extractor = _InlineOnlyExtractor()
+    builder = _make_builder()
+    window = Window(window_id=0, start_frame=0, end_frame=15, frame_ids=[0, 5, 10, 15])
+    reuse_cache = {}
+
+    first_job = builder.build_window_boundary_job(
+        extractor,
+        task_id="demo::sample_w0_r0",
+        subset="demo",
+        sample_id="sample",
+        window=window,
+        fps=30.0,
+        nframes=16,
+        repeat_index=0,
+        repeat_count=2,
+        reuse_cache=reuse_cache,
+    )
+    second_job = builder.build_window_boundary_job(
+        extractor,
+        task_id="demo::sample_w0_r1",
+        subset="demo",
+        sample_id="sample",
+        window=window,
+        fps=30.0,
+        nframes=16,
+        repeat_index=1,
+        repeat_count=2,
+        reuse_cache=reuse_cache,
+    )
+
+    assert extractor.calls == 2
+    assert isinstance(first_job.image_transport, InlineImageTransport)
+    assert isinstance(second_job.image_transport, InlineImageTransport)
+    assert first_job.image_transport.mode == "inline"
+    assert second_job.image_transport.mode == "inline"
+    assert first_job.source_count == 1
+    assert second_job.source_count == 1
+    assert first_job.meta["artifact_reuse"] is False
+    assert second_job.meta["artifact_reuse"] is False
+    assert first_job.meta["artifact_producer_task_id"] == "demo::sample_w0_r0"
+    assert second_job.meta["artifact_producer_task_id"] == "demo::sample_w0_r1"

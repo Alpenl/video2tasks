@@ -12,11 +12,6 @@ import video2tasks.server.app as app_module
 import video2tasks.server.windowing as windowing_module
 from video2tasks.config import Config
 from video2tasks.server.app import (
-    _count_failed_samples,
-    _final_exit_code,
-    _normalize_loaded_boundary_refinement_vlm_json,
-    _normalize_loaded_window_vlm_json,
-    _requeue_empty_result,
     create_app,
 )
 from video2tasks.server.protocol import JobEnvelope, SharedFSImageTransport
@@ -344,6 +339,17 @@ def test_get_job_returns_typed_image_transport_with_dispatch_id(tmp_path) -> Non
     }
 
 
+def test_create_app_exposes_runtime_state_facade_with_legacy_state_aliases(tmp_path) -> None:
+    app, _client = _make_app(tmp_path)
+
+    runtime_state = app.state.runtime_state
+
+    assert runtime_state.job_queue is app.state.job_queue
+    assert runtime_state.inflight is app.state.inflight
+    assert runtime_state.sample_store is app.state.sample_store
+    assert runtime_state.run_manifest_paths is app.state.run_manifest_paths
+
+
 def test_window_scheduling_duplicate_check_accepts_typed_jobs_in_queue(tmp_path, monkeypatch) -> None:
     entered = threading.Event()
     release = threading.Event()
@@ -525,26 +531,6 @@ def test_refinement_repeat_jobs_do_not_reuse_step_a_contact_sheet_artifacts(tmp_
     time.sleep(0.05)
     app.state.runtime.stop()
     app.state.runtime.join(timeout=1.0)
-
-
-def test_requeue_empty_result_respects_retry_limit() -> None:
-    job_queue = [{"task_id": "existing"}]
-    retry_counts = {}
-    job = {"task_id": "target"}
-
-    attempt1, requeued1 = _requeue_empty_result(job_queue, retry_counts, "target", job, 2)
-    attempt2, requeued2 = _requeue_empty_result(job_queue, retry_counts, "target", job, 2)
-    attempt3, requeued3 = _requeue_empty_result(job_queue, retry_counts, "target", job, 2)
-
-    assert (attempt1, requeued1) == (1, True)
-    assert (attempt2, requeued2) == (2, True)
-    assert (attempt3, requeued3) == (3, False)
-    assert retry_counts == {"target": 3}
-    assert job_queue == [
-        {"task_id": "existing"},
-        {"task_id": "target"},
-        {"task_id": "target"},
-    ]
 
 
 def test_submit_result_is_idempotent_and_rejects_stale_dispatches(tmp_path) -> None:
@@ -833,44 +819,6 @@ def test_timeout_exhaustion_records_terminal_error(tmp_path) -> None:
     assert len(app.state.job_queue) == 0
 
 
-def test_normalize_loaded_window_vlm_json_rejects_transition_beyond_logical_frame_count() -> None:
-    record = {
-        "meta": {"logical_frame_count": 4},
-        "vlm_json": {"transitions": [99], "instructions": ["Add potatoes", "Stir the pot"]},
-    }
-
-    assert _normalize_loaded_window_vlm_json(record) == {}
-
-
-def test_normalize_loaded_boundary_refinement_vlm_json_rejects_transition_outside_middle_candidates() -> None:
-    record = {
-        "frame_ids": list(range(8)),
-        "vlm_json": {"transitions": [0], "instructions": ["Add potatoes", "Stir the pot"]},
-    }
-
-    assert _normalize_loaded_boundary_refinement_vlm_json(record) == {}
-
-
-def test_final_exit_code_returns_nonzero_when_any_sample_failed() -> None:
-    states = {
-        "demo": {"sample_status": {"done": 3, "failed": 4}},
-        "demo2": {"sample_status": {"pending": 0}},
-    }
-
-    assert _count_failed_samples(states) == 1
-    assert _final_exit_code(states) == 1
-    assert _final_exit_code({"demo": {"sample_status": {"done": 3}}}) == 0
-
-
-def test_normalize_loaded_window_vlm_json_uses_persisted_top_level_logical_frame_count() -> None:
-    record = {
-        "logical_frame_count": 4,
-        "vlm_json": {"transitions": [99], "instructions": ["Add potatoes", "Stir the pot"]},
-    }
-
-    assert _normalize_loaded_window_vlm_json(record) == {}
-
-
 def test_missing_frame_mp4_marks_sample_failed(tmp_path) -> None:
     app, _, sample_out_dir = _make_dataset_app(tmp_path)
     failed_marker = sample_out_dir / ".FAILED"
@@ -924,6 +872,9 @@ def test_failure_closure_clears_stale_done_and_segments_and_overwrites_payload(t
     assert report["reason"] == "step_a_exception"
     assert report["details"]["error"] == "step a exploded"
     assert "stale" not in report["details"]
+    runtime_payload = _read_json(sample_out_dir / "sample_runtime.json")
+    assert runtime_payload["terminal_state"] == "failed"
+    assert runtime_payload["failure"]["reason"] == "step_a_exception"
 
 
 def test_output_directory_existing_without_done_marker_is_not_treated_as_done(tmp_path) -> None:
@@ -982,6 +933,52 @@ def test_create_app_backfills_done_runtime_and_run_summary_from_existing_termina
     assert sample_runtime["stages"]["completed"] == ["stage1_segments"]
     assert run_summary["sample_counts"] == {"total": 1, "done": 1, "failed": 0, "pending": 0}
     assert app.state.sample_store.load_sample_runtime("demo", sample_id)["terminal_state"] == "done"
+
+
+def test_create_app_backfills_done_runtime_with_required_export_without_segments_diagnostics(tmp_path) -> None:
+    sample_id = "sample"
+    sample_dir = Path(tmp_path) / "data" / "demo" / sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(
+        tmp_path,
+        export={"enabled": True},
+        required_stages=["stage1_segments", "export"],
+    )
+
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / sample_id
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    (sample_out_dir / ".DONE").write_text("", encoding="utf-8")
+    (sample_out_dir / "segments.json").write_text(
+        json.dumps(
+            {
+                "sample_id": sample_id,
+                "nframes": 16,
+                "segments": [{"seg_id": 0, "start_frame": 0, "end_frame": 15, "instruction": "Add potatoes"}],
+                "task_hierarchy": {"enabled_levels": [1, 0, 0], "enabled_level_names": ["coarse"], "root_level": "coarse", "roots": []},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    _make_dataset_app(tmp_path, with_mp4=False, export={"enabled": True}, start_runtime=False)
+
+    sample_runtime = _read_json(sample_out_dir / "sample_runtime.json")
+    run_summary = _read_json(Path(tmp_path) / "demo" / "testrun" / "run_summary.json")
+
+    assert sample_runtime["terminal_state"] == "done"
+    assert sample_runtime["stages"]["required"] == ["stage1_segments", "export"]
+    assert sample_runtime["stages"]["completed"] == ["stage1_segments", "export"]
+    assert sample_runtime["export"] == {
+        "required": True,
+        "enabled": True,
+        "attempted": True,
+        "status": "applied",
+        "reason": "applied",
+    }
+    assert run_summary["sample_counts"] == {"total": 1, "done": 1, "failed": 0, "pending": 0}
+    assert run_summary["stage_completion"]["export"] == {"completed": 1, "missing": 0}
+    assert run_summary["export"]["status_counts"] == {"applied": 1}
 
 
 def test_retry_evidence_survives_restart_before_terminalization(tmp_path, monkeypatch) -> None:
@@ -1732,6 +1729,67 @@ def test_step_a_invalid_artifact_fails_sample_before_dispatch(tmp_path, monkeypa
     assert report["reason"] == "artifact_extraction_failed"
     assert report["details"]["phase"] == "step_a"
     assert report["details"]["issues"][0]["reason"] == "image_decode_failed"
+
+
+def test_boundary_refinement_reload_rejects_persisted_invalid_result_and_blocks_done(tmp_path, monkeypatch) -> None:
+    sample_out_dir = Path(tmp_path) / 'demo' / 'testrun' / 'samples' / 'sample'
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, windowing={'enable_boundary_refinement': True})
+    _seed_completed_window_result(sample_out_dir)
+    _write_jsonl(
+        sample_out_dir / 'boundary_refinements.jsonl',
+        [
+            {
+                'task_id': 'demo::sample_b0',
+                'dispatch_id': 'd7',
+                'boundary_id': 0,
+                'coarse_boundary_frame': 8,
+                'frame_ids': [6, 7, 8, 9],
+                'vlm_json': {'transitions': [0], 'instructions': ['Before', 'After']},
+            }
+        ],
+    )
+
+    _install_basic_finalize_mocks(monkeypatch)
+    monkeypatch.setattr(
+        app_module,
+        'build_boundary_refinement_windows',
+        lambda *_args, **_kwargs: [
+            BoundaryRefinementWindow(boundary_id=0, coarse_boundary_frame=8, start_frame=6, end_frame=9, frame_ids=[6, 7, 8, 9])
+        ],
+    )
+    monkeypatch.setattr(
+        app_module,
+        'apply_boundary_refinement_results',
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError('invalid persisted refinement must not be applied')),
+    )
+    monkeypatch.setattr(
+        app_module,
+        'export_sample_outputs',
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError('export must not run after boundary refinement terminal failure')),
+    )
+
+    app, _, sample_out_dir = _make_dataset_app(
+        tmp_path,
+        with_mp4=True,
+        windowing={'enable_boundary_refinement': True},
+        start_runtime=False,
+    )
+    _start_runtime(app)
+    failed_marker = sample_out_dir / '.FAILED'
+    done_marker = sample_out_dir / '.DONE'
+
+    _wait_until(lambda: failed_marker.exists() or done_marker.exists())
+
+    assert failed_marker.exists()
+    assert not done_marker.exists()
+    report = _read_json(sample_out_dir / 'failure.json')
+    assert report['reason'] == 'boundary_refinement_failed'
+    assert report['details']['errors'] == {'0': 'invalid_vlm_json'}
+
+    sample_runtime = _read_json(sample_out_dir / 'sample_runtime.json')
+    assert sample_runtime['terminal_state'] == 'failed'
+    assert sample_runtime['failure']['reason'] == 'boundary_refinement_failed'
 
 
 def test_boundary_refinement_terminal_failure_blocks_done(tmp_path, monkeypatch) -> None:

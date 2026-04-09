@@ -189,6 +189,9 @@ def test_frozen_event_emitters_include_required_fields() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     calls = _collect_log_event_calls(
         repo_root / "src/video2tasks/server/app.py",
+        repo_root / "src/video2tasks/server/routes.py",
+        repo_root / "src/video2tasks/server/producer.py",
+        repo_root / "src/video2tasks/server/runtime_state.py",
         repo_root / "src/video2tasks/server/job_builder.py",
     )
 

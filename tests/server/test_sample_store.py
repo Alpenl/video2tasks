@@ -94,6 +94,27 @@ def test_sample_store_finalize_success_writes_done_and_clears_failure(tmp_path: 
     assert not (sample_dir / "failure.json").exists()
     payload = json.loads((sample_dir / "segments.json").read_text(encoding="utf-8"))
     assert payload["segments"][0]["instruction"] == "Add potatoes"
+    assert "diagnostics" not in payload
+
+
+def test_sample_store_finalize_success_strips_diagnostics_from_segments_payload(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    sample_dir = Path(store.sample_out_dir("demo", "sample"))
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    store.finalize_sample_success(
+        "demo",
+        "sample",
+        {
+            "segments": [{"seg_id": 0, "instruction": "Add potatoes"}],
+            "diagnostics": {"llm_summary_reason": "applied"},
+        },
+        required_stages=["stage1_segments", "stage2_text"],
+        completed_stages=["stage1_segments", "stage2_text"],
+    )
+
+    payload = json.loads((sample_dir / "segments.json").read_text(encoding="utf-8"))
+    assert "diagnostics" not in payload
 
 
 def test_sample_store_persists_sample_runtime_payload(tmp_path: Path) -> None:
@@ -209,16 +230,18 @@ def test_sample_store_failure_publishes_failed_marker_after_required_artifacts(t
         },
     }
 
-    write_order: list[str] = []
-    original_write_json = store._write_json
+    failed_marker = Path(store.failed_marker_path("demo", "sample"))
+    failure_report = Path(store.failure_report_path("demo", "sample"))
+    runtime_report = Path(store.sample_runtime_path("demo", "sample"))
+    original_touch = Path.touch
 
-    def recording_write_json(path: str, payload: dict) -> None:
-        failed_marker = Path(store.failed_marker_path("demo", "sample"))
-        assert not failed_marker.exists()
-        write_order.append(Path(path).name)
-        original_write_json(path, payload)
+    def recording_touch(path: Path, *args, **kwargs) -> None:
+        if path == failed_marker:
+            assert failure_report.exists()
+            assert runtime_report.exists()
+        original_touch(path, *args, **kwargs)
 
-    monkeypatch.setattr(store, "_write_json", recording_write_json)
+    monkeypatch.setattr(Path, "touch", recording_touch)
 
     store.persist_sample_failure(
         "demo",
@@ -228,8 +251,9 @@ def test_sample_store_failure_publishes_failed_marker_after_required_artifacts(t
         sample_runtime=runtime_payload,
     )
 
-    assert write_order == ["failure.json", "sample_runtime.json"]
-    assert (sample_dir / ".FAILED").exists()
+    assert failed_marker.exists()
+    assert failure_report.exists()
+    assert runtime_report.exists()
 
 
 def test_sample_store_finalize_success_rejects_missing_required_stage_completion(tmp_path: Path) -> None:
@@ -308,12 +332,17 @@ def test_sample_store_persist_sample_payload_does_not_touch_terminal_markers(tmp
     store.persist_sample_payload(
         "demo",
         "sample",
-        {"segments": [{"seg_id": 0, "instruction": "Add potatoes"}], "task_hierarchy": {"roots": []}},
+        {
+            "segments": [{"seg_id": 0, "instruction": "Add potatoes"}],
+            "task_hierarchy": {"roots": []},
+            "diagnostics": {"export_reason": "applied"},
+        },
     )
 
     payload = json.loads((sample_dir / "segments.json").read_text(encoding="utf-8"))
     assert payload["segments"][0]["instruction"] == "Add potatoes"
     assert payload["task_hierarchy"] == {"roots": []}
+    assert "diagnostics" not in payload
     assert (sample_dir / ".DONE").exists()
     assert (sample_dir / ".FAILED").exists()
     assert json.loads((sample_dir / "failure.json").read_text(encoding="utf-8")) == {"reason": "stale"}

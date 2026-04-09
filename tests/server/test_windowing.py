@@ -4,6 +4,8 @@ import cv2
 import numpy as np
 import pytest
 import video2tasks.server.segment_semantics as segment_semantics_module
+import video2tasks.server.segmentation as segmentation_module
+import video2tasks.server.window_media as window_media_module
 import video2tasks.server.windowing as windowing_module
 from video2tasks.server.task_artifacts import ArtifactPayloadValidationError, TaskArtifactWriter
 from video2tasks.server.windowing import (
@@ -243,6 +245,34 @@ def test_frame_extractor_rejects_bad_inline_frame_payload_before_artifact_persis
             artifact_metadata={"subset": "demo", "sample_id": "demo", "task_id": "bad_frame"},
             return_images=False,
         )
+
+
+def test_read_video_info_handles_nan_frame_count_and_releases_capture(monkeypatch) -> None:
+    class FakeCapture:
+        def __init__(self) -> None:
+            self.released = False
+
+        def isOpened(self) -> bool:
+            return True
+
+        def get(self, prop_id: int) -> float:
+            if prop_id == cv2.CAP_PROP_FPS:
+                return 30.0
+            if prop_id == cv2.CAP_PROP_FRAME_COUNT:
+                return float("nan")
+            raise AssertionError(f"unexpected prop_id: {prop_id}")
+
+        def release(self) -> None:
+            self.released = True
+
+    capture = FakeCapture()
+    monkeypatch.setattr(window_media_module.cv2, "VideoCapture", lambda _path: capture)
+
+    fps, nframes = windowing_module.read_video_info("demo.mp4")
+
+    assert fps == 30.0
+    assert nframes == 0
+    assert capture.released is True
 
 
 def _selection_branch_build_input() -> tuple[list[Window], dict]:
@@ -1847,6 +1877,37 @@ def test_build_segments_via_cuts_prunes_single_window_cut_for_multi_probe_mode()
     assert 340 <= boundaries[0] <= 400
 
 
+@pytest.mark.parametrize("boundary_prompt_mode", ["multi_probe_scan", "center_scan"])
+def test_build_segments_via_cuts_does_not_self_corroborate_adjacent_single_window_probe_cuts(
+    boundary_prompt_mode: str,
+) -> None:
+    windows = [Window(window_id=0, start_frame=0, end_frame=7, frame_ids=list(range(8)))]
+    by_wid = {
+        0: {
+            "window_id": 0,
+            "vlm_json": {
+                "transitions": [3, 4],
+                "instructions": ["a", "b", "c"],
+            },
+        }
+    }
+
+    result = build_segments_via_cuts(
+        "sample",
+        windows,
+        by_wid,
+        fps=30.0,
+        nframes=8,
+        frames_per_window=8,
+        boundary_prompt_mode=boundary_prompt_mode,
+        refine_final_instructions=False,
+    )
+
+    assert len(result["segments"]) == 1
+    assert [segment["end_frame"] for segment in result["segments"][:-1]] == []
+    assert result["diagnostics"]["recovered_micro_boundary_points"] == []
+
+
 def test_apply_deferred_segment_labels_overrides_final_instructions() -> None:
     segments = [
         {
@@ -1975,6 +2036,14 @@ def test_windowing_lexical_helpers_bind_to_segment_semantics_module() -> None:
     assert windowing_module._ingredient_tokens is segment_semantics_module._ingredient_tokens
     assert windowing_module._instruction_focus_tokens is segment_semantics_module._instruction_focus_tokens
     assert windowing_module._action_families is segment_semantics_module._action_families
+
+
+def test_windowing_facade_reexports_split_modules() -> None:
+    assert windowing_module.FrameExtractor is window_media_module.FrameExtractor
+    assert windowing_module.read_video_info is window_media_module.read_video_info
+    assert windowing_module.build_windows is segmentation_module.build_windows
+    assert windowing_module.build_refinement_windows is segmentation_module.build_refinement_windows
+    assert windowing_module.build_segments_via_cuts is segmentation_module.build_segments_via_cuts
 
 
 def test_build_window_prompt_metadata_includes_temporal_context() -> None:
