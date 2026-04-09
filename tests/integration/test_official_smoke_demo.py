@@ -45,6 +45,12 @@ def test_official_smoke_demo_contract(tmp_path: Path) -> None:
     assert sample_video.exists(), f"Missing smoke fixture video: {sample_video}"
 
     run_cfg = config_payload.get("run") or {}
+    assert str(run_cfg.get("base_dir")) == "./tmp/smoke_runs", (
+        "Public smoke contract changed: run.base_dir must stay ./tmp/smoke_runs"
+    )
+    assert str(run_cfg.get("run_id")) == "official_smoke_demo", (
+        "Public smoke contract changed: run.run_id must stay official_smoke_demo"
+    )
     run_id = str(run_cfg["run_id"])
 
     worker_cfg = config_payload.get("worker") or {}
