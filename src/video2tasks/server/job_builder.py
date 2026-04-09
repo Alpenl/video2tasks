@@ -169,6 +169,7 @@ class JobBuilder:
                     subset=str(job_meta.get("subset", "")),
                     sample_id=str(job_meta.get("sample_id", "")),
                     job_type=str(job_meta.get("job_type", "")),
+                    artifact_reuse=True,
                     artifact_reuse_group=str(job_meta.get("artifact_reuse_group", "")),
                     artifact_producer_task_id=str(job_meta.get("artifact_producer_task_id", "")),
                     artifact_consumer_task_id=str(job_meta.get("artifact_consumer_task_id", "")),

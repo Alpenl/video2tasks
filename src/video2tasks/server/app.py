@@ -399,6 +399,7 @@ def create_app(config: Config) -> FastAPI:
 
     def _log_fallback_applied(subset: str, sample_id: str, diagnostics: Dict[str, Any]) -> None:
         fallback_fields: Dict[str, Any] = {}
+        fallback_reasons: List[str] = []
         if str(diagnostics.get("selection_policy", "")) == "light_cleanup_fallback":
             fallback_fields["selection_policy"] = "light_cleanup_fallback"
 
@@ -407,9 +408,15 @@ def create_app(config: Config) -> FastAPI:
                 fallback_fields[key] = True
                 reason_key = key.replace("_fallback_used", "_fallback_reason")
                 if reason_key in diagnostics:
-                    fallback_fields[reason_key] = diagnostics[reason_key]
+                    reason_value = str(diagnostics[reason_key]).strip()
+                    if reason_value:
+                        fallback_fields[reason_key] = reason_value
+                        fallback_reasons.append(reason_value)
             if key.endswith("used_subtitle_fallback") and bool(value):
                 fallback_fields[key] = True
+
+        if fallback_reasons:
+            fallback_fields["fallback_reason"] = "; ".join(sorted(set(fallback_reasons)))
 
         if fallback_fields:
             log_event(
