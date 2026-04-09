@@ -25,7 +25,7 @@ Use the frozen event names from [`docs/observability/event-schema.md`](../observ
 - Fallback evidence: `fallback_applied`
 - Terminal failure evidence: `sample_failed` (contains `reason` and `details`)
 
-If retries spike across many `sample_id` values while some samples still converge to `job_done`/`finalize_done`, treat that as endpoint wobble first, not an immediate code regression.
+If retries spike across many `sample_id` values while some samples still converge to `job_done`/`finalize_done`, treat that as endpoint volatility first, not an immediate code regression.
 
 ### B. `<run_dir>/samples/<sample_id>/sample_runtime.json`
 
