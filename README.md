@@ -289,7 +289,8 @@ Use environment variables for secrets such as `OPENAI_API_KEY`, `GEMINI_API_KEY`
 
 The code default for `worker.count` is `7`, but [`config.example.yaml`](config.example.yaml) intentionally sets `worker.count: 1` for a conservative first custom run. If you copy the template unchanged, you will start with `1`, not `7`.
 
-The CLI no longer auto-discovers `./config.yaml` from the current working directory. Use `--config config.yaml` explicitly, or export `VIDEO2TASKS_CONFIG=/absolute/path/to/config.yaml`. If neither is set, configuration comes from environment variables first and then built-in defaults.
+The CLI no longer auto-discovers `./config.yaml` from the current working directory. Use `--config config.yaml` explicitly, or export `VIDEO2TASKS_CONFIG=/absolute/path/to/config.yaml`.
+The frozen config-layering contract is exactly: `env > yaml > defaults` (environment variables override YAML, YAML overrides built-in defaults). If no YAML is supplied, only `env > defaults` remain active.
 
 **Deployment contract (`single-machine shared-fs`):**
 - Run the server and workers on the same machine, and ensure they see the same on-disk paths.
@@ -309,13 +310,15 @@ v2t-worker --config config.yaml
 
 ## ⚙️ Configuration
 
-[`config.example.yaml`](config.example.yaml) is the minimal runnable template, not the full source of truth for every tuning knob. Omitted values fall back to the defaults defined in [`src/video2tasks/config.py`](src/video2tasks/config.py).
+[`config.example.yaml`](config.example.yaml) is the minimal runnable template, not the full source of truth for every tuning knob or production tuning. Omitted values fall back to the defaults defined in [`src/video2tasks/config.py`](src/video2tasks/config.py).
 
 Configuration precedence is:
 
 1. Environment variables
 2. YAML loaded via `--config` or `VIDEO2TASKS_CONFIG`
 3. Built-in defaults
+
+This is the only supported layering model for operator triage and incident analysis.
 
 For secrets, prefer environment variables over YAML. Keep tracked config files credential-free.
 
@@ -365,6 +368,8 @@ Additional rules:
   Resume is strict by default: cross identity continuation (config/prompt/backend/required stage mismatch) is rejected unless you explicitly set `run.force_resume=true` or `RUN_FORCE_RESUME=true`.
 - `sample_runtime.json` + `run_summary.json` are the operator runtime-evidence layer. They exist for operator decisions and auditing, not as a replacement for the final segmentation result.
 - `segments.json.diagnostics` is still dual-written during the P0 compatibility window, but it is compatibility shadow data, not the canonical runtime evidence location.
+
+For endpoint wobble triage (and how to separate endpoint volatility from code/data failures), see [Endpoint Volatility Runbook](docs/runbooks/endpoint-volatility.md).
 
 ---
 

@@ -1,10 +1,11 @@
 # Minimal runnable Video2Tasks config template.
-# Precedence: environment variables > this YAML file > built-in defaults.
+# Frozen config layering (official): env > yaml > defaults.
+# YAML layer means the file loaded via --config or VIDEO2TASKS_CONFIG.
 # Secrets should come from environment variables, not tracked YAML files.
 #
 # Deployment contract: single-machine shared-fs.
 # Run the server and workers on the same machine (or the same mounted container volume) so local paths are identical.
-# This example is intentionally minimal; it is not a full catalog of tuning knobs.
+# This example is intentionally minimal; it is not the full tuning truth or a complete knob catalog.
 # Frozen operator semantics:
 # - .DONE means all required stages for current config are complete.
 # - Resume refuses cross config/prompt/backend identity by default unless force_resume=true.

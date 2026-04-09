@@ -289,7 +289,8 @@ v2t-cluster --config config.yaml
 
 代码中的 `worker.count` 默认值是 `7`，但 [`config.example.yaml`](config.example.yaml) 这个最小模板为了保守起跑，显式写的是 `worker.count: 1`。如果你直接复制模板不改，实际会以 `1` 启动，而不是 `7`。
 
-CLI 现在不会再从当前工作目录隐式扫描 `./config.yaml`。请显式传 `--config config.yaml`，或者导出 `VIDEO2TASKS_CONFIG=/absolute/path/to/config.yaml`。如果两者都没有设置，配置将按“环境变量优先，其次代码默认值”的方式加载。
+CLI 现在不会再从当前工作目录隐式扫描 `./config.yaml`。请显式传 `--config config.yaml`，或者导出 `VIDEO2TASKS_CONFIG=/absolute/path/to/config.yaml`。
+冻结后的官方配置层次只有：`env > yaml > defaults`（环境变量覆盖 YAML，YAML 覆盖代码默认值）。如果没有提供 YAML，则只剩 `env > defaults` 两层。
 
 **部署契约（`single-machine shared-fs`）：**
 - Server 与 Worker 必须在同一台机器上运行，并且看到的本地路径必须一致。
@@ -309,13 +310,15 @@ v2t-worker --config config.yaml
 
 ## ⚙️ 配置说明
 
-[`config.example.yaml`](config.example.yaml) 现在是最小可运行模板，不再试图列出所有调优项。未写出的字段会回落到 [`src/video2tasks/config.py`](src/video2tasks/config.py) 中定义的默认值。
+[`config.example.yaml`](config.example.yaml) 现在是最小可运行模板，不是完整调优真相，也不再试图列出所有调优项。未写出的字段会回落到 [`src/video2tasks/config.py`](src/video2tasks/config.py) 中定义的默认值。
 
 配置优先级为：
 
 1. 环境变量
 2. 通过 `--config` 或 `VIDEO2TASKS_CONFIG` 指定加载的 YAML
 3. 代码内置默认值
+
+这也是运维排障与事故归因时唯一认可的分层模型。
 
 敏感信息优先放环境变量，不要提交到受版本控制的 YAML 中。
 
@@ -365,6 +368,8 @@ v2t-worker --config config.yaml
   resume 默认严格拒绝跨 identity 续跑（config/prompt/backend/required-stages 不一致）。只有显式设置 `run.force_resume=true` 或 `RUN_FORCE_RESUME=true` 才会放行。
 - `sample_runtime.json` + `run_summary.json` 是 operator runtime-evidence 层，用于判断与审计，不替代最终切分结果本体。
 - `segments.json.diagnostics` 在 P0 兼容窗口内仍会双写，但它只是兼容影子数据，不再是 canonical runtime evidence 的位置。
+
+端点抖动排障（以及如何区分端点不稳与代码/数据失败）请看 [Endpoint Volatility Runbook](docs/runbooks/endpoint-volatility.md)。
 
 ---
 
