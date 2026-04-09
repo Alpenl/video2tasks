@@ -249,26 +249,42 @@ pip install -e .
 pip install -e ".[qwen3vl]"
 ```
 
-### Configuration
+### Official Smoke Demo (First Run)
+
+Run the official smoke demo first. It does not require your own video or any external API key.
+
+```bash
+v2t-cluster --config config.smoke.yaml
+```
+
+Smoke output paths are fixed and test-covered:
+- Run dir: `./tmp/smoke_runs/demo_smoke/official_smoke_demo`
+- Sample dir: `./tmp/smoke_runs/demo_smoke/official_smoke_demo/samples/sample_001`
+
+After the command exits, inspect results in this order:
+1. `samples/sample_001/.DONE` or `.FAILED`
+2. `samples/sample_001/segments.json`
+3. `samples/sample_001/sample_runtime.json`
+4. `run_summary.json`
+
+For full commands and expected outputs, see [Official Smoke Demo Runbook](docs/runbooks/official-smoke-demo.md).
+
+### Move To Your Own Data (After Smoke)
 
 ```bash
 # Copy the minimal runnable template
 cp config.example.yaml config.yaml
 
-# Edit the dataset path and any non-secret settings
+# Edit dataset path and non-secret settings
 vim config.yaml  # or your preferred editor
+
+# Start server + configured workers
+v2t-cluster --config config.yaml
 ```
 
 Use environment variables for secrets such as `OPENAI_API_KEY`, `GEMINI_API_KEY`, and `LLM_MERGE_API_KEY`.
 
-### Running
-
-**One command (recommended) - Start server + configured workers:**
-```bash
-v2t-cluster --config config.yaml
-```
-
-The code default for `worker.count` is `7`, but [`config.example.yaml`](config.example.yaml) intentionally sets `worker.count: 1` for a conservative first run. If you copy the template unchanged, you will start with `1`, not `7`.
+The code default for `worker.count` is `7`, but [`config.example.yaml`](config.example.yaml) intentionally sets `worker.count: 1` for a conservative first custom run. If you copy the template unchanged, you will start with `1`, not `7`.
 
 The CLI no longer auto-discovers `./config.yaml` from the current working directory. Use `--config config.yaml` explicitly, or export `VIDEO2TASKS_CONFIG=/absolute/path/to/config.yaml`. If neither is set, configuration comes from environment variables first and then built-in defaults.
 
@@ -285,8 +301,6 @@ v2t-server --config config.yaml
 ```bash
 v2t-worker --config config.yaml
 ```
-
-> 💡 **Tip:** You can start multiple workers to process videos in parallel!
 
 ---
 

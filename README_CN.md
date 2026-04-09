@@ -249,26 +249,44 @@ pip install -e .
 pip install -e ".[qwen3vl]"
 ```
 
-### 配置
+### 官方 Smoke Demo（首次运行）
+
+建议先跑官方 smoke demo。它不需要你准备自己的视频，也不依赖任何外部 API Key。
+
+```bash
+v2t-cluster --config config.smoke.yaml
+```
+
+smoke 输出路径是固定且有测试覆盖的：
+- Run 目录：`./tmp/smoke_runs/demo_smoke/official_smoke_demo`
+- Sample 目录：`./tmp/smoke_runs/demo_smoke/official_smoke_demo/samples/sample_001`
+
+命令退出后按以下顺序查看结果：
+1. `samples/sample_001/.DONE` 或 `.FAILED`
+2. `samples/sample_001/segments.json`
+3. `samples/sample_001/sample_runtime.json`
+4. `run_summary.json`
+
+完整命令与预期结果请参考：[Official Smoke Demo Runbook](docs/runbooks/official-smoke-demo.md)
+
+### 切换到你的真实数据（Smoke 通过后）
 
 ```bash
 # 复制最小可运行模板
 cp config.example.yaml config.yaml
 
-# 只修改数据路径和非敏感配置
+# 修改数据路径和非敏感配置
 vim config.yaml  # 或使用你喜欢的编辑器
+
+# 一条命令启动 Server + Worker
+v2t-cluster --config config.yaml
 ```
 
 像 `OPENAI_API_KEY`、`GEMINI_API_KEY`、`LLM_MERGE_API_KEY` 这类敏感信息应通过环境变量提供。
 
-### 运行
-
-**一条命令启动（推荐） - 同时启动 Server 和配置好的 Worker：**
-```bash
-v2t-cluster --config config.yaml
-```
-
 代码中的 `worker.count` 默认值是 `7`，但 [`config.example.yaml`](config.example.yaml) 这个最小模板为了保守起跑，显式写的是 `worker.count: 1`。如果你直接复制模板不改，实际会以 `1` 启动，而不是 `7`。
+
+CLI 现在不会再从当前工作目录隐式扫描 `./config.yaml`。请显式传 `--config config.yaml`，或者导出 `VIDEO2TASKS_CONFIG=/absolute/path/to/config.yaml`。如果两者都没有设置，配置将按“环境变量优先，其次代码默认值”的方式加载。
 
 **部署契约（`single-machine shared-fs`）：**
 - Server 与 Worker 必须在同一台机器上运行，并且看到的本地路径必须一致。
@@ -283,10 +301,6 @@ v2t-server --config config.yaml
 ```bash
 v2t-worker --config config.yaml
 ```
-
-> 💡 **提示：** 可以启动多个 Worker 来并行处理视频！
-
-CLI 现在不会再从当前工作目录隐式扫描 `./config.yaml`。请显式传 `--config config.yaml`，或者导出 `VIDEO2TASKS_CONFIG=/absolute/path/to/config.yaml`。如果两者都没有设置，配置将按“环境变量优先，其次代码默认值”的方式加载。
 
 ---
 

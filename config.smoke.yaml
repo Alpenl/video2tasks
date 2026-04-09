@@ -1,0 +1,31 @@
+# Official smoke demo config.
+# Goal: run end-to-end after checkout without external API credentials.
+# Deployment contract: single-machine shared filesystem.
+
+datasets:
+  - root: "./tests/fixtures/smoke_dataset"
+    subset: "demo_smoke"
+
+run:
+  base_dir: "./tmp/smoke_runs"
+  run_id: "official_smoke_demo"
+  force_resume: false
+
+server:
+  host: "127.0.0.1"
+  port: 18099
+  max_empty_retries_per_job: 3
+  auto_exit_after_all_done: true
+
+worker:
+  count: 1
+  server_url: "http://127.0.0.1:18099"
+  backend: "dummy"
+
+windowing:
+  window_sec: 4.0
+  step_sec: 2.0
+  frames_per_window: 12
+
+logging:
+  level: "INFO"
