@@ -96,6 +96,86 @@ def test_sample_store_finalize_success_writes_done_and_clears_failure(tmp_path: 
     assert payload["segments"][0]["instruction"] == "Add potatoes"
 
 
+def test_sample_store_persists_sample_runtime_payload(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    payload = {
+        "sample_id": "sample",
+        "subset": "demo",
+        "terminal_state": "done",
+        "stages": {
+            "required": ["stage1_segments"],
+            "completed": ["stage1_segments"],
+            "pending": [],
+        },
+        "fallback": {"applied": False, "reasons": [], "fields": {}},
+        "retry": {
+            "total_retries": 0,
+            "empty_result_retries": 0,
+            "timeout_retries": 0,
+            "dispatch_count": 1,
+        },
+        "export": {
+            "required": False,
+            "enabled": False,
+            "attempted": False,
+            "status": "disabled",
+            "reason": "disabled",
+        },
+        "failure": None,
+    }
+
+    store.persist_sample_runtime("demo", "sample", payload)
+
+    assert json.loads(Path(store.sample_runtime_path("demo", "sample")).read_text(encoding="utf-8")) == payload
+    assert store.load_sample_runtime("demo", "sample") == payload
+
+
+def test_sample_store_failure_writes_sample_runtime_when_provided(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    sample_dir = Path(store.sample_out_dir("demo", "sample"))
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    runtime_payload = {
+        "sample_id": "sample",
+        "subset": "demo",
+        "terminal_state": "failed",
+        "stages": {
+            "required": ["stage1_segments", "export"],
+            "completed": ["stage1_segments"],
+            "pending": ["export"],
+        },
+        "fallback": {"applied": False, "reasons": [], "fields": {}},
+        "retry": {
+            "total_retries": 2,
+            "empty_result_retries": 1,
+            "timeout_retries": 1,
+            "dispatch_count": 3,
+        },
+        "export": {
+            "required": True,
+            "enabled": True,
+            "attempted": True,
+            "status": "failed",
+            "reason": "failed",
+        },
+        "failure": {
+            "reason": "export_failed",
+            "report_path": "failure.json",
+        },
+    }
+
+    store.persist_sample_failure(
+        "demo",
+        "sample",
+        "export_failed",
+        {"stage": "export"},
+        sample_runtime=runtime_payload,
+    )
+
+    assert json.loads((sample_dir / "sample_runtime.json").read_text(encoding="utf-8")) == runtime_payload
+
+
 def test_sample_store_finalize_success_rejects_missing_required_stage_completion(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     sample_dir = Path(store.sample_out_dir("demo", "sample"))
@@ -127,9 +207,35 @@ def test_sample_store_finalize_success_allows_stage1_only_terminal_contract(tmp_
         {"segments": [{"seg_id": 0, "instruction": "Add potatoes"}]},
         required_stages=["stage1_segments"],
         completed_stages=["stage1_segments"],
+        sample_runtime={
+            "sample_id": "sample",
+            "subset": "demo",
+            "terminal_state": "done",
+            "stages": {
+                "required": ["stage1_segments"],
+                "completed": ["stage1_segments"],
+                "pending": [],
+            },
+            "fallback": {"applied": False, "reasons": [], "fields": {}},
+            "retry": {
+                "total_retries": 0,
+                "empty_result_retries": 0,
+                "timeout_retries": 0,
+                "dispatch_count": 1,
+            },
+            "export": {
+                "required": False,
+                "enabled": False,
+                "attempted": False,
+                "status": "disabled",
+                "reason": "disabled",
+            },
+            "failure": None,
+        },
     )
 
     assert (sample_dir / "segments.json").exists()
+    assert (sample_dir / "sample_runtime.json").exists()
     assert (sample_dir / ".DONE").exists()
     assert not (sample_dir / ".FAILED").exists()
     assert not (sample_dir / "failure.json").exists()

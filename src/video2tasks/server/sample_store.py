@@ -97,6 +97,13 @@ class SampleStore:
     def failure_report_path(self, subset: str, sample_id: str) -> str:
         return str(Path(self.sample_out_dir(subset, sample_id)) / "failure.json")
 
+    def sample_runtime_path(self, subset: str, sample_id: str) -> str:
+        return str(Path(self.sample_out_dir(subset, sample_id)) / "sample_runtime.json")
+
+    def _write_json(self, path: str, payload: Dict[str, Any]) -> None:
+        with open(path, "w", encoding="utf-8") as file_obj:
+            json.dump(payload, file_obj, indent=2, ensure_ascii=False)
+
     def _append_jsonl_record(self, path: str, record: Dict[str, Any]) -> None:
         with open(path, "a", encoding="utf-8") as file_obj:
             file_obj.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -278,12 +285,27 @@ class SampleStore:
                 },
             )
 
+    def load_sample_runtime(self, subset: str, sample_id: str) -> Optional[Dict[str, Any]]:
+        path = Path(self.sample_runtime_path(subset, sample_id))
+        if not path.exists():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def persist_sample_runtime(self, subset: str, sample_id: str, payload: Dict[str, Any]) -> None:
+        with self._get_sample_lock(subset, sample_id):
+            self._write_json(self.sample_runtime_path(subset, sample_id), payload)
+
     def persist_sample_failure(
         self,
         subset: str,
         sample_id: str,
         reason: str,
         details: Optional[Dict[str, Any]] = None,
+        *,
+        sample_runtime: Optional[Dict[str, Any]] = None,
     ) -> None:
         payload = {
             "subset": subset,
@@ -299,13 +321,13 @@ class SampleStore:
                 except FileNotFoundError:
                     pass
             Path(self.failed_marker_path(subset, sample_id)).touch()
-            with open(self.failure_report_path(subset, sample_id), "w", encoding="utf-8") as file_obj:
-                json.dump(payload, file_obj, indent=2, ensure_ascii=False)
+            self._write_json(self.failure_report_path(subset, sample_id), payload)
+            if sample_runtime is not None:
+                self._write_json(self.sample_runtime_path(subset, sample_id), sample_runtime)
 
     def persist_sample_payload(self, subset: str, sample_id: str, payload: Dict[str, Any]) -> None:
         with self._get_sample_lock(subset, sample_id):
-            with open(self.segments_path(subset, sample_id), "w", encoding="utf-8") as file_obj:
-                json.dump(payload, file_obj, indent=2, ensure_ascii=False)
+            self._write_json(self.segments_path(subset, sample_id), payload)
 
     def finalize_sample_success(
         self,
@@ -315,6 +337,7 @@ class SampleStore:
         *,
         required_stages: Iterable[str],
         completed_stages: Iterable[str],
+        sample_runtime: Optional[Dict[str, Any]] = None,
     ) -> bool:
         normalized_required_stages = _normalize_stage_names(required_stages)
         normalized_completed_stages = _normalize_stage_names(completed_stages)
@@ -334,8 +357,9 @@ class SampleStore:
         payload_to_persist["diagnostics"] = diagnostics
 
         with self._get_sample_lock(subset, sample_id):
-            with open(self.segments_path(subset, sample_id), "w", encoding="utf-8") as file_obj:
-                json.dump(payload_to_persist, file_obj, indent=2, ensure_ascii=False)
+            self._write_json(self.segments_path(subset, sample_id), payload_to_persist)
+            if sample_runtime is not None:
+                self._write_json(self.sample_runtime_path(subset, sample_id), sample_runtime)
 
             done_path = Path(self.done_marker_path(subset, sample_id))
             already_done = done_path.exists()

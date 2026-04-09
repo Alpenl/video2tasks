@@ -26,6 +26,7 @@ from .exporter import export_sample_outputs
 from .llm_merge import run_export_subtitle_localization_pass, run_llm_postprocess_pass
 from .job_builder import ArtifactReuseEntry, JobBuilder
 from .run_manifest import ensure_run_manifest, load_run_manifest, run_manifest_path
+from .run_summary import build_run_summary, build_sample_runtime_record, write_run_summary
 from .protocol import (
     JobEnvelope,
     ProtocolValidationError,
@@ -248,6 +249,8 @@ def create_app(config: Config) -> FastAPI:
     # Initialize dataset contexts
     dataset_ctxs = parse_datasets(config)
     data_dir_by_subset = {ctx.subset: ctx.data_dir for ctx in dataset_ctxs}
+    run_dir_by_subset = {ctx.subset: ctx.run_dir for ctx in dataset_ctxs}
+    sample_ids_by_subset = {ctx.subset: list(ctx.sample_ids) for ctx in dataset_ctxs}
     
     # Thread-safe job management
     queue_lock = threading.Lock()
@@ -256,6 +259,7 @@ def create_app(config: Config) -> FastAPI:
     timeout_retry_counts: Dict[str, int] = {}
     empty_retry_counts: Dict[str, int] = {}
     dispatch_counts: Dict[str, int] = {}
+    sample_retry_stats: Dict[Tuple[str, str], Dict[str, int]] = {}
     completed_dispatch_ids: Dict[str, str] = {}
     step_a_repeat_artifact_reuse_caches: Dict[
         Tuple[str, str],
@@ -367,13 +371,163 @@ def create_app(config: Config) -> FastAPI:
             terminal_error=terminal_error,
         )
 
+    def _sample_retry_key(subset: str, sample_id: str) -> Tuple[str, str]:
+        return (str(subset), str(sample_id))
+
+    def _record_sample_retry(subset: str, sample_id: str, retry_field: str) -> None:
+        key = _sample_retry_key(subset, sample_id)
+        stats = sample_retry_stats.setdefault(
+            key,
+            {
+                "total_retries": 0,
+                "empty_result_retries": 0,
+                "timeout_retries": 0,
+            },
+        )
+        stats[retry_field] = int(stats.get(retry_field, 0)) + 1
+        stats["total_retries"] = int(stats.get("empty_result_retries", 0)) + int(stats.get("timeout_retries", 0))
+
+    def _sample_dispatch_count(subset: str, sample_id: str) -> int:
+        prefix = f"{subset}::{sample_id}_"
+        with queue_lock:
+            return sum(
+                int(count)
+                for task_id, count in dispatch_counts.items()
+                if str(task_id).startswith(prefix)
+            )
+
+    def _sample_retry_summary(subset: str, sample_id: str) -> Dict[str, int]:
+        stats = dict(sample_retry_stats.get(_sample_retry_key(subset, sample_id), {}))
+        total_retries = int(stats.get("total_retries", 0) or 0)
+        empty_result_retries = int(stats.get("empty_result_retries", 0) or 0)
+        timeout_retries = int(stats.get("timeout_retries", 0) or 0)
+        dispatch_count = _sample_dispatch_count(subset, sample_id)
+        if dispatch_count <= 0 and (total_retries > 0 or Path(done_marker_path(subset, sample_id)).exists() or Path(failed_marker_path(subset, sample_id)).exists()):
+            dispatch_count = total_retries + 1
+        return {
+            "total_retries": total_retries,
+            "empty_result_retries": empty_result_retries,
+            "timeout_retries": timeout_retries,
+            "dispatch_count": dispatch_count,
+        }
+
+    def _read_json_object(path_str: str) -> Dict[str, Any]:
+        path = Path(path_str)
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return dict(payload) if isinstance(payload, dict) else {}
+
+    def _persist_run_summary(subset: str) -> None:
+        manifest_path = run_manifest_paths.get(subset, "")
+        run_dir = run_dir_by_subset.get(subset, "")
+        if not manifest_path or not run_dir:
+            return
+        try:
+            manifest = load_run_manifest(manifest_path)
+        except Exception as exc:
+            logger.warning(f"[Warn] subset={subset}: failed to load run manifest for summary: {exc}")
+            return
+
+        sample_runtime_records = []
+        for sample_id in sample_ids_by_subset.get(subset, []):
+            sample_runtime = sample_store.load_sample_runtime(subset, sample_id)
+            if sample_runtime is not None:
+                sample_runtime_records.append(sample_runtime)
+
+        summary = build_run_summary(
+            run_manifest=manifest,
+            sample_runtime_records=sample_runtime_records,
+            total_samples=len(sample_ids_by_subset.get(subset, [])),
+        )
+        write_run_summary(run_dir, summary)
+
+    def _build_sample_runtime(
+        subset: str,
+        sample_id: str,
+        *,
+        terminal_state: str,
+        required_stages: List[str],
+        completed_stages: List[str],
+        diagnostics: Optional[Dict[str, Any]] = None,
+        failure_reason: str = "",
+        failure_details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return build_sample_runtime_record(
+            subset=subset,
+            sample_id=sample_id,
+            terminal_state=terminal_state,
+            required_stages=required_stages,
+            completed_stages=completed_stages,
+            diagnostics=dict(diagnostics or {}),
+            retry_summary=_sample_retry_summary(subset, sample_id),
+            failure_reason=failure_reason,
+            failure_details=dict(failure_details or {}),
+            failure_report_path=(Path(sample_store.failure_report_path(subset, sample_id)).name if failure_reason else ""),
+        )
+
+    def _ensure_sample_runtime_for_terminal_artifact(subset: str, sample_id: str) -> None:
+        if sample_store.load_sample_runtime(subset, sample_id) is not None:
+            return
+
+        required_stages = _required_stages_for_subset(subset)
+        if Path(done_marker_path(subset, sample_id)).exists():
+            payload = _read_json_object(segments_path(subset, sample_id))
+            diagnostics = dict(payload.get("diagnostics", {}))
+            completed_stages = diagnostics.get("completed_stages", required_stages)
+            runtime_payload = _build_sample_runtime(
+                subset,
+                sample_id,
+                terminal_state="done",
+                required_stages=list(diagnostics.get("required_stages", required_stages)),
+                completed_stages=list(completed_stages),
+                diagnostics=diagnostics,
+            )
+            sample_store.persist_sample_runtime(subset, sample_id, runtime_payload)
+            return
+
+        if Path(failed_marker_path(subset, sample_id)).exists():
+            report = _read_json_object(failure_report_path(subset, sample_id))
+            details = dict(report.get("details", {}))
+            runtime_payload = _build_sample_runtime(
+                subset,
+                sample_id,
+                terminal_state="failed",
+                required_stages=list(details.get("required_stages", required_stages)),
+                completed_stages=list(details.get("completed_stages", [])),
+                failure_reason=str(report.get("reason", "")).strip(),
+                failure_details=details,
+            )
+            sample_store.persist_sample_runtime(subset, sample_id, runtime_payload)
+
     def _persist_sample_failure(
         subset: str,
         sample_id: str,
         reason: str,
         details: Optional[Dict[str, Any]] = None,
     ) -> None:
-        sample_store.persist_sample_failure(subset, sample_id, reason, details)
+        details_payload = dict(details or {})
+        runtime_payload = _build_sample_runtime(
+            subset,
+            sample_id,
+            terminal_state="failed",
+            required_stages=list(details_payload.get("required_stages", _required_stages_for_subset(subset))),
+            completed_stages=list(details_payload.get("completed_stages", [])),
+            diagnostics=dict(details_payload.get("diagnostics", {})) if isinstance(details_payload.get("diagnostics", {}), dict) else {},
+            failure_reason=reason,
+            failure_details=details_payload,
+        )
+        sample_store.persist_sample_failure(
+            subset,
+            sample_id,
+            reason,
+            details_payload,
+            sample_runtime=runtime_payload,
+        )
+        _persist_run_summary(subset)
 
     def _clear_sample_jobs(subset: str, sample_id: str) -> None:
         removed_task_ids: set[str] = set()
@@ -538,6 +692,19 @@ def create_app(config: Config) -> FastAPI:
         diagnostics = dict(payload_to_persist.get("diagnostics", {}))
         _log_fallback_applied(subset, sample_id, diagnostics)
         sample_store.persist_sample_payload(subset, sample_id, payload_to_persist)
+        sample_store.persist_sample_runtime(
+            subset,
+            sample_id,
+            _build_sample_runtime(
+                subset,
+                sample_id,
+                terminal_state="done",
+                required_stages=required_stages,
+                completed_stages=completed_stages,
+                diagnostics=diagnostics,
+            ),
+        )
+        _persist_run_summary(subset)
         return payload_to_persist
 
     def _mark_sample_done(
@@ -565,7 +732,16 @@ def create_app(config: Config) -> FastAPI:
             payload_to_persist,
             required_stages=required_stages,
             completed_stages=completed_stages,
+            sample_runtime=_build_sample_runtime(
+                subset,
+                sample_id,
+                terminal_state="done",
+                required_stages=required_stages,
+                completed_stages=completed_stages,
+                diagnostics=diagnostics,
+            ),
         )
+        _persist_run_summary(subset)
 
         state["sample_status"][sample_id] = 3
         state["cur_idx"] += 1
@@ -659,12 +835,18 @@ def create_app(config: Config) -> FastAPI:
     app.state.timeout_retry_counts = timeout_retry_counts
     app.state.empty_retry_counts = empty_retry_counts
     app.state.dispatch_counts = dispatch_counts
+    app.state.sample_retry_stats = sample_retry_stats
     app.state.completed_dispatch_ids = completed_dispatch_ids
     app.state.task_artifact_writer = task_artifact_writer
     app.state.sample_store = sample_store
     app.state.step_a_producer_batch_limit = _STEP_A_PRODUCER_BATCH_LIMIT
     app.state.run_manifest_paths = run_manifest_paths
     app.state.run_manifest_status_by_subset = run_manifest_status_by_subset
+
+    for ctx in dataset_ctxs:
+        for sample_id in ctx.sample_ids:
+            _ensure_sample_runtime_for_terminal_artifact(ctx.subset, sample_id)
+        _persist_run_summary(ctx.subset)
 
     @app.get("/get_job")
     def get_job() -> Dict[str, Any]:
@@ -752,6 +934,11 @@ def create_app(config: Config) -> FastAPI:
                 limit = config.server.max_empty_retries_per_job
                 limit_label = "inf" if limit <= 0 else str(limit)
                 if requeued:
+                    _record_sample_retry(
+                        str(result_meta.get("subset", "")),
+                        str(result_meta.get("sample_id", "")),
+                        "empty_result_retries",
+                    )
                     log_event(
                         logger,
                         "result_empty_retry",
@@ -856,6 +1043,11 @@ def create_app(config: Config) -> FastAPI:
                     limit_label = "inf" if limit <= 0 else str(limit)
                     if limit <= 0 or attempt <= limit:
                         job_queue.append(job)
+                        _record_sample_retry(
+                            str(_job_payload_meta(job).get("subset", "")),
+                            str(_job_payload_meta(job).get("sample_id", "")),
+                            "timeout_retries",
+                        )
                         log_event(
                             logger,
                             "result_timeout_retry",
@@ -929,6 +1121,7 @@ def create_app(config: Config) -> FastAPI:
                 
                 # Skip if already done
                 if Path(done_marker_path(ctx.subset, sid)).exists():
+                    _ensure_sample_runtime_for_terminal_artifact(ctx.subset, sid)
                     _clear_step_a_repeat_artifact_reuse_cache(ctx.subset, sid)
                     sample_status[sid] = 3
                     st["cur_idx"] += 1
@@ -936,6 +1129,7 @@ def create_app(config: Config) -> FastAPI:
                     continue
 
                 if Path(failed_marker_path(ctx.subset, sid)).exists():
+                    _ensure_sample_runtime_for_terminal_artifact(ctx.subset, sid)
                     _clear_step_a_repeat_artifact_reuse_cache(ctx.subset, sid)
                     sample_status[sid] = 4
                     st["cur_idx"] += 1

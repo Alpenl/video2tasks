@@ -264,9 +264,11 @@ smoke 输出路径是固定且有测试覆盖的：
 命令退出后按以下顺序查看结果：
 1. `samples/sample_001/.DONE` 或 `.FAILED`
 2. `samples/sample_001/segments.json`
-3. `run_manifest.json`
+3. `samples/sample_001/sample_runtime.json`
+4. `run_manifest.json`
+5. `run_summary.json`
 
-未来的运行态证据产物可能会增加 `samples/sample_001/sample_runtime.json` 和 `run_summary.json`，但它们不属于当前 smoke 通过的必需项。
+`segments.json` 仍然是结果层真相；`sample_runtime.json` 和 `run_summary.json` 是承载 runtime/export/fallback/retry 状态的 operator 证据层。
 
 完整命令与预期结果请参考：[Official Smoke Demo Runbook](docs/runbooks/official-smoke-demo.md)
 
@@ -334,11 +336,13 @@ v2t-worker --config config.yaml
 下文中的 `<run_dir>` 统一表示 `<run.base_dir>/<subset>/<run_id>`；默认示例是 `./runs/<subset>/<run_id>`。
 
 - `<run_dir>/samples/<sample_id>/windows.jsonl`：Stage 1 每个窗口的原始结果（append-only）。
-- `<run_dir>/samples/<sample_id>/segments.json`：样本结果层产物。只承载 segmentation + Stage 2 文本产物（merge/summary/字幕本地化结果）。run/export/fallback 等运行态信息不属于最终切分真相。
+- `<run_dir>/samples/<sample_id>/segments.json`：样本结果层产物。只承载 segmentation + Stage 2 文本产物（merge/summary/字幕本地化结果）。runtime/export/fallback/retry 状态不属于最终切分真相。
   source instruction 永远是英文；字幕本地化只改变字幕文本。
+- `<run_dir>/samples/<sample_id>/sample_runtime.json`：样本级 operator 证据。它是 canonical runtime artifact，承载终态、required-stage 完成情况、fallback 概况、retry 概况、export 概况，以及 failure 引用。
 - `<run_dir>/samples/<sample_id>/.DONE` / `<run_dir>/samples/<sample_id>/.FAILED`：样本终态标记。
   `.DONE` 的语义是：该样本已完成 `<run_dir>/run_manifest.json.required_stages` 里定义的全部必需阶段。
 - `failure.json`：只要存在 `.FAILED` 就必须存在，用来记录该样本面向 operator 的终态 reason/details。
+- `<run_dir>/run_summary.json`：run 级 operator 证据，由 `run_manifest.json` 与各样本的 `sample_runtime.json` 聚合得到。
 
 终态矩阵：
 
@@ -359,7 +363,8 @@ v2t-worker --config config.yaml
   `<run_dir>/clips/<sample_id>/manifest.json` 是 clips 导出契约记录。clips 导出必须保留音频（`audio_preserved=true`）。
 - `<run_dir>/run_manifest.json`（run 级）：记录 run 身份（config/prompt hash、backend 摘要、`required_stages`）与 resume 校验元数据。
   resume 默认严格拒绝跨 identity 续跑（config/prompt/backend/required-stages 不一致）。只有显式设置 `run.force_resume=true` 或 `RUN_FORCE_RESUME=true` 才会放行。
-- `manifest + diagnostics` 是运行态证据层（run/export/fallback state），用于 operator 判断和审计，不替代最终切分结果本体。
+- `sample_runtime.json` + `run_summary.json` 是 operator runtime-evidence 层，用于判断与审计，不替代最终切分结果本体。
+- `segments.json.diagnostics` 在 P0 兼容窗口内仍会双写，但它只是兼容影子数据，不再是 canonical runtime evidence 的位置。
 
 ---
 

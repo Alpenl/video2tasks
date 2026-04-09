@@ -264,9 +264,11 @@ Smoke output paths are fixed and test-covered:
 After the command exits, inspect results in this order:
 1. `samples/sample_001/.DONE` or `.FAILED`
 2. `samples/sample_001/segments.json`
-3. `run_manifest.json`
+3. `samples/sample_001/sample_runtime.json`
+4. `run_manifest.json`
+5. `run_summary.json`
 
-Future runtime-evidence artifacts may add `samples/sample_001/sample_runtime.json` and `run_summary.json`, but they are not required for the current smoke pass.
+`segments.json` remains the result-layer truth. `sample_runtime.json` and `run_summary.json` are the operator-evidence layer for runtime/export/fallback/retry state.
 
 For full commands and expected outputs, see [Official Smoke Demo Runbook](docs/runbooks/official-smoke-demo.md).
 
@@ -334,11 +336,13 @@ Common sections in the full config model:
 `<run_dir>` below means `<run.base_dir>/<subset>/<run_id>`; by default that is `./runs/<subset>/<run_id>`.
 
 - `<run_dir>/samples/<sample_id>/windows.jsonl`: Stage 1 window-level raw results (append-only).
-- `<run_dir>/samples/<sample_id>/segments.json`: sample result-layer output. It only carries segmentation + Stage 2 text artifacts (merge/summary/subtitle-localization results). Run/export/fallback runtime state is not part of the final segmentation truth.
+- `<run_dir>/samples/<sample_id>/segments.json`: sample result-layer output. It only carries segmentation + Stage 2 text artifacts (merge/summary/subtitle-localization results). Runtime/export/fallback/retry state is not segmentation truth.
   Source instructions are always English. Subtitle localization changes subtitle text only.
+- `<run_dir>/samples/<sample_id>/sample_runtime.json`: sample-level operator evidence. It is the canonical runtime artifact for terminal state, required-stage completion, fallback summary, retry summary, export summary, and failure reference.
 - `<run_dir>/samples/<sample_id>/.DONE` / `<run_dir>/samples/<sample_id>/.FAILED`: sample terminal markers.
   `.DONE` means all stages listed in `<run_dir>/run_manifest.json.required_stages` completed for that sample.
 - `failure.json`: required whenever `.FAILED` exists. It carries the operator-facing terminal reason/details for that sample.
+- `<run_dir>/run_summary.json`: run-level operator evidence aggregated from `run_manifest.json` + per-sample `sample_runtime.json` records.
 
 Terminal-state matrix:
 
@@ -359,7 +363,8 @@ Additional rules:
   `<run_dir>/clips/<sample_id>/manifest.json` is the clip export contract record. Clips must preserve audio (`audio_preserved=true`).
 - `<run_dir>/run_manifest.json` (run-level): records run identity (config/prompt hashes, backend summary, `required_stages`) and resume validation metadata.
   Resume is strict by default: cross identity continuation (config/prompt/backend/required stage mismatch) is rejected unless you explicitly set `run.force_resume=true` or `RUN_FORCE_RESUME=true`.
-- `manifest + diagnostics` are runtime evidence (run/export/fallback state). They are for operator decisions and auditing, not a replacement for the final segmentation result itself.
+- `sample_runtime.json` + `run_summary.json` are the operator runtime-evidence layer. They exist for operator decisions and auditing, not as a replacement for the final segmentation result.
+- `segments.json.diagnostics` is still dual-written during the P0 compatibility window, but it is compatibility shadow data, not the canonical runtime evidence location.
 
 ---
 
