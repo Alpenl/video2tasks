@@ -93,4 +93,5 @@
 ## Enforcement
 
 - `log_event(...)` 对以上冻结事件执行必有字段校验：缺字段或字段值为 `None` 会抛出 `ValueError`。
+- 对标识字段 `subset`、`sample_id`、`job_type`、`task_id`、`dispatch_id`，空白字符串（如 `""`、`"   "`）同样会触发 `ValueError`。
 - 非冻结事件不做该校验（保持低开销与兼容性）。

@@ -1,11 +1,13 @@
 import ast
 import json
 import logging
+import re
 from io import StringIO
 from pathlib import Path
 
 import pytest
 import video2tasks.server.app as server_app_module
+from video2tasks.server.protocol import InlineImageTransport, JobEnvelope
 import video2tasks.vlm.openai_api as openai_api_module
 import video2tasks.worker.runner as worker_runner_module
 from video2tasks.config import Config
@@ -61,6 +63,37 @@ def _collect_log_event_calls(*module_paths: Path) -> dict[str, list[set[str]]]:
             explicit_fields = {kw.arg for kw in node.keywords if kw.arg is not None}
             calls.setdefault(event_name, []).append(explicit_fields)
     return calls
+
+
+def _extract_doc_required_fields(doc_path: Path) -> dict[str, tuple[str, ...]]:
+    lines = doc_path.read_text(encoding="utf-8").splitlines()
+    parsed: dict[str, tuple[str, ...]] = {}
+
+    for index, line in enumerate(lines):
+        heading_match = re.match(r"^###\s+\d+\)\s+`([^`]+)`\s*$", line.strip())
+        if not heading_match:
+            continue
+
+        event_name = heading_match.group(1)
+        required_line = ""
+        for seek in range(index + 1, len(lines)):
+            candidate = lines[seek].strip()
+            if candidate.startswith("### "):
+                break
+            if candidate.startswith("`"):
+                required_line = candidate
+                break
+
+        if not required_line:
+            continue
+
+        parsed[event_name] = tuple(
+            part.strip().strip("`")
+            for part in required_line.split(",")
+            if part.strip()
+        )
+
+    return parsed
 
 
 def test_server_worker_and_vlm_loggers_share_package_namespace(tmp_path) -> None:
@@ -133,6 +166,25 @@ def test_log_event_rejects_missing_required_frozen_event_fields() -> None:
         log_event(logger, "job_dispatched", task_id="demo::sample_w0")
 
 
+@pytest.mark.parametrize("field_name", ["subset", "sample_id", "job_type", "task_id", "dispatch_id"])
+def test_log_event_rejects_blank_identifier_required_fields(field_name: str) -> None:
+    logger, _ = _build_test_logger()
+    payload = {
+        "task_id": "demo::sample_w0",
+        "dispatch_id": "d1",
+        "subset": "demo",
+        "sample_id": "sample_001",
+        "job_type": "window_boundary",
+        "source_count": 1,
+        "transport_mode": "inline",
+        "artifact_reuse": False,
+    }
+    payload[field_name] = "   "
+
+    with pytest.raises(ValueError, match=field_name):
+        log_event(logger, "job_dispatched", **payload)
+
+
 def test_frozen_event_emitters_include_required_fields() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     calls = _collect_log_event_calls(
@@ -146,3 +198,56 @@ def test_frozen_event_emitters_include_required_fields() -> None:
         required = set(schema.required_fields)
         for explicit_fields in calls[event_name]:
             assert required <= explicit_fields
+
+
+def test_event_schema_doc_matches_frozen_schema_required_fields() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    doc_required_fields = _extract_doc_required_fields(
+        repo_root / "docs/observability/event-schema.md",
+    )
+    code_required_fields = {
+        event_name: schema.required_fields
+        for event_name, schema in FROZEN_EVENT_SCHEMAS.items()
+    }
+
+    assert set(doc_required_fields.keys()) == set(code_required_fields.keys())
+    for event_name, expected_required_fields in code_required_fields.items():
+        assert doc_required_fields[event_name] == expected_required_fields
+
+
+def test_get_job_emits_job_dispatched_event_payload(tmp_path, capsys) -> None:
+    config = Config(
+        run={"base_dir": str(tmp_path), "run_id": "testrun"},
+        server={"auto_exit_after_all_done": False},
+    )
+    app = server_app_module.create_app(config)
+    app.state.job_queue.append(
+        JobEnvelope(
+            task_id="demo_smoke::sample_001_w0",
+            meta={
+                "subset": "demo_smoke",
+                "sample_id": "sample_001",
+                "job_type": "window_boundary",
+                "artifact_reuse": False,
+            },
+            image_transport=InlineImageTransport(images=["img_b64"]),
+        )
+    )
+
+    get_job_route = next(route for route in app.routes if getattr(route, "path", "") == "/get_job")
+    result = get_job_route.endpoint()
+    assert result["status"] == "ok"
+
+    out_lines = capsys.readouterr().out.splitlines()
+    payload = next(
+        json.loads(line)
+        for line in out_lines
+        if line.startswith("{") and '"event": "job_dispatched"' in line
+    )
+
+    assert payload["event"] == "job_dispatched"
+    assert payload["task_id"] == "demo_smoke::sample_001_w0"
+    assert payload["dispatch_id"] == "d1"
+    assert payload["subset"] == "demo_smoke"
+    assert payload["sample_id"] == "sample_001"
+    assert payload["job_type"] == "window_boundary"

@@ -132,6 +132,15 @@ FROZEN_EVENT_SCHEMAS: Dict[str, EventSchema] = {
 }
 
 FROZEN_EVENT_NAMES: tuple[str, ...] = tuple(FROZEN_EVENT_SCHEMAS.keys())
+_IDENTIFIER_REQUIRED_FIELDS: frozenset[str] = frozenset(
+    {
+        "subset",
+        "sample_id",
+        "job_type",
+        "task_id",
+        "dispatch_id",
+    }
+)
 
 
 def _required_field_violations(event: str, fields: Mapping[str, Any]) -> tuple[str, ...]:
@@ -139,11 +148,21 @@ def _required_field_violations(event: str, fields: Mapping[str, Any]) -> tuple[s
     if schema is None:
         return ()
 
-    missing = [
-        field_name
-        for field_name in schema.required_fields
-        if field_name not in fields or fields[field_name] is None
-    ]
+    missing: list[str] = []
+    for field_name in schema.required_fields:
+        if field_name not in fields:
+            missing.append(field_name)
+            continue
+
+        value = fields[field_name]
+        if value is None:
+            missing.append(field_name)
+            continue
+
+        if field_name in _IDENTIFIER_REQUIRED_FIELDS:
+            if not isinstance(value, str) or not value.strip():
+                missing.append(field_name)
+
     return tuple(missing)
 
 
