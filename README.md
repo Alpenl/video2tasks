@@ -338,6 +338,22 @@ Common sections in the full config model:
   Source instructions are always English. Subtitle localization changes subtitle text only.
 - `<run_dir>/samples/<sample_id>/.DONE` / `<run_dir>/samples/<sample_id>/.FAILED`: sample terminal markers.
   `.DONE` means all stages listed in `<run_dir>/run_manifest.json.required_stages` completed for that sample.
+- `failure.json`: required whenever `.FAILED` exists. It carries the operator-facing terminal reason/details for that sample.
+
+Terminal-state matrix:
+
+| Runtime outcome | `.DONE` | `.FAILED` | `failure.json` |
+| --- | --- | --- | --- |
+| All required stages completed | present | absent | absent |
+| Any required stage fails (`window_boundary_failed`, `segment_label_failed`, `boundary_refinement_failed`, `export_failed`) | absent | present | present |
+| Known-bad artifacts are rejected before dispatch (`artifact_extraction_failed`, `artifact_preparation_failed`) | absent | present | present |
+| Finalize crashes or empties a required-stage result (`finalize_exception`, `finalize_empty_segments`) | absent | present | present |
+
+Additional rules:
+
+- Writing `.FAILED` always removes stale `.DONE`. Writing `.DONE` always removes stale `.FAILED` and `failure.json`.
+- `failure.json.reason` is the sample-level terminal reason. Raw per-job causes such as `empty_retry_exhausted` and `timeout_retry_exhausted` remain in `windows.jsonl` / `segment_labels.jsonl` / `boundary_refinements.jsonl` as `terminal_error`, then the sample converges to `.FAILED` when the corresponding required stage is observed as failed.
+- `server.max_empty_retries_per_job` defaults to `3`. Set it to `0` only if you explicitly want unlimited empty-result retries. Once the budget is exhausted, the raw job record is terminal and the sample must eventually close as `.FAILED`; it must not remain half-finished.
 - `<run_dir>/exports/<sample_id>/annotated.mp4`: expected when `export.mode=annotated|both` and annotated export succeeds.
 - `<run_dir>/clips/<sample_id>/...`: expected when `export.mode=clips|both` and clip export succeeds.
   `<run_dir>/clips/<sample_id>/manifest.json` is the clip export contract record. Clips must preserve audio (`audio_preserved=true`).

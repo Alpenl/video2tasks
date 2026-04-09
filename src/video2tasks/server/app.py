@@ -25,7 +25,7 @@ from .windowing import (
 from .exporter import export_sample_outputs
 from .llm_merge import run_export_subtitle_localization_pass, run_llm_postprocess_pass
 from .job_builder import ArtifactReuseEntry, JobBuilder
-from .run_manifest import ensure_run_manifest, run_manifest_path
+from .run_manifest import ensure_run_manifest, load_run_manifest, run_manifest_path
 from .protocol import (
     JobEnvelope,
     ProtocolValidationError,
@@ -33,7 +33,11 @@ from .protocol import (
 )
 from .runtime import ThreadRuntime
 from .sample_store import SampleStore
-from .task_artifacts import TaskArtifactWriter
+from .task_artifacts import (
+    ArtifactPayloadValidationError,
+    TaskArtifactWriter,
+    artifact_validation_error_details,
+)
 from ..vlm.base import normalize_task_window_result
 
 
@@ -51,6 +55,14 @@ class DatasetCtx:
     run_dir: str
     run_dir_nonempty_before_prepare: bool
     sample_ids: List[str]
+
+
+@dataclass
+class _SampleArtifactDispatchFailure(Exception):
+    reason: str
+    phase: str
+    error: ArtifactPayloadValidationError
+    details: Dict[str, Any]
 
 
 def parse_datasets(config: Config) -> List[DatasetCtx]:
@@ -471,6 +483,110 @@ def create_app(config: Config) -> FastAPI:
             terminal_error=terminal_error,
         )
 
+    def _required_stages_for_subset(subset: str) -> list[str]:
+        manifest_path = run_manifest_paths.get(subset, "")
+        if manifest_path:
+            try:
+                manifest = load_run_manifest(manifest_path)
+                return [
+                    str(stage).strip()
+                    for stage in manifest.required_stages
+                    if str(stage).strip()
+                ]
+            except Exception as exc:
+                logger.warning(
+                    f"[Warn] subset={subset}: failed to read required stages from manifest {manifest_path}: {exc}"
+                )
+
+        required_stages = ["stage1_segments"]
+        if bool(config.llm_merge.enabled):
+            required_stages.append("stage2_text")
+        if bool(config.export.enabled):
+            required_stages.append("export")
+        return required_stages
+
+    def _required_stages_satisfied(required_stages: List[str], completed_stages: List[str]) -> bool:
+        completed_stage_set = {str(stage).strip() for stage in completed_stages if str(stage).strip()}
+        return all(str(stage).strip() in completed_stage_set for stage in required_stages)
+
+    def _mark_sample_done(
+        state: Dict[str, Any],
+        subset: str,
+        sample_id: str,
+        final_res: Dict[str, Any],
+        *,
+        required_stages: List[str],
+        completed_stages: List[str],
+        finalize_start: float,
+        global_done: int,
+        progress_total: int,
+    ) -> int:
+        payload_to_persist = dict(final_res)
+        diagnostics = dict(payload_to_persist.get("diagnostics", {}))
+        diagnostics["required_stages"] = list(required_stages)
+        diagnostics["completed_stages"] = list(completed_stages)
+        payload_to_persist["diagnostics"] = diagnostics
+        _log_fallback_applied(subset, sample_id, diagnostics)
+        already_done = sample_store.finalize_sample_success(
+            subset,
+            sample_id,
+            payload_to_persist,
+            required_stages=required_stages,
+            completed_stages=completed_stages,
+        )
+
+        state["sample_status"][sample_id] = 3
+        state["cur_idx"] += 1
+
+        if not already_done:
+            global_done += 1
+        log_event(
+            logger,
+            "finalize_done",
+            subset=subset,
+            sample_id=sample_id,
+            finalize_ms=int(round((time.perf_counter() - finalize_start) * 1000.0)),
+            segment_count=len(payload_to_persist.get("segments", [])),
+        )
+        logger.info(f"[Progress] {global_done}/{progress_total} (finished: {subset}/{sample_id})")
+        return global_done
+
+    def _artifact_failure_details(
+        error: ArtifactPayloadValidationError,
+        *,
+        phase: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        payload = {"phase": phase, **artifact_validation_error_details(error)}
+        payload["error"] = str(error).strip() or type(error).__name__
+        payload["exception_type"] = type(error).__name__
+        if details:
+            payload.update(details)
+        return payload
+
+    def _fail_sample_for_invalid_artifacts(
+        state: Dict[str, Any],
+        subset: str,
+        sample_id: str,
+        *,
+        reason: str,
+        phase: str,
+        error: ArtifactPayloadValidationError,
+        log_message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        _fail_sample(
+            state,
+            subset,
+            sample_id,
+            reason,
+            _artifact_failure_details(error, phase=phase, details=details),
+            log_message=log_message,
+        )
+
+    def _export_stage_succeeded(export_diagnostics: Dict[str, Any]) -> bool:
+        return bool(export_diagnostics.get("export_attempted")) and str(export_diagnostics.get("export_reason", "")).strip() == "applied"
+
     app.state.job_queue = job_queue
     app.state.inflight = inflight
     app.state.timeout_retry_counts = timeout_retry_counts
@@ -505,7 +621,7 @@ def create_app(config: Config) -> FastAPI:
                 dispatch_id=dispatch_id,
                 subset=str(base_job.meta.get("subset", "")),
                 sample_id=str(base_job.meta.get("sample_id", "")),
-                job_type=str(base_job.meta.get("job_type", "")),
+                job_type=str(base_job.meta.get("job_type", "unknown") or "unknown"),
                 source_count=base_job.source_count,
                 transport_mode=str(base_job.image_transport.mode),
                 artifact_reuse=bool(base_job.meta.get("artifact_reuse", False)),
@@ -872,6 +988,16 @@ def create_app(config: Config) -> FastAPI:
                             _clear_step_a_repeat_artifact_reuse_cache(ctx.subset, sid)
                             sample_status[sid] = 2
                     
+                    except ArtifactPayloadValidationError as exc:
+                        _fail_sample_for_invalid_artifacts(
+                            st,
+                            ctx.subset,
+                            sid,
+                            reason="artifact_extraction_failed",
+                            phase="step_a",
+                            error=exc,
+                            log_message=f"[Fail] {ctx.subset}/{sid}: invalid extraction artifacts blocked dispatch",
+                        )
                     except Exception as e:
                         logger.exception(f"[Err] {ctx.subset}/{sid}: {e}")
                         _fail_sample(
@@ -962,18 +1088,26 @@ def create_app(config: Config) -> FastAPI:
                                                     if active:
                                                         continue
 
-                                                    job = job_builder.build_window_boundary_job(
-                                                        extractor,
-                                                        task_id=tid,
-                                                        subset=ctx.subset,
-                                                        sample_id=sid,
-                                                        window=refinement_window,
-                                                        fps=fps,
-                                                        nframes=nframes,
-                                                        repeat_index=repeat_index,
-                                                        repeat_count=max(1, int(config.windowing.window_repeat_count)),
-                                                        window_pass="refinement",
-                                                    )
+                                                    try:
+                                                        job = job_builder.build_window_boundary_job(
+                                                            extractor,
+                                                            task_id=tid,
+                                                            subset=ctx.subset,
+                                                            sample_id=sid,
+                                                            window=refinement_window,
+                                                            fps=fps,
+                                                            nframes=nframes,
+                                                            repeat_index=repeat_index,
+                                                            repeat_count=max(1, int(config.windowing.window_repeat_count)),
+                                                            window_pass="refinement",
+                                                        )
+                                                    except ArtifactPayloadValidationError as exc:
+                                                        raise _SampleArtifactDispatchFailure(
+                                                            reason="artifact_preparation_failed",
+                                                            phase="refinement_dispatch",
+                                                            error=exc,
+                                                            details={"task_id": tid, "job_type": "window_boundary"},
+                                                        ) from exc
 
                                                     with queue_lock:
                                                         job_queue.append(job)
@@ -992,6 +1126,9 @@ def create_app(config: Config) -> FastAPI:
                                     if not _all_windows_completed(windows + refinement_windows, by_wid):
                                         time.sleep(0.05)
                                         continue
+
+                            required_stages = _required_stages_for_subset(ctx.subset)
+                            completed_stages: List[str] = []
 
                             logger.info(f"[Finalize] {ctx.subset}/{sid}...")
 
@@ -1073,13 +1210,21 @@ def create_app(config: Config) -> FastAPI:
                                             if active:
                                                 continue
 
-                                            job = job_builder.build_boundary_refinement_job(
-                                                extractor,
-                                                task_id=tid,
-                                                subset=ctx.subset,
-                                                sample_id=sid,
-                                                boundary_window=boundary_window,
-                                            )
+                                            try:
+                                                job = job_builder.build_boundary_refinement_job(
+                                                    extractor,
+                                                    task_id=tid,
+                                                    subset=ctx.subset,
+                                                    sample_id=sid,
+                                                    boundary_window=boundary_window,
+                                                )
+                                            except ArtifactPayloadValidationError as exc:
+                                                raise _SampleArtifactDispatchFailure(
+                                                    reason="artifact_preparation_failed",
+                                                    phase="boundary_refinement_dispatch",
+                                                    error=exc,
+                                                    details={"task_id": tid, "job_type": "boundary_refinement"},
+                                                ) from exc
 
                                             with queue_lock:
                                                 job_queue.append(job)
@@ -1159,14 +1304,22 @@ def create_app(config: Config) -> FastAPI:
                                                 config.windowing.frames_per_window,
                                                 nframes,
                                             )
-                                            job = job_builder.build_segment_label_job(
-                                                extractor,
-                                                task_id=tid,
-                                                subset=ctx.subset,
-                                                sample_id=sid,
-                                                segment=segment,
-                                                frame_ids=frame_ids,
-                                            )
+                                            try:
+                                                job = job_builder.build_segment_label_job(
+                                                    extractor,
+                                                    task_id=tid,
+                                                    subset=ctx.subset,
+                                                    sample_id=sid,
+                                                    segment=segment,
+                                                    frame_ids=frame_ids,
+                                                )
+                                            except ArtifactPayloadValidationError as exc:
+                                                raise _SampleArtifactDispatchFailure(
+                                                    reason="artifact_preparation_failed",
+                                                    phase="segment_label_dispatch",
+                                                    error=exc,
+                                                    details={"task_id": tid, "job_type": "segment_label"},
+                                                ) from exc
 
                                             with queue_lock:
                                                 job_queue.append(job)
@@ -1196,91 +1349,162 @@ def create_app(config: Config) -> FastAPI:
                                 ]
                                 final_res["diagnostics"] = diagnostics
 
-                            cleaned_segments, task_hierarchy, llm_postprocess_diagnostics = run_llm_postprocess_pass(
-                                sid,
-                                final_res.get("segments", []),
-                                config.llm_merge,
-                            )
-                            final_res = dict(final_res)
-                            final_res["segments"] = cleaned_segments
-                            if task_hierarchy is not None:
-                                final_res["task_hierarchy"] = task_hierarchy
-                            diagnostics = dict(final_res.get("diagnostics", {}))
-                            diagnostics.update(llm_postprocess_diagnostics)
-                            final_res["diagnostics"] = diagnostics
-                            if not final_res.get("segments"):
-                                _fail_sample(
+                            completed_stages.append("stage1_segments")
+                            if _required_stages_satisfied(required_stages, completed_stages):
+                                global_done = _mark_sample_done(
                                     st,
                                     ctx.subset,
                                     sid,
-                                    "finalize_empty_segments",
-                                    {
-                                        "phase": "postprocess",
-                                        "window_count": len(windows),
-                                        "completed_window_count": len(by_wid),
-                                    },
-                                    log_message=f"[Fail] {ctx.subset}/{sid}: finalize produced no segments after postprocess",
+                                    final_res,
+                                    required_stages=required_stages,
+                                    completed_stages=completed_stages,
+                                    finalize_start=finalize_start,
+                                    global_done=global_done,
+                                    progress_total=progress_total,
                                 )
-                                time.sleep(0.01)
                                 continue
 
-                            export_segments = [
-                                dict(segment)
-                                for segment in final_res.get("segments", [])
-                                if isinstance(segment, dict)
-                            ]
-                            subtitle_segments, subtitle_localization_diagnostics = run_export_subtitle_localization_pass(
-                                sid,
-                                export_segments,
-                                config.llm_merge,
-                                str(config.export.subtitles.language),
-                            )
-                            export_segments = subtitle_segments
-                            final_res["segments"] = [
-                                dict(segment)
-                                for segment in export_segments
-                                if isinstance(segment, dict)
-                            ]
-                            diagnostics.update(subtitle_localization_diagnostics)
-
-                            try:
-                                export_diagnostics = export_sample_outputs(
-                                    run_dir=ctx.run_dir,
-                                    sample_id=sid,
-                                    video_path=mp4,
-                                    fps=fps,
-                                    segments=export_segments,
-                                    export_config=config.export,
+                            if "stage2_text" in required_stages:
+                                cleaned_segments, task_hierarchy, llm_postprocess_diagnostics = run_llm_postprocess_pass(
+                                    sid,
+                                    final_res.get("segments", []),
+                                    config.llm_merge,
                                 )
-                            except Exception as exc:
-                                export_diagnostics = {
-                                    "export_enabled": bool(config.export.enabled),
-                                    "export_attempted": bool(config.export.enabled),
-                                    "export_mode": str(config.export.mode),
-                                    "export_reason": "failed_before_export_completion",
-                                    "export_error": str(exc).strip() or type(exc).__name__,
-                                }
+                                final_res = dict(final_res)
+                                final_res["segments"] = cleaned_segments
+                                if task_hierarchy is not None:
+                                    final_res["task_hierarchy"] = task_hierarchy
+                                diagnostics = dict(final_res.get("diagnostics", {}))
+                                diagnostics.update(llm_postprocess_diagnostics)
+                                final_res["diagnostics"] = diagnostics
+                                if not final_res.get("segments"):
+                                    _fail_sample(
+                                        st,
+                                        ctx.subset,
+                                        sid,
+                                        "finalize_empty_segments",
+                                        {
+                                            "phase": "postprocess",
+                                            "window_count": len(windows),
+                                            "completed_window_count": len(by_wid),
+                                        },
+                                        log_message=f"[Fail] {ctx.subset}/{sid}: finalize produced no segments after postprocess",
+                                    )
+                                    time.sleep(0.01)
+                                    continue
+                                completed_stages.append("stage2_text")
+                                if _required_stages_satisfied(required_stages, completed_stages):
+                                    global_done = _mark_sample_done(
+                                        st,
+                                        ctx.subset,
+                                        sid,
+                                        final_res,
+                                        required_stages=required_stages,
+                                        completed_stages=completed_stages,
+                                        finalize_start=finalize_start,
+                                        global_done=global_done,
+                                        progress_total=progress_total,
+                                    )
+                                    continue
 
-                            diagnostics.update(export_diagnostics)
-                            final_res["diagnostics"] = diagnostics
-                            _log_fallback_applied(ctx.subset, sid, diagnostics)
-                            already_done = sample_store.finalize_sample_success(ctx.subset, sid, final_res)
-                            
-                            sample_status[sid] = 3
-                            st["cur_idx"] += 1
-                            
-                            if not already_done:
-                                global_done += 1
-                            log_event(
-                                logger,
-                                "finalize_done",
-                                subset=ctx.subset,
-                                sample_id=sid,
-                                finalize_ms=int(round((time.perf_counter() - finalize_start) * 1000.0)),
-                                segment_count=len(final_res.get("segments", [])),
+                            if "export" in required_stages:
+                                export_segments = [
+                                    dict(segment)
+                                    for segment in final_res.get("segments", [])
+                                    if isinstance(segment, dict)
+                                ]
+                                subtitle_segments, subtitle_localization_diagnostics = run_export_subtitle_localization_pass(
+                                    sid,
+                                    export_segments,
+                                    config.llm_merge,
+                                    str(config.export.subtitles.language),
+                                )
+                                export_segments = subtitle_segments
+                                final_res = dict(final_res)
+                                final_res["segments"] = [
+                                    dict(segment)
+                                    for segment in export_segments
+                                    if isinstance(segment, dict)
+                                ]
+                                diagnostics = dict(final_res.get("diagnostics", {}))
+                                diagnostics.update(subtitle_localization_diagnostics)
+                                final_res["diagnostics"] = diagnostics
+
+                                try:
+                                    export_diagnostics = export_sample_outputs(
+                                        run_dir=ctx.run_dir,
+                                        sample_id=sid,
+                                        video_path=mp4,
+                                        fps=fps,
+                                        segments=export_segments,
+                                        export_config=config.export,
+                                    )
+                                except Exception as exc:
+                                    export_diagnostics = {
+                                        "export_enabled": bool(config.export.enabled),
+                                        "export_attempted": bool(config.export.enabled),
+                                        "export_mode": str(config.export.mode),
+                                        "export_reason": "failed_before_export_completion",
+                                        "export_error": str(exc).strip() or type(exc).__name__,
+                                    }
+
+                                diagnostics.update(export_diagnostics)
+                                final_res["diagnostics"] = diagnostics
+                                if not _export_stage_succeeded(export_diagnostics):
+                                    _fail_sample(
+                                        st,
+                                        ctx.subset,
+                                        sid,
+                                        "export_failed",
+                                        {
+                                            "stage": "export",
+                                            "required_stages": list(required_stages),
+                                            "completed_stages": list(completed_stages),
+                                            "export_reason": str(export_diagnostics.get("export_reason", "")).strip(),
+                                            "export_errors": list(export_diagnostics.get("export_errors", [])),
+                                            "export_error": str(export_diagnostics.get("export_error", "")).strip(),
+                                        },
+                                        log_message=f"[Fail] {ctx.subset}/{sid}: required export stage did not complete",
+                                    )
+                                    time.sleep(0.01)
+                                    continue
+                                completed_stages.append("export")
+                                global_done = _mark_sample_done(
+                                    st,
+                                    ctx.subset,
+                                    sid,
+                                    final_res,
+                                    required_stages=required_stages,
+                                    completed_stages=completed_stages,
+                                    finalize_start=finalize_start,
+                                    global_done=global_done,
+                                    progress_total=progress_total,
+                                )
+                                continue
+
+                            global_done = _mark_sample_done(
+                                st,
+                                ctx.subset,
+                                sid,
+                                final_res,
+                                required_stages=required_stages,
+                                completed_stages=completed_stages,
+                                finalize_start=finalize_start,
+                                global_done=global_done,
+                                progress_total=progress_total,
                             )
-                            logger.info(f"[Progress] {global_done}/{progress_total} (finished: {ctx.subset}/{sid})")
 
+                    except _SampleArtifactDispatchFailure as exc:
+                        _fail_sample_for_invalid_artifacts(
+                            st,
+                            ctx.subset,
+                            sid,
+                            reason=exc.reason,
+                            phase=exc.phase,
+                            error=exc.error,
+                            log_message=f"[Fail] {ctx.subset}/{sid}: invalid preparation artifacts blocked dispatch",
+                            details=exc.details,
+                        )
                     except Exception as e:
                         logger.error(f"[Err-Finalize] {ctx.subset}/{sid}: {e}")
                         _fail_sample(

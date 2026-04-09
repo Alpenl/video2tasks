@@ -338,6 +338,22 @@ v2t-worker --config config.yaml
   source instruction 永远是英文；字幕本地化只改变字幕文本。
 - `<run_dir>/samples/<sample_id>/.DONE` / `<run_dir>/samples/<sample_id>/.FAILED`：样本终态标记。
   `.DONE` 的语义是：该样本已完成 `<run_dir>/run_manifest.json.required_stages` 里定义的全部必需阶段。
+- `failure.json`：只要存在 `.FAILED` 就必须存在，用来记录该样本面向 operator 的终态 reason/details。
+
+终态矩阵：
+
+| 运行时结果 | `.DONE` | `.FAILED` | `failure.json` |
+| --- | --- | --- | --- |
+| 全部 required stages 完成 | 存在 | 不存在 | 不存在 |
+| 任一 required stage 失败（`window_boundary_failed`、`segment_label_failed`、`boundary_refinement_failed`、`export_failed`） | 不存在 | 存在 | 存在 |
+| 已知坏产物在 dispatch 前被拒绝（`artifact_extraction_failed`、`artifact_preparation_failed`） | 不存在 | 存在 | 存在 |
+| finalize 崩溃，或把 required-stage 结果清空（`finalize_exception`、`finalize_empty_segments`） | 不存在 | 存在 | 存在 |
+
+额外规则：
+
+- 写入 `.FAILED` 时必须移除陈旧 `.DONE`；写入 `.DONE` 时必须移除陈旧 `.FAILED` 和 `failure.json`。
+- `failure.json.reason` 是样本级终态原因。像 `empty_retry_exhausted`、`timeout_retry_exhausted` 这类 job 级原始原因会保留在 `windows.jsonl` / `segment_labels.jsonl` / `boundary_refinements.jsonl` 的 `terminal_error` 字段里；当对应 required stage 被识别为失败时，样本再收敛到 `.FAILED`。
+- `server.max_empty_retries_per_job` 默认是 `3`。只有在你明确要允许空结果无限重试时才设成 `0`。一旦预算耗尽，原始 job 记录就进入终态，样本最终必须收敛到 `.FAILED`，不能停在半完成目录状态。
 - `<run_dir>/exports/<sample_id>/annotated.mp4`：当 `export.mode=annotated|both` 且 annotated 导出成功时可见。
 - `<run_dir>/clips/<sample_id>/...`：当 `export.mode=clips|both` 且 clips 导出成功时可见。
   `<run_dir>/clips/<sample_id>/manifest.json` 是 clips 导出契约记录。clips 导出必须保留音频（`audio_preserved=true`）。

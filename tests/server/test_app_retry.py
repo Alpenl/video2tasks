@@ -20,6 +20,7 @@ from video2tasks.server.app import (
 )
 from video2tasks.server.protocol import JobEnvelope, SharedFSImageTransport
 from video2tasks.server.run_manifest import build_run_manifest, run_manifest_path
+from video2tasks.server.task_artifacts import ArtifactPayloadIssue, ArtifactPayloadValidationError
 from video2tasks.server.windowing import BoundaryRefinementWindow, Window
 
 
@@ -43,6 +44,7 @@ def _make_dataset_app(
     with_mp4: bool = False,
     windowing: dict | None = None,
     export: dict | None = None,
+    llm_merge: dict | None = None,
     start_runtime: bool = True,
 ):
     subset = "demo"
@@ -58,6 +60,7 @@ def _make_dataset_app(
         server={"auto_exit_after_all_done": False},
         windowing=windowing or {},
         export=export or {},
+        llm_merge=llm_merge or {},
     )
     app = create_app(config)
     if start_runtime:
@@ -71,6 +74,8 @@ def _seed_dataset_run_manifest(
     *,
     windowing: dict | None = None,
     export: dict | None = None,
+    llm_merge: dict | None = None,
+    required_stages: list[str] | None = None,
 ) -> None:
     subset = "demo"
     data_root = tmp_path / "data"
@@ -81,6 +86,7 @@ def _seed_dataset_run_manifest(
         server={"auto_exit_after_all_done": False},
         windowing=windowing or {},
         export=export or {},
+        llm_merge=llm_merge or {},
     )
     run_dir = Path(tmp_path) / subset / "testrun"
     manifest = build_run_manifest(
@@ -89,6 +95,8 @@ def _seed_dataset_run_manifest(
         data_root=str(data_root),
         config=config,
     )
+    if required_stages is not None:
+        manifest.required_stages = [str(stage) for stage in required_stages]
     path = run_manifest_path(run_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest.model_dump(mode="json"), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -107,6 +115,13 @@ def _read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _override_required_stages(app, stages: list[str], *, subset: str = "demo") -> None:
+    manifest_path = Path(app.state.run_manifest_paths[subset])
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["required_stages"] = [str(stage) for stage in stages]
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 class _NoopFrameExtractor:
     def __init__(self, *_args, **_kwargs):
         pass
@@ -119,6 +134,32 @@ class _NoopFrameExtractor:
 
     def get_many_b64_with_artifacts(self, *_args, **_kwargs):
         return [], None
+
+
+class _InvalidArtifactFrameExtractor:
+    reason = "image_decode_failed"
+    source = "cv2_frame"
+
+    def __init__(self, *_args, **_kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def get_many_b64_with_artifacts(self, *_args, **_kwargs):
+        raise ArtifactPayloadValidationError(
+            [
+                ArtifactPayloadIssue(
+                    index=0,
+                    reason=type(self).reason,
+                    byte_size=0,
+                    source=type(self).source,
+                )
+            ]
+        )
 
 
 
@@ -236,7 +277,7 @@ def test_get_job_returns_typed_image_transport_with_dispatch_id(tmp_path) -> Non
     app.state.job_queue.append(
         JobEnvelope(
             task_id="demo::sample_w0",
-            meta={"subset": "demo", "sample_id": "sample"},
+            meta={"subset": "demo", "sample_id": "sample", "job_type": "window_boundary"},
             image_transport=SharedFSImageTransport(
                 image_paths=["/tmp/frame_000.png"],
                 artifact_manifest_path="/tmp/manifest.json",
@@ -255,6 +296,7 @@ def test_get_job_returns_typed_image_transport_with_dispatch_id(tmp_path) -> Non
             "meta": {
                 "subset": "demo",
                 "sample_id": "sample",
+                "job_type": "window_boundary",
                 "dispatch_id": "d1",
             },
             "image_transport": {
@@ -870,10 +912,40 @@ def test_output_directory_existing_without_done_marker_is_not_treated_as_done(tm
     assert report["reason"] == "missing_input_video"
 
 
+def test_done_marker_writes_after_stage1_when_stage1_is_only_required_stage(tmp_path, monkeypatch) -> None:
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, required_stages=["stage1_segments"])
+    _seed_completed_window_result(sample_out_dir)
+
+    _install_basic_finalize_mocks(monkeypatch)
+    monkeypatch.setattr(
+        app_module,
+        "run_llm_postprocess_pass",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("stage2 should not run when not required")),
+    )
+    monkeypatch.setattr(
+        app_module,
+        "export_sample_outputs",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("export should not run when not required")),
+    )
+
+    _, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True)
+    done_marker = sample_out_dir / ".DONE"
+    failed_marker = sample_out_dir / ".FAILED"
+
+    _wait_until(lambda: done_marker.exists() or failed_marker.exists())
+
+    assert done_marker.exists()
+    assert not failed_marker.exists()
+    payload = _read_json(sample_out_dir / "segments.json")
+    assert payload["segments"][0]["instruction"] == "Add potatoes"
+
+
 def test_done_marker_waits_for_stage2_required_stage_completion(tmp_path, monkeypatch) -> None:
     sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
     sample_out_dir.mkdir(parents=True, exist_ok=True)
-    _seed_dataset_run_manifest(tmp_path)
+    _seed_dataset_run_manifest(tmp_path, llm_merge={"enabled": True})
     _seed_completed_window_result(sample_out_dir)
 
     entered = threading.Event()
@@ -893,7 +965,7 @@ def test_done_marker_waits_for_stage2_required_stage_completion(tmp_path, monkey
         lambda **_kwargs: {"export_enabled": False, "export_attempted": False},
     )
 
-    _, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True)
+    _, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True, llm_merge={"enabled": True})
     done_marker = sample_out_dir / ".DONE"
     failed_marker = sample_out_dir / ".FAILED"
 
@@ -944,6 +1016,37 @@ def test_done_marker_waits_for_export_required_stage_completion_when_enabled(tmp
     assert not failed_marker.exists()
 
 
+def test_done_marker_does_not_wait_for_optional_export_when_manifest_does_not_require_it(tmp_path, monkeypatch) -> None:
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, export={"enabled": True})
+    _seed_completed_window_result(sample_out_dir)
+
+    _install_basic_finalize_mocks(monkeypatch)
+    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", lambda _sid, segments, _config: (segments, None, {}))
+    monkeypatch.setattr(
+        app_module,
+        "export_sample_outputs",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("optional export should not run after terminal success")),
+    )
+
+    app, _, sample_out_dir = _make_dataset_app(
+        tmp_path,
+        with_mp4=True,
+        export={"enabled": True},
+        start_runtime=False,
+    )
+    _override_required_stages(app, ["stage1_segments"])
+    _start_runtime(app)
+    done_marker = sample_out_dir / ".DONE"
+    failed_marker = sample_out_dir / ".FAILED"
+
+    _wait_until(lambda: done_marker.exists() or failed_marker.exists())
+
+    assert done_marker.exists()
+    assert not failed_marker.exists()
+
+
 def test_step_a_exception_marks_sample_failed(tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(app_module, "read_video_info", lambda _mp4: (30.0, 16))
 
@@ -961,6 +1064,41 @@ def test_step_a_exception_marks_sample_failed(tmp_path, monkeypatch) -> None:
     report = _read_json(sample_out_dir / "failure.json")
     assert report["reason"] == "step_a_exception"
     assert report["details"]["error"] == "step a exploded"
+
+
+def test_required_export_failure_marks_sample_failed_without_done(tmp_path, monkeypatch) -> None:
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, export={"enabled": True})
+    _seed_completed_window_result(sample_out_dir)
+
+    _install_basic_finalize_mocks(monkeypatch)
+    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", lambda _sid, segments, _config: (segments, None, {}))
+    monkeypatch.setattr(
+        app_module,
+        "export_sample_outputs",
+        lambda **_kwargs: {
+            "export_enabled": True,
+            "export_attempted": True,
+            "export_mode": "clips",
+            "export_reason": "failed",
+            "export_errors": ["clips:degraded"],
+            "export_clips_contract_status": "degraded",
+        },
+    )
+
+    _, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True, export={"enabled": True})
+    failed_marker = sample_out_dir / ".FAILED"
+    done_marker = sample_out_dir / ".DONE"
+
+    _wait_until(lambda: failed_marker.exists() or done_marker.exists())
+
+    assert failed_marker.exists()
+    assert not done_marker.exists()
+    report = _read_json(sample_out_dir / "failure.json")
+    assert report["reason"] == "export_failed"
+    assert report["details"]["stage"] == "export"
+    assert report["details"]["export_reason"] == "failed"
 
 
 def test_finalize_exception_marks_sample_failed_without_done_marker(tmp_path, monkeypatch) -> None:
@@ -1066,7 +1204,7 @@ def test_reload_validation_uses_persisted_logical_frame_count_layout(tmp_path, m
 def test_postprocess_empty_result_marks_sample_failed_without_done(tmp_path, monkeypatch) -> None:
     sample_out_dir = Path(tmp_path) / 'demo' / 'testrun' / 'samples' / 'sample'
     sample_out_dir.mkdir(parents=True, exist_ok=True)
-    _seed_dataset_run_manifest(tmp_path)
+    _seed_dataset_run_manifest(tmp_path, llm_merge={"enabled": True})
     _seed_completed_window_result(sample_out_dir)
 
     _install_basic_finalize_mocks(monkeypatch)
@@ -1077,7 +1215,7 @@ def test_postprocess_empty_result_marks_sample_failed_without_done(tmp_path, mon
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError('export should not run after postprocess emptied segments')),
     )
 
-    _, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True)
+    _, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True, llm_merge={"enabled": True})
     failed_marker = sample_out_dir / '.FAILED'
     done_marker = sample_out_dir / '.DONE'
     failure_report = sample_out_dir / 'failure.json'
@@ -1090,6 +1228,24 @@ def test_postprocess_empty_result_marks_sample_failed_without_done(tmp_path, mon
     report = _read_json(failure_report)
     assert report['reason'] == 'finalize_empty_segments'
     assert report['details']['phase'] == 'postprocess'
+
+
+def test_step_a_invalid_artifact_fails_sample_before_dispatch(tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(app_module, "read_video_info", lambda _mp4: (30.0, 16))
+    monkeypatch.setattr(app_module, "build_windows", lambda *_args, **_kwargs: _single_window())
+    monkeypatch.setattr(app_module, "FrameExtractor", _InvalidArtifactFrameExtractor)
+
+    app, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=True)
+    failed_marker = sample_out_dir / ".FAILED"
+
+    _wait_until(lambda: failed_marker.exists())
+
+    assert app.state.job_queue == []
+    assert not (sample_out_dir / ".DONE").exists()
+    report = _read_json(sample_out_dir / "failure.json")
+    assert report["reason"] == "artifact_extraction_failed"
+    assert report["details"]["phase"] == "step_a"
+    assert report["details"]["issues"][0]["reason"] == "image_decode_failed"
 
 
 def test_boundary_refinement_terminal_failure_blocks_done(tmp_path, monkeypatch) -> None:
@@ -1139,6 +1295,34 @@ def test_boundary_refinement_terminal_failure_blocks_done(tmp_path, monkeypatch)
     report = _read_json(sample_out_dir / 'failure.json')
     assert report['reason'] == 'boundary_refinement_failed'
     assert report['details']['errors'] == {'0': 'boundary_retry_exhausted'}
+
+
+def test_deferred_label_invalid_artifact_fails_sample_before_dispatch(tmp_path, monkeypatch) -> None:
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, windowing={"segment_labeling_mode": "deferred"})
+    _seed_completed_window_result(sample_out_dir)
+
+    _install_basic_finalize_mocks(monkeypatch)
+    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", lambda _sid, segments, _config: (segments, None, {}))
+    monkeypatch.setattr(app_module, "FrameExtractor", _InvalidArtifactFrameExtractor)
+
+    _, _, sample_out_dir = _make_dataset_app(
+        tmp_path,
+        with_mp4=True,
+        windowing={"segment_labeling_mode": "deferred"},
+    )
+    failed_marker = sample_out_dir / ".FAILED"
+    done_marker = sample_out_dir / ".DONE"
+
+    _wait_until(lambda: failed_marker.exists() or done_marker.exists())
+
+    assert failed_marker.exists()
+    assert not done_marker.exists()
+    report = _read_json(sample_out_dir / "failure.json")
+    assert report["reason"] == "artifact_preparation_failed"
+    assert report["details"]["phase"] == "segment_label_dispatch"
+    assert report["details"]["issues"][0]["reason"] == "image_decode_failed"
 
 
 def test_deferred_label_terminal_failure_blocks_done(tmp_path, monkeypatch) -> None:

@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from video2tasks.server.sample_store import SampleStore
 
 
@@ -82,6 +84,8 @@ def test_sample_store_finalize_success_writes_done_and_clears_failure(tmp_path: 
         "demo",
         "sample",
         {"segments": [{"seg_id": 0, "instruction": "Add potatoes"}]},
+        required_stages=["stage1_segments", "stage2_text"],
+        completed_stages=["stage1_segments", "stage2_text"],
     )
 
     assert already_done is False
@@ -90,6 +94,45 @@ def test_sample_store_finalize_success_writes_done_and_clears_failure(tmp_path: 
     assert not (sample_dir / "failure.json").exists()
     payload = json.loads((sample_dir / "segments.json").read_text(encoding="utf-8"))
     assert payload["segments"][0]["instruction"] == "Add potatoes"
+
+
+def test_sample_store_finalize_success_rejects_missing_required_stage_completion(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    sample_dir = Path(store.sample_out_dir("demo", "sample"))
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(ValueError, match="missing required stages"):
+        store.finalize_sample_success(
+            "demo",
+            "sample",
+            {"segments": [{"seg_id": 0, "instruction": "Add potatoes"}]},
+            required_stages=["stage1_segments", "stage2_text"],
+            completed_stages=["stage1_segments"],
+        )
+
+    assert not (sample_dir / "segments.json").exists()
+    assert not (sample_dir / ".DONE").exists()
+    assert not (sample_dir / ".FAILED").exists()
+    assert not (sample_dir / "failure.json").exists()
+
+
+def test_sample_store_finalize_success_allows_stage1_only_terminal_contract(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    sample_dir = Path(store.sample_out_dir("demo", "sample"))
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    store.finalize_sample_success(
+        "demo",
+        "sample",
+        {"segments": [{"seg_id": 0, "instruction": "Add potatoes"}]},
+        required_stages=["stage1_segments"],
+        completed_stages=["stage1_segments"],
+    )
+
+    assert (sample_dir / "segments.json").exists()
+    assert (sample_dir / ".DONE").exists()
+    assert not (sample_dir / ".FAILED").exists()
+    assert not (sample_dir / "failure.json").exists()
 
 
 def test_sample_store_copies_initial_subset_dir_mapping(tmp_path: Path) -> None:

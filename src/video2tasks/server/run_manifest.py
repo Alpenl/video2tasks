@@ -285,7 +285,9 @@ def _backend_summary(config: Config) -> dict[str, Any]:
 
 
 def _required_stages(config: Config) -> list[str]:
-    stages = ["stage1_segments", "stage2_text"]
+    stages = ["stage1_segments"]
+    if bool(config.llm_merge.enabled):
+        stages.append("stage2_text")
     if bool(config.export.enabled):
         stages.append("export")
     return stages

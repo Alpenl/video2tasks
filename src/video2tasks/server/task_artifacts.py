@@ -79,6 +79,26 @@ class ArtifactPayloadIssue:
     source: str
 
 
+def artifact_validation_error_details(error: ArtifactPayloadValidationError) -> Dict[str, Any]:
+    issues = [
+        {
+            "index": int(issue.index),
+            "reason": str(issue.reason),
+            "byte_size": int(issue.byte_size),
+            "source": str(issue.source),
+        }
+        for issue in error.issues
+    ]
+    reasons = sorted({str(issue["reason"]) for issue in issues if str(issue["reason"])})
+    sources = sorted({str(issue["source"]) for issue in issues if str(issue["source"])})
+    return {
+        "issue_count": len(issues),
+        "issues": issues,
+        "artifact_reasons": reasons,
+        "artifact_sources": sources,
+    }
+
+
 class ArtifactPayloadValidationError(ValueError):
     """Raised when one or more artifact payloads are empty or undecodable."""
 

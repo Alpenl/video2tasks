@@ -5,11 +5,23 @@ from __future__ import annotations
 import json
 import threading
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 
 
 RecordNormalizer = Callable[[Dict[str, Any]], Dict[str, Any]]
 PayloadNormalizer = Callable[[Dict[str, Any]], Dict[str, Any]]
+
+
+def _normalize_stage_names(stages: Iterable[str]) -> tuple[str, ...]:
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for stage in stages:
+        name = str(stage).strip()
+        if not name or name in seen:
+            continue
+        normalized.append(name)
+        seen.add(name)
+    return tuple(normalized)
 
 
 class SampleStore:
@@ -290,10 +302,35 @@ class SampleStore:
             with open(self.failure_report_path(subset, sample_id), "w", encoding="utf-8") as file_obj:
                 json.dump(payload, file_obj, indent=2, ensure_ascii=False)
 
-    def finalize_sample_success(self, subset: str, sample_id: str, payload: Dict[str, Any]) -> bool:
+    def finalize_sample_success(
+        self,
+        subset: str,
+        sample_id: str,
+        payload: Dict[str, Any],
+        *,
+        required_stages: Iterable[str],
+        completed_stages: Iterable[str],
+    ) -> bool:
+        normalized_required_stages = _normalize_stage_names(required_stages)
+        normalized_completed_stages = _normalize_stage_names(completed_stages)
+        missing_required_stages = [
+            stage
+            for stage in normalized_required_stages
+            if stage not in normalized_completed_stages
+        ]
+        if missing_required_stages:
+            missing_rendered = ", ".join(missing_required_stages)
+            raise ValueError(f"missing required stages: {missing_rendered}")
+
+        payload_to_persist = dict(payload)
+        diagnostics = dict(payload_to_persist.get("diagnostics", {}))
+        diagnostics["required_stages"] = list(normalized_required_stages)
+        diagnostics["completed_stages"] = list(normalized_completed_stages)
+        payload_to_persist["diagnostics"] = diagnostics
+
         with self._get_sample_lock(subset, sample_id):
             with open(self.segments_path(subset, sample_id), "w", encoding="utf-8") as file_obj:
-                json.dump(payload, file_obj, indent=2, ensure_ascii=False)
+                json.dump(payload_to_persist, file_obj, indent=2, ensure_ascii=False)
 
             done_path = Path(self.done_marker_path(subset, sample_id))
             already_done = done_path.exists()
