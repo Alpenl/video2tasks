@@ -264,8 +264,9 @@ Smoke output paths are fixed and test-covered:
 After the command exits, inspect results in this order:
 1. `samples/sample_001/.DONE` or `.FAILED`
 2. `samples/sample_001/segments.json`
-3. `samples/sample_001/sample_runtime.json`
-4. `run_summary.json`
+3. `run_manifest.json`
+
+Future runtime-evidence artifacts may add `samples/sample_001/sample_runtime.json` and `run_summary.json`, but they are not required for the current smoke pass.
 
 For full commands and expected outputs, see [Official Smoke Demo Runbook](docs/runbooks/official-smoke-demo.md).
 

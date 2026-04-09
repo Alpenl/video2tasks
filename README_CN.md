@@ -264,8 +264,9 @@ smoke 输出路径是固定且有测试覆盖的：
 命令退出后按以下顺序查看结果：
 1. `samples/sample_001/.DONE` 或 `.FAILED`
 2. `samples/sample_001/segments.json`
-3. `samples/sample_001/sample_runtime.json`
-4. `run_summary.json`
+3. `run_manifest.json`
+
+未来的运行态证据产物可能会增加 `samples/sample_001/sample_runtime.json` 和 `run_summary.json`，但它们不属于当前 smoke 通过的必需项。
 
 完整命令与预期结果请参考：[Official Smoke Demo Runbook](docs/runbooks/official-smoke-demo.md)
 
