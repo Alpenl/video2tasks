@@ -369,7 +369,7 @@ v2t-worker --config config.yaml
 - `sample_runtime.json` + `run_summary.json` 是 operator runtime-evidence 层，用于判断与审计，不替代最终切分结果本体。
 - `segments.json.diagnostics` 在 P0 兼容窗口内仍会双写，但它只是兼容影子数据，不再是 canonical runtime evidence 的位置。
 
-端点波动排障（以及如何区分端点不稳与代码/数据失败）请看 [Endpoint Volatility Runbook](docs/runbooks/endpoint-volatility.md)。
+端点波动排障（以及如何区分端点波动与代码/数据失败）请看 [Endpoint Volatility Runbook](docs/runbooks/endpoint-volatility.md)。
 
 ---
 

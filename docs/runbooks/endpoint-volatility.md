@@ -9,7 +9,7 @@ It is documentation-only and assumes the existing deployment contract: `single-m
 - Config layering is **only** `env > yaml > defaults`.
   `yaml` means the file loaded via `--config` or `VIDEO2TASKS_CONFIG`.
 - `config.example.yaml` is a **minimal runnable template**, not a full tuning catalog.
-- External endpoint instability is **not automatically** a code failure.
+- External endpoint volatility is **not automatically** a code failure.
   You must classify with runtime evidence before blaming code.
 
 ## 2) Observation Entry Points (In This Order)
