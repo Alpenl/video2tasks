@@ -368,7 +368,13 @@ v2t-worker --config config.yaml
 - `<run_dir>/run_manifest.json`（run 级）：记录 run 身份（config/prompt hash、backend 摘要、`required_stages`）与 resume 校验元数据。
   resume 默认严格拒绝跨 identity 续跑（config/prompt/backend/required-stages 不一致）。只有显式设置 `run.force_resume=true` 或 `RUN_FORCE_RESUME=true` 才会放行。
 - `sample_runtime.json` + `run_summary.json` 是 operator runtime-evidence 层，用于判断与审计，不替代最终切分结果本体。
-- `segments.json.diagnostics` 在 P0 兼容窗口内仍会双写，但它只是兼容影子数据，不再是 canonical runtime evidence 的位置。
+- **Gate 1 弃用策略（已于 2026 年 4 月 9 日冻结）：**
+  `segments.json.diagnostics.required_stages` 与 `segments.json.diagnostics.completed_stages` 属于已弃用的 runtime 影子字段。
+  这两个字段的写入路径已在 P1-2（2026 年 4 月 9 日）移除。
+  迁移目标是 `sample_runtime.json.stages`（样本级）与 `run_summary.json.stage_completion`（run 级）。
+  兼容读取仅用于从 P1-2 之前的遗留样本重建缺失 runtime 产物。
+  兼容窗口为 90 天，截止到 2026 年 7 月 8 日。
+  2026 年 7 月 8 日后，在确认无保留 run 依赖这些旧字段时，移除该读取回退。
 
 端点波动排障（以及如何区分端点波动与代码/数据失败）请看 [Endpoint Volatility Runbook](docs/runbooks/endpoint-volatility.md)。
 

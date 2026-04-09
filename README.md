@@ -368,7 +368,13 @@ Additional rules:
 - `<run_dir>/run_manifest.json` (run-level): records run identity (config/prompt hashes, backend summary, `required_stages`) and resume validation metadata.
   Resume is strict by default: cross identity continuation (config/prompt/backend/required stage mismatch) is rejected unless you explicitly set `run.force_resume=true` or `RUN_FORCE_RESUME=true`.
 - `sample_runtime.json` + `run_summary.json` are the operator runtime-evidence layer. They exist for operator decisions and auditing, not as a replacement for the final segmentation result.
-- `segments.json.diagnostics` is still dual-written during the P0 compatibility window, but it is compatibility shadow data, not the canonical runtime evidence location.
+- **Gate 1 deprecation policy (frozen on April 9, 2026):**
+  `segments.json.diagnostics.required_stages` and `segments.json.diagnostics.completed_stages` are deprecated runtime shadow fields.
+  Their write path was removed in P1-2 on April 9, 2026.
+  Migration target is `sample_runtime.json.stages` (sample-level) plus `run_summary.json.stage_completion` (run-level).
+  Read compatibility is temporary and only for rebuilding missing runtime artifacts from legacy pre-P1-2 samples.
+  Compatibility window: 90 days, ending on July 8, 2026.
+  Remove the legacy read fallback after July 8, 2026, once no retained run depends on these legacy stage fields.
 
 For endpoint volatility triage (and how to separate endpoint volatility from code/data failures), see [Endpoint Volatility Runbook](docs/runbooks/endpoint-volatility.md).
 
