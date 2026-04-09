@@ -302,6 +302,11 @@ class SampleStore:
             with open(self.failure_report_path(subset, sample_id), "w", encoding="utf-8") as file_obj:
                 json.dump(payload, file_obj, indent=2, ensure_ascii=False)
 
+    def persist_sample_payload(self, subset: str, sample_id: str, payload: Dict[str, Any]) -> None:
+        with self._get_sample_lock(subset, sample_id):
+            with open(self.segments_path(subset, sample_id), "w", encoding="utf-8") as file_obj:
+                json.dump(payload, file_obj, indent=2, ensure_ascii=False)
+
     def finalize_sample_success(
         self,
         subset: str,

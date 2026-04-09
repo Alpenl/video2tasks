@@ -135,7 +135,6 @@ def test_create_app_force_resume_records_exact_identity_mismatch_surface(tmp_pat
     assert resume_status["mismatch_fields"] == [
         "deployment_mode",
         "run_id",
-        "required_stages",
     ]
 
 

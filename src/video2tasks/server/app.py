@@ -509,6 +509,37 @@ def create_app(config: Config) -> FastAPI:
         completed_stage_set = {str(stage).strip() for stage in completed_stages if str(stage).strip()}
         return all(str(stage).strip() in completed_stage_set for stage in required_stages)
 
+    def _payload_with_terminal_diagnostics(
+        final_res: Dict[str, Any],
+        *,
+        required_stages: List[str],
+        completed_stages: List[str],
+    ) -> Dict[str, Any]:
+        payload_to_persist = dict(final_res)
+        diagnostics = dict(payload_to_persist.get("diagnostics", {}))
+        diagnostics["required_stages"] = list(required_stages)
+        diagnostics["completed_stages"] = list(completed_stages)
+        payload_to_persist["diagnostics"] = diagnostics
+        return payload_to_persist
+
+    def _persist_sample_writeback(
+        subset: str,
+        sample_id: str,
+        final_res: Dict[str, Any],
+        *,
+        required_stages: List[str],
+        completed_stages: List[str],
+    ) -> Dict[str, Any]:
+        payload_to_persist = _payload_with_terminal_diagnostics(
+            final_res,
+            required_stages=required_stages,
+            completed_stages=completed_stages,
+        )
+        diagnostics = dict(payload_to_persist.get("diagnostics", {}))
+        _log_fallback_applied(subset, sample_id, diagnostics)
+        sample_store.persist_sample_payload(subset, sample_id, payload_to_persist)
+        return payload_to_persist
+
     def _mark_sample_done(
         state: Dict[str, Any],
         subset: str,
@@ -521,11 +552,12 @@ def create_app(config: Config) -> FastAPI:
         global_done: int,
         progress_total: int,
     ) -> int:
-        payload_to_persist = dict(final_res)
+        payload_to_persist = _payload_with_terminal_diagnostics(
+            final_res,
+            required_stages=required_stages,
+            completed_stages=completed_stages,
+        )
         diagnostics = dict(payload_to_persist.get("diagnostics", {}))
-        diagnostics["required_stages"] = list(required_stages)
-        diagnostics["completed_stages"] = list(completed_stages)
-        payload_to_persist["diagnostics"] = diagnostics
         _log_fallback_applied(subset, sample_id, diagnostics)
         already_done = sample_store.finalize_sample_success(
             subset,
@@ -550,6 +582,41 @@ def create_app(config: Config) -> FastAPI:
         )
         logger.info(f"[Progress] {global_done}/{progress_total} (finished: {subset}/{sample_id})")
         return global_done
+
+    def _apply_stage2_text_writeback(sample_id: str, final_res: Dict[str, Any]) -> Dict[str, Any]:
+        cleaned_segments, task_hierarchy, llm_postprocess_diagnostics = run_llm_postprocess_pass(
+            sample_id,
+            final_res.get("segments", []),
+            config.llm_merge,
+        )
+        next_res = dict(final_res)
+        next_res["segments"] = cleaned_segments
+        if task_hierarchy is not None:
+            next_res["task_hierarchy"] = task_hierarchy
+        diagnostics = dict(next_res.get("diagnostics", {}))
+        diagnostics.update(llm_postprocess_diagnostics)
+        next_res["diagnostics"] = diagnostics
+
+        export_segments = [
+            dict(segment)
+            for segment in next_res.get("segments", [])
+            if isinstance(segment, dict)
+        ]
+        subtitle_segments, subtitle_localization_diagnostics = run_export_subtitle_localization_pass(
+            sample_id,
+            export_segments,
+            config.llm_merge,
+            str(config.export.subtitles.language),
+        )
+        next_res["segments"] = [
+            dict(segment)
+            for segment in subtitle_segments
+            if isinstance(segment, dict)
+        ]
+        diagnostics = dict(next_res.get("diagnostics", {}))
+        diagnostics.update(subtitle_localization_diagnostics)
+        next_res["diagnostics"] = diagnostics
+        return next_res
 
     def _artifact_failure_details(
         error: ArtifactPayloadValidationError,
@@ -1350,7 +1417,8 @@ def create_app(config: Config) -> FastAPI:
                                 final_res["diagnostics"] = diagnostics
 
                             completed_stages.append("stage1_segments")
-                            if _required_stages_satisfied(required_stages, completed_stages):
+                            early_done = _required_stages_satisfied(required_stages, completed_stages)
+                            if early_done:
                                 global_done = _mark_sample_done(
                                     st,
                                     ctx.subset,
@@ -1362,22 +1430,25 @@ def create_app(config: Config) -> FastAPI:
                                     global_done=global_done,
                                     progress_total=progress_total,
                                 )
-                                continue
 
-                            if "stage2_text" in required_stages:
-                                cleaned_segments, task_hierarchy, llm_postprocess_diagnostics = run_llm_postprocess_pass(
-                                    sid,
-                                    final_res.get("segments", []),
-                                    config.llm_merge,
-                                )
-                                final_res = dict(final_res)
-                                final_res["segments"] = cleaned_segments
-                                if task_hierarchy is not None:
-                                    final_res["task_hierarchy"] = task_hierarchy
-                                diagnostics = dict(final_res.get("diagnostics", {}))
-                                diagnostics.update(llm_postprocess_diagnostics)
-                                final_res["diagnostics"] = diagnostics
-                                if not final_res.get("segments"):
+                            stage2_writeback_required = early_done or "stage2_text" in required_stages or "export" in required_stages
+                            if stage2_writeback_required:
+                                try:
+                                    stage2_res = _apply_stage2_text_writeback(sid, final_res)
+                                except Exception as exc:
+                                    if early_done:
+                                        logger.warning(
+                                            f"[Warn] {ctx.subset}/{sid}: optional Stage 2 writeback skipped after terminal success: {exc}"
+                                        )
+                                        continue
+                                    raise
+
+                                if not stage2_res.get("segments"):
+                                    if early_done:
+                                        logger.warning(
+                                            f"[Warn] {ctx.subset}/{sid}: optional Stage 2 writeback produced no segments after terminal success"
+                                        )
+                                        continue
                                     _fail_sample(
                                         st,
                                         ctx.subset,
@@ -1392,20 +1463,33 @@ def create_app(config: Config) -> FastAPI:
                                     )
                                     time.sleep(0.01)
                                     continue
-                                completed_stages.append("stage2_text")
-                                if _required_stages_satisfied(required_stages, completed_stages):
-                                    global_done = _mark_sample_done(
-                                        st,
+
+                                final_res = stage2_res
+                                if early_done:
+                                    _persist_sample_writeback(
                                         ctx.subset,
                                         sid,
                                         final_res,
                                         required_stages=required_stages,
                                         completed_stages=completed_stages,
-                                        finalize_start=finalize_start,
-                                        global_done=global_done,
-                                        progress_total=progress_total,
                                     )
                                     continue
+
+                                if "stage2_text" in required_stages:
+                                    completed_stages.append("stage2_text")
+                                    if _required_stages_satisfied(required_stages, completed_stages):
+                                        global_done = _mark_sample_done(
+                                            st,
+                                            ctx.subset,
+                                            sid,
+                                            final_res,
+                                            required_stages=required_stages,
+                                            completed_stages=completed_stages,
+                                            finalize_start=finalize_start,
+                                            global_done=global_done,
+                                            progress_total=progress_total,
+                                        )
+                                        continue
 
                             if "export" in required_stages:
                                 export_segments = [
@@ -1413,22 +1497,6 @@ def create_app(config: Config) -> FastAPI:
                                     for segment in final_res.get("segments", [])
                                     if isinstance(segment, dict)
                                 ]
-                                subtitle_segments, subtitle_localization_diagnostics = run_export_subtitle_localization_pass(
-                                    sid,
-                                    export_segments,
-                                    config.llm_merge,
-                                    str(config.export.subtitles.language),
-                                )
-                                export_segments = subtitle_segments
-                                final_res = dict(final_res)
-                                final_res["segments"] = [
-                                    dict(segment)
-                                    for segment in export_segments
-                                    if isinstance(segment, dict)
-                                ]
-                                diagnostics = dict(final_res.get("diagnostics", {}))
-                                diagnostics.update(subtitle_localization_diagnostics)
-                                final_res["diagnostics"] = diagnostics
 
                                 try:
                                     export_diagnostics = export_sample_outputs(
@@ -1448,6 +1516,7 @@ def create_app(config: Config) -> FastAPI:
                                         "export_error": str(exc).strip() or type(exc).__name__,
                                     }
 
+                                diagnostics = dict(final_res.get("diagnostics", {}))
                                 diagnostics.update(export_diagnostics)
                                 final_res["diagnostics"] = diagnostics
                                 if not _export_stage_succeeded(export_diagnostics):
@@ -1480,6 +1549,9 @@ def create_app(config: Config) -> FastAPI:
                                     global_done=global_done,
                                     progress_total=progress_total,
                                 )
+                                continue
+
+                            if early_done:
                                 continue
 
                             global_done = _mark_sample_done(

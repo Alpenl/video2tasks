@@ -918,11 +918,38 @@ def test_done_marker_writes_after_stage1_when_stage1_is_only_required_stage(tmp_
     _seed_dataset_run_manifest(tmp_path, required_stages=["stage1_segments"])
     _seed_completed_window_result(sample_out_dir)
 
+    entered = threading.Event()
+    release = threading.Event()
+
     _install_basic_finalize_mocks(monkeypatch)
+
+    def paused_postprocess(_sid, segments, _config):
+        entered.set()
+        assert release.wait(2.0)
+        return (
+            segments,
+            {
+                "roots": [
+                    {
+                        "level": "coarse",
+                        "start_seg_id": 0,
+                        "end_seg_id": 0,
+                        "summary": "Add potatoes",
+                        "children": [],
+                    }
+                ]
+            },
+            {"llm_summary_applied": True},
+        )
+
+    monkeypatch.setattr(app_module, "run_llm_postprocess_pass", paused_postprocess)
     monkeypatch.setattr(
         app_module,
-        "run_llm_postprocess_pass",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("stage2 should not run when not required")),
+        "run_export_subtitle_localization_pass",
+        lambda _sid, segments, _config, _target_language: (
+            [dict(segment, export_subtitle="Add potatoes") for segment in segments],
+            {"export_subtitle_fallback_used": True},
+        ),
     )
     monkeypatch.setattr(
         app_module,
@@ -934,12 +961,26 @@ def test_done_marker_writes_after_stage1_when_stage1_is_only_required_stage(tmp_
     done_marker = sample_out_dir / ".DONE"
     failed_marker = sample_out_dir / ".FAILED"
 
-    _wait_until(lambda: done_marker.exists() or failed_marker.exists())
+    _wait_until(entered.is_set)
 
     assert done_marker.exists()
     assert not failed_marker.exists()
+
     payload = _read_json(sample_out_dir / "segments.json")
     assert payload["segments"][0]["instruction"] == "Add potatoes"
+    assert "task_hierarchy" not in payload
+
+    release.set()
+    _wait_until(
+        lambda: "task_hierarchy" in _read_json(sample_out_dir / "segments.json")
+        and _read_json(sample_out_dir / "segments.json")["segments"][0].get("export_subtitle") == "Add potatoes"
+    )
+
+    payload = _read_json(sample_out_dir / "segments.json")
+    assert payload["task_hierarchy"]["roots"][0]["summary"] == "Add potatoes"
+    assert payload["segments"][0]["export_subtitle"] == "Add potatoes"
+    assert done_marker.exists()
+    assert not failed_marker.exists()
 
 
 def test_done_marker_waits_for_stage2_required_stage_completion(tmp_path, monkeypatch) -> None:

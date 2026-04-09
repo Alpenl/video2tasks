@@ -135,6 +135,28 @@ def test_sample_store_finalize_success_allows_stage1_only_terminal_contract(tmp_
     assert not (sample_dir / "failure.json").exists()
 
 
+def test_sample_store_persist_sample_payload_does_not_touch_terminal_markers(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+    sample_dir = Path(store.sample_out_dir("demo", "sample"))
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    (sample_dir / ".DONE").write_text("", encoding="utf-8")
+    (sample_dir / ".FAILED").write_text("", encoding="utf-8")
+    (sample_dir / "failure.json").write_text(json.dumps({"reason": "stale"}), encoding="utf-8")
+
+    store.persist_sample_payload(
+        "demo",
+        "sample",
+        {"segments": [{"seg_id": 0, "instruction": "Add potatoes"}], "task_hierarchy": {"roots": []}},
+    )
+
+    payload = json.loads((sample_dir / "segments.json").read_text(encoding="utf-8"))
+    assert payload["segments"][0]["instruction"] == "Add potatoes"
+    assert payload["task_hierarchy"] == {"roots": []}
+    assert (sample_dir / ".DONE").exists()
+    assert (sample_dir / ".FAILED").exists()
+    assert json.loads((sample_dir / "failure.json").read_text(encoding="utf-8")) == {"reason": "stale"}
+
+
 def test_sample_store_copies_initial_subset_dir_mapping(tmp_path: Path) -> None:
     initial_mapping = {"demo": str(tmp_path / "seeded" / "samples")}
     store = SampleStore(
