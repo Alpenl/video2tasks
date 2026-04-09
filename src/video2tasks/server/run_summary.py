@@ -64,11 +64,20 @@ def _export_overview(
     diagnostics: dict[str, Any],
     *,
     failure_reason: str = "",
+    failure_details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     export_required = "export" in required_stages
-    export_enabled = bool(diagnostics.get("export_enabled", export_required))
-    export_attempted = bool(diagnostics.get("export_attempted", False))
-    export_reason = str(diagnostics.get("export_reason", "")).strip()
+    details_payload = dict(failure_details or {})
+    source: dict[str, Any] = {}
+    if failure_reason == "export_failed":
+        source.update(details_payload)
+    for key, value in diagnostics.items():
+        if str(key).startswith("export_"):
+            source[key] = value
+
+    export_enabled = bool(source.get("export_enabled", export_required))
+    export_attempted = bool(source.get("export_attempted", failure_reason == "export_failed"))
+    export_reason = str(source.get("export_reason", "")).strip()
 
     if export_reason == "applied":
         status = "applied"
@@ -91,10 +100,14 @@ def _export_overview(
         "reason": export_reason or status,
     }
 
-    errors = diagnostics.get("export_errors", [])
+    mode = str(source.get("export_mode", "")).strip()
+    if mode:
+        payload["mode"] = mode
+
+    errors = source.get("export_errors", [])
     if isinstance(errors, list) and errors:
         payload["errors"] = [str(item).strip() for item in errors if str(item).strip()]
-    error = str(diagnostics.get("export_error", "")).strip()
+    error = str(source.get("export_error", "")).strip()
     if error:
         payload["error"] = error
     return payload
@@ -164,6 +177,7 @@ def build_sample_runtime_record(
             normalized_required,
             diagnostics_payload,
             failure_reason=normalized_failure_reason,
+            failure_details=details_payload,
         ),
         "failure": failure_payload,
     }

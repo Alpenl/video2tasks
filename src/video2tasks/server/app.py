@@ -374,16 +374,21 @@ def create_app(config: Config) -> FastAPI:
     def _sample_retry_key(subset: str, sample_id: str) -> Tuple[str, str]:
         return (str(subset), str(sample_id))
 
+    def _persisted_retry_summary(subset: str, sample_id: str) -> Dict[str, int]:
+        payload = sample_store.load_sample_runtime(subset, sample_id) or {}
+        retry = payload.get("retry", {}) if isinstance(payload, dict) else {}
+        if not isinstance(retry, dict):
+            retry = {}
+        return {
+            "total_retries": int(retry.get("total_retries", 0) or 0),
+            "empty_result_retries": int(retry.get("empty_result_retries", 0) or 0),
+            "timeout_retries": int(retry.get("timeout_retries", 0) or 0),
+            "dispatch_count": int(retry.get("dispatch_count", 0) or 0),
+        }
+
     def _record_sample_retry(subset: str, sample_id: str, retry_field: str) -> None:
         key = _sample_retry_key(subset, sample_id)
-        stats = sample_retry_stats.setdefault(
-            key,
-            {
-                "total_retries": 0,
-                "empty_result_retries": 0,
-                "timeout_retries": 0,
-            },
-        )
+        stats = sample_retry_stats.setdefault(key, _persisted_retry_summary(subset, sample_id))
         stats[retry_field] = int(stats.get(retry_field, 0)) + 1
         stats["total_retries"] = int(stats.get("empty_result_retries", 0)) + int(stats.get("timeout_retries", 0))
 
@@ -397,12 +402,18 @@ def create_app(config: Config) -> FastAPI:
             )
 
     def _sample_retry_summary(subset: str, sample_id: str) -> Dict[str, int]:
-        stats = dict(sample_retry_stats.get(_sample_retry_key(subset, sample_id), {}))
-        total_retries = int(stats.get("total_retries", 0) or 0)
-        empty_result_retries = int(stats.get("empty_result_retries", 0) or 0)
-        timeout_retries = int(stats.get("timeout_retries", 0) or 0)
-        dispatch_count = _sample_dispatch_count(subset, sample_id)
-        if dispatch_count <= 0 and (total_retries > 0 or Path(done_marker_path(subset, sample_id)).exists() or Path(failed_marker_path(subset, sample_id)).exists()):
+        persisted = _persisted_retry_summary(subset, sample_id)
+        stats = dict(persisted)
+        stats.update(sample_retry_stats.get(_sample_retry_key(subset, sample_id), {}))
+        total_retries = max(int(stats.get("total_retries", 0) or 0), int(persisted.get("total_retries", 0) or 0))
+        empty_result_retries = max(int(stats.get("empty_result_retries", 0) or 0), int(persisted.get("empty_result_retries", 0) or 0))
+        timeout_retries = max(int(stats.get("timeout_retries", 0) or 0), int(persisted.get("timeout_retries", 0) or 0))
+        dispatch_count = max(
+            _sample_dispatch_count(subset, sample_id),
+            int(stats.get("dispatch_count", 0) or 0),
+            int(persisted.get("dispatch_count", 0) or 0),
+        )
+        if dispatch_count <= 0 and total_retries > 0:
             dispatch_count = total_retries + 1
         return {
             "total_retries": total_retries,
@@ -410,6 +421,28 @@ def create_app(config: Config) -> FastAPI:
             "timeout_retries": timeout_retries,
             "dispatch_count": dispatch_count,
         }
+
+    def _persist_retry_evidence(subset: str, sample_id: str) -> None:
+        existing = sample_store.load_sample_runtime(subset, sample_id) or {}
+        stages = existing.get("stages", {}) if isinstance(existing, dict) else {}
+        failure = existing.get("failure", {}) if isinstance(existing, dict) else {}
+        payload = build_sample_runtime_record(
+            subset=subset,
+            sample_id=sample_id,
+            terminal_state=str(existing.get("terminal_state", "running") or "running"),
+            required_stages=(stages.get("required", []) if isinstance(stages, dict) else []),
+            completed_stages=(stages.get("completed", []) if isinstance(stages, dict) else []),
+            diagnostics={},
+            retry_summary=_sample_retry_summary(subset, sample_id),
+            failure_reason=(str(failure.get("reason", "")).strip() if isinstance(failure, dict) else ""),
+            failure_details=(dict(failure.get("details", {})) if isinstance(failure, dict) else {}),
+            failure_report_path=(str(failure.get("report_path", "")).strip() if isinstance(failure, dict) else ""),
+        )
+        if isinstance(existing.get("fallback"), dict):
+            payload["fallback"] = dict(existing["fallback"])
+        if isinstance(existing.get("export"), dict):
+            payload["export"] = dict(existing["export"])
+        sample_store.persist_sample_runtime(subset, sample_id, payload)
 
     def _read_json_object(path_str: str) -> Dict[str, Any]:
         path = Path(path_str)
@@ -470,11 +503,16 @@ def create_app(config: Config) -> FastAPI:
         )
 
     def _ensure_sample_runtime_for_terminal_artifact(subset: str, sample_id: str) -> None:
-        if sample_store.load_sample_runtime(subset, sample_id) is not None:
-            return
+        existing_runtime = sample_store.load_sample_runtime(subset, sample_id)
+        done_exists = Path(done_marker_path(subset, sample_id)).exists()
+        failed_exists = Path(failed_marker_path(subset, sample_id)).exists()
+        if existing_runtime is not None:
+            existing_state = str(existing_runtime.get("terminal_state", "")).strip()
+            if (done_exists and existing_state == "done") or (failed_exists and existing_state == "failed"):
+                return
 
         required_stages = _required_stages_for_subset(subset)
-        if Path(done_marker_path(subset, sample_id)).exists():
+        if done_exists:
             payload = _read_json_object(segments_path(subset, sample_id))
             diagnostics = dict(payload.get("diagnostics", {}))
             completed_stages = diagnostics.get("completed_stages", required_stages)
@@ -923,6 +961,8 @@ def create_app(config: Config) -> FastAPI:
         )
 
         if not normalized_vlm_json:
+            retry_subset = str(result_meta.get("subset", ""))
+            retry_sample_id = str(result_meta.get("sample_id", ""))
             with queue_lock:
                 attempt, requeued = _requeue_empty_result(
                     job_queue,
@@ -935,28 +975,31 @@ def create_app(config: Config) -> FastAPI:
                 limit_label = "inf" if limit <= 0 else str(limit)
                 if requeued:
                     _record_sample_retry(
-                        str(result_meta.get("subset", "")),
-                        str(result_meta.get("sample_id", "")),
+                        retry_subset,
+                        retry_sample_id,
                         "empty_result_retries",
                     )
-                    log_event(
-                        logger,
-                        "result_empty_retry",
-                        task_id=tid,
-                        dispatch_id=dispatch_id,
-                        subset=str(result_meta.get("subset", "")),
-                        sample_id=str(result_meta.get("sample_id", "")),
-                        job_type=str(result_meta.get("job_type", "")),
-                        attempt=attempt,
-                        retry_limit=limit_label,
-                        infer_ms=infer_ms,
-                        submit_ms=int(round((time.perf_counter() - submit_start) * 1000.0)),
-                    )
-                    logger.warning(
-                        f"[Warn] Task {tid} empty or invalid, re-queueing to tail "
-                        f"(empty attempt {attempt}/{limit_label})"
-                    )
-                    return {"status": "retry_triggered"}
+
+            if requeued:
+                _persist_retry_evidence(retry_subset, retry_sample_id)
+                log_event(
+                    logger,
+                    "result_empty_retry",
+                    task_id=tid,
+                    dispatch_id=dispatch_id,
+                    subset=retry_subset,
+                    sample_id=retry_sample_id,
+                    job_type=str(result_meta.get("job_type", "")),
+                    attempt=attempt,
+                    retry_limit=limit_label,
+                    infer_ms=infer_ms,
+                    submit_ms=int(round((time.perf_counter() - submit_start) * 1000.0)),
+                )
+                logger.warning(
+                    f"[Warn] Task {tid} empty or invalid, re-queueing to tail "
+                    f"(empty attempt {attempt}/{limit_label})"
+                )
+                return {"status": "retry_triggered"}
 
             logger.error(
                 f"[Err] Task {tid} empty or invalid retry budget exhausted "
@@ -1028,6 +1071,7 @@ def create_app(config: Config) -> FastAPI:
             # Check inflight timeouts
             now = time.time()
             exhausted_timeouts: List[tuple[str, str, Dict[str, Any], int, str]] = []
+            timeout_retries_to_log: List[tuple[str, str, Dict[str, Any], int, str]] = []
             with queue_lock:
                 expired = [
                     tid for tid, info in inflight.items()
@@ -1037,6 +1081,7 @@ def create_app(config: Config) -> FastAPI:
                     inflight_info = inflight.pop(tid)
                     job = inflight_info["job"]
                     dispatch_id = str(inflight_info.get("dispatch_id", ""))
+                    meta = _job_payload_meta(job)
                     timeout_retry_counts[tid] = timeout_retry_counts.get(tid, 0) + 1
                     attempt = timeout_retry_counts[tid]
                     limit = config.server.max_retries_per_job
@@ -1044,27 +1089,34 @@ def create_app(config: Config) -> FastAPI:
                     if limit <= 0 or attempt <= limit:
                         job_queue.append(job)
                         _record_sample_retry(
-                            str(_job_payload_meta(job).get("subset", "")),
-                            str(_job_payload_meta(job).get("sample_id", "")),
+                            str(meta.get("subset", "")),
+                            str(meta.get("sample_id", "")),
                             "timeout_retries",
                         )
-                        log_event(
-                            logger,
-                            "result_timeout_retry",
-                            task_id=tid,
-                            dispatch_id=dispatch_id,
-                            subset=str(_job_payload_meta(job).get("subset", "")),
-                            sample_id=str(_job_payload_meta(job).get("sample_id", "")),
-                            job_type=str(_job_payload_meta(job).get("job_type", "")),
-                            attempt=attempt,
-                            retry_limit=limit_label,
-                        )
-                        logger.warning(
-                            f"[Warn] Task {tid} timed out, re-queueing to tail "
-                            f"(timeout attempt {attempt}/{limit_label})"
-                        )
+                        timeout_retries_to_log.append((tid, dispatch_id, meta, attempt, limit_label))
                     else:
-                        exhausted_timeouts.append((tid, dispatch_id, _job_payload_meta(job), attempt, limit_label))
+                        exhausted_timeouts.append((tid, dispatch_id, meta, attempt, limit_label))
+
+            for tid, dispatch_id, meta, attempt, limit_label in timeout_retries_to_log:
+                _persist_retry_evidence(
+                    str(meta.get("subset", "")),
+                    str(meta.get("sample_id", "")),
+                )
+                log_event(
+                    logger,
+                    "result_timeout_retry",
+                    task_id=tid,
+                    dispatch_id=dispatch_id,
+                    subset=str(meta.get("subset", "")),
+                    sample_id=str(meta.get("sample_id", "")),
+                    job_type=str(meta.get("job_type", "")),
+                    attempt=attempt,
+                    retry_limit=limit_label,
+                )
+                logger.warning(
+                    f"[Warn] Task {tid} timed out, re-queueing to tail "
+                    f"(timeout attempt {attempt}/{limit_label})"
+                )
 
             for tid, dispatch_id, meta, attempt, limit_label in exhausted_timeouts:
                 logger.error(
@@ -1723,6 +1775,9 @@ def create_app(config: Config) -> FastAPI:
                                             "stage": "export",
                                             "required_stages": list(required_stages),
                                             "completed_stages": list(completed_stages),
+                                            "export_enabled": bool(export_diagnostics.get("export_enabled", bool(config.export.enabled))),
+                                            "export_attempted": bool(export_diagnostics.get("export_attempted", bool(config.export.enabled))),
+                                            "export_mode": str(export_diagnostics.get("export_mode", str(config.export.mode))).strip(),
                                             "export_reason": str(export_diagnostics.get("export_reason", "")).strip(),
                                             "export_errors": list(export_diagnostics.get("export_errors", [])),
                                             "export_error": str(export_diagnostics.get("export_error", "")).strip(),

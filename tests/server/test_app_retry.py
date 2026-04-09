@@ -912,6 +912,158 @@ def test_output_directory_existing_without_done_marker_is_not_treated_as_done(tm
     assert report["reason"] == "missing_input_video"
 
 
+def test_create_app_backfills_done_runtime_and_run_summary_from_existing_terminal_artifacts(tmp_path) -> None:
+    sample_id = "sample"
+    sample_dir = Path(tmp_path) / "data" / "demo" / sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, required_stages=["stage1_segments"])
+
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / sample_id
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    (sample_out_dir / ".DONE").write_text("", encoding="utf-8")
+    (sample_out_dir / "segments.json").write_text(
+        json.dumps(
+            {
+                "sample_id": sample_id,
+                "nframes": 16,
+                "segments": [{"seg_id": 0, "start_frame": 0, "end_frame": 15, "instruction": "Add potatoes"}],
+                "diagnostics": {
+                    "required_stages": ["stage1_segments"],
+                    "completed_stages": ["stage1_segments"],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    app, _, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=False, start_runtime=False)
+
+    sample_runtime = _read_json(sample_out_dir / "sample_runtime.json")
+    run_summary = _read_json(Path(tmp_path) / "demo" / "testrun" / "run_summary.json")
+
+    assert sample_runtime["terminal_state"] == "done"
+    assert sample_runtime["stages"]["completed"] == ["stage1_segments"]
+    assert run_summary["sample_counts"] == {"total": 1, "done": 1, "failed": 0, "pending": 0}
+    assert app.state.sample_store.load_sample_runtime("demo", sample_id)["terminal_state"] == "done"
+
+
+def test_retry_evidence_survives_restart_before_terminalization(tmp_path, monkeypatch) -> None:
+    subset = "demo"
+    sample_id = "sample"
+    data_root = Path(tmp_path) / "data"
+    sample_dir = data_root / subset / sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    (sample_dir / "Frame_demo.mp4").write_bytes(b"not-a-real-video")
+
+    config = Config(
+        datasets=[{"root": str(data_root), "subset": subset}],
+        run={"base_dir": str(tmp_path), "run_id": "testrun"},
+        server={"auto_exit_after_all_done": False, "max_empty_retries_per_job": 2},
+    )
+    app = create_app(config)
+    client = TestClient(app)
+    resumed_app = None
+    try:
+        task_id = "demo::sample_w0_r0"
+        meta = {
+            "subset": subset,
+            "sample_id": sample_id,
+            "window_id": 0,
+            "repeat_index": 0,
+            "job_type": "window_boundary",
+            "logical_frame_count": 4,
+        }
+        app.state.inflight[task_id] = {"job": {"task_id": task_id, "meta": meta}, "ts": time.time(), "dispatch_id": "d1"}
+
+        attempt = client.post(
+            "/submit_result",
+            json={"task_id": task_id, "dispatch_id": "d1", "vlm_json": {}, "meta": meta},
+        )
+        assert attempt.json()["status"] == "retry_triggered"
+
+        sample_out_dir = Path(tmp_path) / subset / "testrun" / "samples" / sample_id
+        retry_runtime = _read_json(sample_out_dir / "sample_runtime.json")
+        assert retry_runtime["retry"]["total_retries"] == 1
+        assert retry_runtime["retry"]["empty_result_retries"] == 1
+
+        _seed_completed_window_result(sample_out_dir)
+        _install_basic_finalize_mocks(monkeypatch)
+
+        resumed_config = Config(
+            datasets=[{"root": str(data_root), "subset": subset}],
+            run={"base_dir": str(tmp_path), "run_id": "testrun", "force_resume": True},
+            server={"auto_exit_after_all_done": False, "max_empty_retries_per_job": 2},
+        )
+        resumed_app = create_app(resumed_config)
+        resumed_app.state.runtime.start()
+
+        _wait_until(lambda: (sample_out_dir / ".DONE").exists())
+
+        sample_runtime = _read_json(sample_out_dir / "sample_runtime.json")
+        assert sample_runtime["terminal_state"] == "done"
+        assert sample_runtime["retry"]["total_retries"] == 1
+        assert sample_runtime["retry"]["empty_result_retries"] == 1
+        assert _read_json(Path(tmp_path) / subset / "testrun" / "run_summary.json")["retry"]["total_retries"] == 1
+    finally:
+        client.close()
+        if resumed_app is not None:
+            resumed_app.state.runtime.stop()
+            resumed_app.state.runtime.join(timeout=1.0)
+
+
+def test_create_app_backfills_failed_runtime_with_export_failure_details(tmp_path) -> None:
+    sample_id = "sample"
+    sample_dir = Path(tmp_path) / "data" / "demo" / sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+    _seed_dataset_run_manifest(tmp_path, export={"enabled": True})
+
+    sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / sample_id
+    sample_out_dir.mkdir(parents=True, exist_ok=True)
+    (sample_out_dir / ".FAILED").write_text("", encoding="utf-8")
+    (sample_out_dir / "failure.json").write_text(
+        json.dumps(
+            {
+                "subset": "demo",
+                "sample_id": sample_id,
+                "reason": "export_failed",
+                "details": {
+                    "stage": "export",
+                    "required_stages": ["stage1_segments", "export"],
+                    "completed_stages": ["stage1_segments"],
+                    "export_enabled": True,
+                    "export_attempted": True,
+                    "export_mode": "clips",
+                    "export_reason": "failed_before_export_completion",
+                    "export_error": "ffmpeg exploded",
+                    "export_errors": ["clips:degraded"],
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    _make_dataset_app(tmp_path, with_mp4=False, export={"enabled": True}, start_runtime=False)
+
+    sample_runtime = _read_json(sample_out_dir / "sample_runtime.json")
+    run_summary = _read_json(Path(tmp_path) / "demo" / "testrun" / "run_summary.json")
+
+    assert sample_runtime["terminal_state"] == "failed"
+    assert sample_runtime["export"] == {
+        "required": True,
+        "enabled": True,
+        "attempted": True,
+        "status": "failed",
+        "reason": "failed_before_export_completion",
+        "mode": "clips",
+        "errors": ["clips:degraded"],
+        "error": "ffmpeg exploded",
+    }
+    assert run_summary["export"]["status_counts"] == {"failed": 1}
+    assert run_summary["failure_reasons"] == {"export_failed": 1}
+
+
 def test_done_marker_writes_after_stage1_when_stage1_is_only_required_stage(tmp_path, monkeypatch) -> None:
     sample_out_dir = Path(tmp_path) / "demo" / "testrun" / "samples" / "sample"
     sample_out_dir.mkdir(parents=True, exist_ok=True)
@@ -1139,7 +1291,23 @@ def test_required_export_failure_marks_sample_failed_without_done(tmp_path, monk
     report = _read_json(sample_out_dir / "failure.json")
     assert report["reason"] == "export_failed"
     assert report["details"]["stage"] == "export"
+    assert report["details"]["export_enabled"] is True
+    assert report["details"]["export_attempted"] is True
+    assert report["details"]["export_mode"] == "clips"
     assert report["details"]["export_reason"] == "failed"
+    assert report["details"]["export_errors"] == ["clips:degraded"]
+
+    sample_runtime = _read_json(sample_out_dir / "sample_runtime.json")
+    assert sample_runtime["failure"]["reason"] == "export_failed"
+    assert sample_runtime["export"] == {
+        "required": True,
+        "enabled": True,
+        "attempted": True,
+        "status": "failed",
+        "reason": "failed",
+        "mode": "clips",
+        "errors": ["clips:degraded"],
+    }
 
 
 def test_finalize_exception_marks_sample_failed_without_done_marker(tmp_path, monkeypatch) -> None:

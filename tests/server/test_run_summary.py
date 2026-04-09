@@ -87,6 +87,40 @@ def test_build_sample_runtime_record_references_failure_details() -> None:
     }
 
 
+def test_build_sample_runtime_record_preserves_export_failure_diagnostics_from_failure_details() -> None:
+    payload = build_sample_runtime_record(
+        subset="demo",
+        sample_id="sample",
+        terminal_state="failed",
+        required_stages=["stage1_segments", "export"],
+        completed_stages=["stage1_segments"],
+        diagnostics={},
+        retry_summary={"dispatch_count": 2, "total_retries": 1},
+        failure_reason="export_failed",
+        failure_details={
+            "stage": "export",
+            "export_enabled": True,
+            "export_attempted": True,
+            "export_mode": "clips",
+            "export_reason": "failed_before_export_completion",
+            "export_error": "ffmpeg exploded",
+            "export_errors": ["clips:degraded"],
+        },
+        failure_report_path="failure.json",
+    )
+
+    assert payload["export"] == {
+        "required": True,
+        "enabled": True,
+        "attempted": True,
+        "status": "failed",
+        "reason": "failed_before_export_completion",
+        "mode": "clips",
+        "errors": ["clips:degraded"],
+        "error": "ffmpeg exploded",
+    }
+
+
 def test_build_run_summary_aggregates_terminal_runtime_records(tmp_path: Path) -> None:
     manifest = _build_manifest(tmp_path, export_enabled=False)
     summary = build_run_summary(
