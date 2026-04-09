@@ -37,17 +37,12 @@ Check results in this exact order:
 
 1. `./tmp/smoke_runs/demo_smoke/official_smoke_demo/samples/sample_001/.DONE` or `.FAILED`
 2. `./tmp/smoke_runs/demo_smoke/official_smoke_demo/samples/sample_001/segments.json`
-3. `./tmp/smoke_runs/demo_smoke/official_smoke_demo/samples/sample_001/sample_runtime.json`
-4. `./tmp/smoke_runs/demo_smoke/official_smoke_demo/run_summary.json`
-
-Additional identity/runtime artifact:
-
-- `./tmp/smoke_runs/demo_smoke/official_smoke_demo/run_manifest.json`
+3. `./tmp/smoke_runs/demo_smoke/official_smoke_demo/run_manifest.json`
 
 Notes:
 
-- In this P0-1 smoke slice, `sample_runtime.json` and `run_summary.json` may be absent depending on current runtime evidence rollout.
-- `.DONE` + `segments.json` + `run_manifest.json` are required and are covered by `tests/integration/test_official_smoke_demo.py`.
+- `.DONE` + `segments.json` + `run_manifest.json` are the current guaranteed smoke outputs and are covered by `tests/integration/test_official_smoke_demo.py`.
+- Future runtime-evidence rollout may add `sample_runtime.json` and `run_summary.json`; treat them as optional at this stage.
 
 ## 5) Re-run Cleanly
 
