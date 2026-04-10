@@ -32,8 +32,8 @@
   结果层产物：只放全局切分结果 + Stage 2 文本产物（merge/summary/subtitle localization）。
   source instruction 永远是英文；字幕本地化只改变字幕文本。
 - `<run_dir>/run_manifest.json`
-  run 级身份和契约文件：记录 config/prompt/backend identity、`required_stages`、resume 校验信息。
-  resume 默认拒绝跨 identity 续跑；只有显式 force（`run.force_resume=true` 或 `RUN_FORCE_RESUME=true`）才放行。
+  run 级身份和契约文件：记录 `schema_version`、`deployment_mode`、`run_id`、`subset`、`data_root`、config/prompt/backend identity、`git_version`、`required_stages` 以及 resume 校验信息。
+  resume 默认严格：只要这些 run identity 字段有任一不一致，就拒绝续跑；只有显式 force（`run.force_resume=true` 或 `RUN_FORCE_RESUME=true`）才放行。
 - `<run_dir>/samples/<sample_id>/.DONE`
   样本完成标记：表示该样本完成了当前配置要求的全部必需阶段（即 `run_manifest.json.required_stages`）。
 - `<run_dir>/samples/<sample_id>/.FAILED`（以及 `<run_dir>/samples/<sample_id>/failure.json`）
@@ -43,10 +43,12 @@
 - `<run_dir>/clips/<sample_id>/...`（若 `export.mode=clips|both` 且导出成功）
   clips 导出产物；同时会写 `<run_dir>/clips/<sample_id>/manifest.json`。
   clips 导出必须保留音频（`audio_preserved=true`）。
-- `diagnostics` / 各类 manifest
-  运行态事实（run/export/fallback state）放在 manifest 与 diagnostics，不和最终切分真相混在一起。
+- `sample_runtime.json` / `run_summary.json` / `failure.json` / 各类 manifest / 结构化事件日志
+  运行态事实（run/export/fallback/failure state）放在这些 operator 证据层产物里，不和最终切分真相混在一起。
+  `segments.json` 持久化时不会保留通用 `diagnostics` 字段。
 
-调试时你可能还会看到 `tmp/` 下的中间产物（例如联系图、日志等），是否写入取决于配置和代码路径。
+当前 `single-machine shared-fs` 部署里，`tmp/` 默认还是任务图片/联系图等共享产物的根目录之一，而不只是可有可无的调试残留。
+调试时你也可能在里面看到额外日志或中间文件；如果随手清理或隔离错了，会直接影响 server -> worker 的产物传递。
 
 ## 三个阶段的直觉
 

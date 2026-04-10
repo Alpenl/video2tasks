@@ -2,10 +2,10 @@
 
 本文档冻结 `video2tasks` 首批 operator-facing 结构化事件契约。
 
-- 适用范围：`src/video2tasks/server/app.py` + `src/video2tasks/server/job_builder.py`
+- 适用范围：冻结契约定义在 `src/video2tasks/logging_utils.py`；实际 emit/persist 分散在 `src/video2tasks/server/routes.py`、`src/video2tasks/server/runtime_state.py`、`src/video2tasks/server/job_builder.py`，以及 timeout-retry 路径对应的 `src/video2tasks/server/producer.py`
 - 输出格式：每条事件为单行 JSON，且包含 `event` 字段
 - 稳定性：本文件中的事件名与“必有字段”视为契约，后续改动需要同步更新代码与测试
-- 当前实现：`src/video2tasks/logging_utils.py` 中 `FROZEN_EVENT_SCHEMAS` 与本文件一一对应
+- 当前实现：`src/video2tasks/logging_utils.py` 中 `FROZEN_EVENT_SCHEMAS` 与本文件一一对应；job dispatch/result、artifact extract/reuse、sample stage/finalize/failure、timeout retry 等事件由上述模块分别产生日志与落盘记录
 
 ## Common Field Notes
 

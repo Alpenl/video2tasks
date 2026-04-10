@@ -377,8 +377,8 @@ Additional rules:
 - `<run_dir>/exports/<sample_id>/annotated.mp4`: expected when `export.mode=annotated|both` and annotated export succeeds.
 - `<run_dir>/clips/<sample_id>/...`: expected when `export.mode=clips|both` and clip export succeeds.
   `<run_dir>/clips/<sample_id>/manifest.json` is the clip export contract record. Clips must preserve audio (`audio_preserved=true`).
-- `<run_dir>/run_manifest.json` (run-level): records run identity (config/prompt hashes, backend summary, `required_stages`) and resume validation metadata.
-  Resume is strict by default: cross identity continuation (config/prompt/backend/required stage mismatch) is rejected unless you explicitly set `run.force_resume=true` or `RUN_FORCE_RESUME=true`.
+- `<run_dir>/run_manifest.json` (run-level): records run identity (`schema_version`, `deployment_mode`, `run_id`, `subset`, `data_root`, config/prompt hashes, `git_version`, backend summary, `required_stages`) and resume validation metadata.
+  Resume is strict by default: continuation is rejected when any run-identity field above mismatches, unless you explicitly set `run.force_resume=true` or `RUN_FORCE_RESUME=true`.
 - `sample_runtime.json` + `run_summary.json` are the operator runtime-evidence layer. They exist for operator decisions and auditing, not as a replacement for the final segmentation result.
 - **Gate 1 deprecation policy (frozen on April 9, 2026):**
   `segments.json.diagnostics.required_stages` and `segments.json.diagnostics.completed_stages` are deprecated runtime shadow fields.

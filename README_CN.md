@@ -377,8 +377,8 @@ v2t-worker --config config.yaml
 - `<run_dir>/exports/<sample_id>/annotated.mp4`：当 `export.mode=annotated|both` 且 annotated 导出成功时可见。
 - `<run_dir>/clips/<sample_id>/...`：当 `export.mode=clips|both` 且 clips 导出成功时可见。
   `<run_dir>/clips/<sample_id>/manifest.json` 是 clips 导出契约记录。clips 导出必须保留音频（`audio_preserved=true`）。
-- `<run_dir>/run_manifest.json`（run 级）：记录 run 身份（config/prompt hash、backend 摘要、`required_stages`）与 resume 校验元数据。
-  resume 默认严格拒绝跨 identity 续跑（config/prompt/backend/required-stages 不一致）。只有显式设置 `run.force_resume=true` 或 `RUN_FORCE_RESUME=true` 才会放行。
+- `<run_dir>/run_manifest.json`（run 级）：记录 run 身份（`schema_version`、`deployment_mode`、`run_id`、`subset`、`data_root`、config/prompt hash、`git_version`、backend 摘要、`required_stages`）与 resume 校验元数据。
+  resume 默认严格：只要上述任一 run identity 字段不一致，就会拒绝续跑。只有显式设置 `run.force_resume=true` 或 `RUN_FORCE_RESUME=true` 才会放行。
 - `sample_runtime.json` + `run_summary.json` 是 operator runtime-evidence 层，用于判断与审计，不替代最终切分结果本体。
 - **Gate 1 弃用策略（已于 2026 年 4 月 9 日冻结）：**
   `segments.json.diagnostics.required_stages` 与 `segments.json.diagnostics.completed_stages` 属于已弃用的 runtime 影子字段。

@@ -18,7 +18,7 @@
 - `.DONE` 表示当前配置要求的全部必需阶段完成（由 `<run_dir>/run_manifest.json.required_stages` 定义）。
 - `segments.json` 只放 segmentation + Stage 2 文本产物，不承载 run/export/fallback 的最终真相。
 - source instruction 永远英文；subtitle localization 是 Stage 2 正式 artifact。
-- resume 默认拒绝跨 config/prompt/backend/required-stages 续跑，除非显式 force。
+- resume 默认严格：`schema_version`、`deployment_mode`、`run_id`、`subset`、`data_root`、config/prompt/backend、`git_version`、`required_stages` 任一不一致都拒绝续跑，除非显式 force。
 - clips 导出必须保留音频；音频不保留属于导出契约失败。
 
 ## Stage 1：窗口任务（最重）
@@ -98,7 +98,7 @@ server 收到 worker 的 JSON 后，会把它追加写入：
 - `<run_dir>/samples/<sample_id>/segments.json`
 
 `segments.json` 只承载分段结果与 Stage 2 文本层结果。
-run/resume/export/fallback 等运行态事实在 manifest 与 diagnostics，不和分段结果混成一个“最终真相”。
+run/resume/export/fallback 等运行态事实在 `sample_runtime.json`、`run_summary.json`、`failure.json`、导出 manifest 与结构化事件日志里，不和分段结果混成一个“最终真相”。
 
 ## Stage 2：后处理（合并/字幕语言等）
 
@@ -153,7 +153,7 @@ Stage 2 的常见失败点：
 
 - 先看 `<run_dir>/samples/<sample_id>/segments.json`：段数、时间戳是否合理。
 - 若 segments 不合理，再看 `<run_dir>/samples/<sample_id>/windows.jsonl`：哪些窗口贡献了错误 cut。
-- 若字幕不对，先看 `<run_dir>/samples/<sample_id>/segments.json` 里的 Stage 2 字幕结果，再看对应 `diagnostics`。
+- 若字幕不对，先看 `<run_dir>/samples/<sample_id>/segments.json` 里的 Stage 2 字幕结果；再看 `<run_dir>/samples/<sample_id>/sample_runtime.json`、`<run_dir>/run_summary.json`、相关 export manifest 和结构化事件日志。不要预期在持久化后的 `segments.json` 里还能看到通用 `diagnostics`。
 - 若导出不对，按 `export.mode` 检查：`<run_dir>/exports/<sample_id>/annotated.mp4`（annotated|both）与 `<run_dir>/clips/<sample_id>/`（clips|both，包括 `manifest.json`），并重点看 clips 的 `audio_preserved` 字段。
 
 下一份文档会专门讲：哪些配置最影响速度/质量，以及怎么做最小代价的调参试验。
