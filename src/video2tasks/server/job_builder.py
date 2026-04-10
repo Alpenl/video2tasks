@@ -6,7 +6,7 @@ import hashlib
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Tuple
 
 from ..logging_utils import get_logger, log_event
 from .protocol import InlineImageTransport, JobEnvelope, SharedFSImageTransport
@@ -48,6 +48,14 @@ class JobBuilder:
         self.use_contact_sheets = bool(use_contact_sheets)
         self.contact_sheet_rows = int(contact_sheet_rows)
         self.contact_sheet_cols = int(contact_sheet_cols)
+        self._event_recorder: Optional[Callable[[str, Dict[str, Any]], None]] = None
+
+    def bind_event_recorder(self, recorder: Callable[[str, Dict[str, Any]], None]) -> None:
+        self._event_recorder = recorder
+
+    def _persist_event(self, event: str, **fields: Any) -> None:
+        if self._event_recorder is not None:
+            self._event_recorder(str(event), {str(key): value for key, value in fields.items()})
 
     def _contact_sheet_meta(self) -> Dict[str, Any]:
         return {
@@ -174,6 +182,17 @@ class JobBuilder:
                     artifact_producer_task_id=str(job_meta.get("artifact_producer_task_id", "")),
                     artifact_consumer_task_id=str(job_meta.get("artifact_consumer_task_id", "")),
                 )
+                self._persist_event(
+                    "artifact_reuse_hit",
+                    task_id=task_id,
+                    subset=str(job_meta.get("subset", "")),
+                    sample_id=str(job_meta.get("sample_id", "")),
+                    job_type=str(job_meta.get("job_type", "")),
+                    artifact_reuse=True,
+                    artifact_reuse_group=str(job_meta.get("artifact_reuse_group", "")),
+                    artifact_producer_task_id=str(job_meta.get("artifact_producer_task_id", "")),
+                    artifact_consumer_task_id=str(job_meta.get("artifact_consumer_task_id", "")),
+                )
                 return JobEnvelope(
                     task_id=task_id,
                     meta=job_meta,
@@ -230,10 +249,32 @@ class JobBuilder:
                 transport_mode="shared_fs",
                 artifact_reuse=False,
             )
+            self._persist_event(
+                "artifact_extract_done",
+                task_id=task_id,
+                subset=str(job_meta.get("subset", "")),
+                sample_id=str(job_meta.get("sample_id", "")),
+                job_type=str(job_meta.get("job_type", "")),
+                image_count=len(image_transport.image_paths),
+                artifact_extract_ms=artifact_extract_ms,
+                transport_mode="shared_fs",
+                artifact_reuse=False,
+            )
         else:
             image_transport = InlineImageTransport(images=images)
             log_event(
                 logger,
+                "artifact_extract_done",
+                task_id=task_id,
+                subset=str(job_meta.get("subset", "")),
+                sample_id=str(job_meta.get("sample_id", "")),
+                job_type=str(job_meta.get("job_type", "")),
+                image_count=len(images),
+                artifact_extract_ms=artifact_extract_ms,
+                transport_mode="inline",
+                artifact_reuse=False,
+            )
+            self._persist_event(
                 "artifact_extract_done",
                 task_id=task_id,
                 subset=str(job_meta.get("subset", "")),

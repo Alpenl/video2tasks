@@ -272,6 +272,18 @@ smoke 输出路径是固定且有测试覆盖的：
 
 完整命令与预期结果请参考：[Official Smoke Demo Runbook](docs/runbooks/official-smoke-demo.md)
 
+### 直接跑单个视频
+
+```bash
+uv run v2t-single [--config /path/to/config.yaml] /path/to/video.mp4 [/path/to/output_dir]
+```
+
+- `--config/-c` 为可选参数；传入后，`v2t-single` 会显式加载该配置文件。
+- `video_path` 为必填参数。
+- `output_dir` 为可选参数；不传时，默认输出根目录就是输入视频所在目录。
+- 不传 `--config` 时，配置加载行为保持不变：先看 `VIDEO2TASKS_CONFIG`，否则继续走环境变量覆盖与默认值。
+- 输出仍使用项目当前的标准 run 目录布局，根在 `output_dir` 下，例如 `output_dir/<video_stem>/<run_id>/...`。
+
 ### 切换到你的真实数据（Smoke 通过后）
 
 ```bash

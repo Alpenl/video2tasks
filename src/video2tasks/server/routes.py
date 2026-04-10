@@ -53,6 +53,17 @@ def register_routes(app: FastAPI, runtime_state: ServerRuntimeState) -> None:
                 transport_mode=str(base_job.image_transport.mode),
                 artifact_reuse=bool(base_job.meta.get("artifact_reuse", False)),
             )
+            runtime_state.persist_structured_event_record(
+                "job_dispatched",
+                task_id=task_id,
+                dispatch_id=dispatch_id,
+                subset=str(base_job.meta.get("subset", "")),
+                sample_id=str(base_job.meta.get("sample_id", "")),
+                job_type=str(base_job.meta.get("job_type", "unknown") or "unknown"),
+                source_count=base_job.source_count,
+                transport_mode=str(base_job.image_transport.mode),
+                artifact_reuse=bool(base_job.meta.get("artifact_reuse", False)),
+            )
             return {"status": "ok", "data": dispatched_job.model_dump_payload()}
 
     @app.post("/submit_result")
@@ -95,6 +106,15 @@ def register_routes(app: FastAPI, runtime_state: ServerRuntimeState) -> None:
             job_type=str(result_meta.get("job_type", "")),
             infer_ms=infer_ms,
         )
+        runtime_state.persist_structured_event_record(
+            "infer_attempt",
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            subset=str(result_meta.get("subset", "")),
+            sample_id=str(result_meta.get("sample_id", "")),
+            job_type=str(result_meta.get("job_type", "")),
+            infer_ms=infer_ms,
+        )
         normalized_vlm_json = normalize_submitted_vlm_json(result.vlm_json, authoritative_meta)
 
         if not normalized_vlm_json:
@@ -118,7 +138,7 @@ def register_routes(app: FastAPI, runtime_state: ServerRuntimeState) -> None:
                     )
 
             if requeued:
-                runtime_state.persist_retry_evidence(retry_subset, retry_sample_id)
+                submit_ms = int(round((time.perf_counter() - submit_start) * 1000.0))
                 log_event(
                     runtime_state.logger,
                     "result_empty_retry",
@@ -130,8 +150,21 @@ def register_routes(app: FastAPI, runtime_state: ServerRuntimeState) -> None:
                     attempt=attempt,
                     retry_limit=limit_label,
                     infer_ms=infer_ms,
-                    submit_ms=int(round((time.perf_counter() - submit_start) * 1000.0)),
+                    submit_ms=submit_ms,
                 )
+                runtime_state.persist_structured_event_record(
+                    "result_empty_retry",
+                    task_id=task_id,
+                    dispatch_id=dispatch_id,
+                    subset=retry_subset,
+                    sample_id=retry_sample_id,
+                    job_type=str(result_meta.get("job_type", "")),
+                    attempt=attempt,
+                    retry_limit=limit_label,
+                    infer_ms=infer_ms,
+                    submit_ms=submit_ms,
+                )
+                runtime_state.persist_retry_evidence(retry_subset, retry_sample_id)
                 runtime_state.logger.warning(
                     f"[Warn] Task {task_id} empty or invalid, re-queueing to tail "
                     f"(empty attempt {attempt}/{limit_label})"
@@ -156,6 +189,7 @@ def register_routes(app: FastAPI, runtime_state: ServerRuntimeState) -> None:
             runtime_state.empty_retry_counts.pop(task_id, None)
 
         runtime_state.persist_result_record(task_id, dispatch_id, normalized_vlm_json, result_meta)
+        submit_ms = int(round((time.perf_counter() - submit_start) * 1000.0))
         log_event(
             runtime_state.logger,
             "job_done",
@@ -165,7 +199,17 @@ def register_routes(app: FastAPI, runtime_state: ServerRuntimeState) -> None:
             sample_id=str(result_meta.get("sample_id", "")),
             job_type=str(result_meta.get("job_type", "")),
             infer_ms=infer_ms,
-            submit_ms=int(round((time.perf_counter() - submit_start) * 1000.0)),
+            submit_ms=submit_ms,
+        )
+        runtime_state.persist_structured_event_record(
+            "job_done",
+            task_id=task_id,
+            dispatch_id=dispatch_id,
+            subset=str(result_meta.get("subset", "")),
+            sample_id=str(result_meta.get("sample_id", "")),
+            job_type=str(result_meta.get("job_type", "")),
+            infer_ms=infer_ms,
+            submit_ms=submit_ms,
         )
         return {"status": "received"}
 

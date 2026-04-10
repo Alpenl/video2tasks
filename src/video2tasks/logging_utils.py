@@ -103,6 +103,21 @@ FROZEN_EVENT_SCHEMAS: Dict[str, EventSchema] = {
             "retry_limit",
         ),
     ),
+    "sample_stage_start": EventSchema(
+        required_fields=(
+            "subset",
+            "sample_id",
+            "stage",
+        ),
+    ),
+    "sample_stage_done": EventSchema(
+        required_fields=(
+            "subset",
+            "sample_id",
+            "stage",
+            "elapsed_ms",
+        ),
+    ),
     "fallback_applied": EventSchema(
         required_fields=(
             "subset",
@@ -136,6 +151,7 @@ _IDENTIFIER_REQUIRED_FIELDS: frozenset[str] = frozenset(
     {
         "subset",
         "sample_id",
+        "stage",
         "job_type",
         "task_id",
         "dispatch_id",

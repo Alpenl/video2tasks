@@ -26,6 +26,8 @@ EXPECTED_FROZEN_EVENT_NAMES = {
     "job_done",
     "result_empty_retry",
     "result_timeout_retry",
+    "sample_stage_start",
+    "sample_stage_done",
     "fallback_applied",
     "sample_failed",
     "finalize_done",
@@ -254,3 +256,16 @@ def test_get_job_emits_job_dispatched_event_payload(tmp_path, capsys) -> None:
     assert payload["subset"] == "demo_smoke"
     assert payload["sample_id"] == "sample_001"
     assert payload["job_type"] == "window_boundary"
+
+    sample_events_path = tmp_path / "demo_smoke" / "testrun" / "samples" / "sample_001" / "events.jsonl"
+    run_events_path = tmp_path / "demo_smoke" / "testrun" / "events.jsonl"
+
+    sample_event_payload = json.loads(sample_events_path.read_text(encoding="utf-8").strip())
+    run_event_payload = json.loads(run_events_path.read_text(encoding="utf-8").strip())
+
+    assert sample_event_payload["event"] == "job_dispatched"
+    assert run_event_payload["event"] == "job_dispatched"
+    assert sample_event_payload["dispatch_id"] == "d1"
+    assert run_event_payload["sample_id"] == "sample_001"
+    assert isinstance(sample_event_payload["ts_unix_ms"], int)
+    assert sample_event_payload["ts_unix_ms"] > 0

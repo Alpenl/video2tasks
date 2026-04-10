@@ -106,6 +106,14 @@ class SampleStore:
     def sample_runtime_path(self, subset: str, sample_id: str) -> str:
         return str(Path(self.sample_out_dir(subset, sample_id)) / "sample_runtime.json")
 
+    def sample_events_path(self, subset: str, sample_id: str) -> str:
+        return str(Path(self.sample_out_dir(subset, sample_id)) / "events.jsonl")
+
+    def run_events_path(self, subset: str) -> str:
+        run_dir = Path(self.base_dir) / subset / self.run_id
+        run_dir.mkdir(parents=True, exist_ok=True)
+        return str(run_dir / "events.jsonl")
+
     def _write_json(self, path: str, payload: Dict[str, Any]) -> None:
         with open(path, "w", encoding="utf-8") as file_obj:
             json.dump(payload, file_obj, indent=2, ensure_ascii=False)
@@ -304,6 +312,28 @@ class SampleStore:
         with self._get_sample_lock(subset, sample_id):
             self._write_json(self.sample_runtime_path(subset, sample_id), payload)
 
+    def persist_event_record(self, subset: str, sample_id: str, payload: Dict[str, Any]) -> None:
+        record = dict(payload)
+        with self._get_sample_lock(subset, sample_id):
+            self._append_jsonl_record(self.sample_events_path(subset, sample_id), record)
+            self._append_jsonl_record(self.run_events_path(subset), record)
+
+    def load_sample_event_records(self, subset: str, sample_id: str) -> list[Dict[str, Any]]:
+        path = Path(self.sample_events_path(subset, sample_id))
+        if not path.exists():
+            return []
+
+        records: list[Dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as file_obj:
+            for line in file_obj:
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    records.append(payload)
+        return records
+
     def persist_sample_failure(
         self,
         subset: str,
@@ -312,6 +342,7 @@ class SampleStore:
         details: Optional[Dict[str, Any]] = None,
         *,
         sample_runtime: Optional[Dict[str, Any]] = None,
+        publish_failed_marker: bool = True,
     ) -> None:
         payload = {
             "subset": subset,
@@ -329,6 +360,11 @@ class SampleStore:
             self._write_json(self.failure_report_path(subset, sample_id), payload)
             if sample_runtime is not None:
                 self._write_json(self.sample_runtime_path(subset, sample_id), sample_runtime)
+            if publish_failed_marker:
+                Path(self.failed_marker_path(subset, sample_id)).touch()
+
+    def publish_failed_marker(self, subset: str, sample_id: str) -> None:
+        with self._get_sample_lock(subset, sample_id):
             Path(self.failed_marker_path(subset, sample_id)).touch()
 
     def persist_sample_payload(self, subset: str, sample_id: str, payload: Dict[str, Any]) -> None:
@@ -347,6 +383,7 @@ class SampleStore:
         required_stages: Iterable[str],
         completed_stages: Iterable[str],
         sample_runtime: Optional[Dict[str, Any]] = None,
+        publish_done_marker: bool = True,
     ) -> bool:
         normalized_required_stages = _normalize_stage_names(required_stages)
         normalized_completed_stages = _normalize_stage_names(completed_stages)
@@ -373,8 +410,13 @@ class SampleStore:
                     Path(stale_failure_path).unlink()
                 except FileNotFoundError:
                     pass
-            done_path.touch()
+            if publish_done_marker:
+                done_path.touch()
         return already_done
+
+    def publish_done_marker(self, subset: str, sample_id: str) -> None:
+        with self._get_sample_lock(subset, sample_id):
+            Path(self.done_marker_path(subset, sample_id)).touch()
 
 
 __all__ = ["SampleStore"]

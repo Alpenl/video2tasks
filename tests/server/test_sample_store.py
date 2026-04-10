@@ -152,6 +152,32 @@ def test_sample_store_persists_sample_runtime_payload(tmp_path: Path) -> None:
     assert store.load_sample_runtime("demo", "sample") == payload
 
 
+def test_sample_store_persists_sample_and_run_event_logs(tmp_path: Path) -> None:
+    store = _make_store(tmp_path)
+
+    record = {
+        "event": "job_dispatched",
+        "subset": "demo",
+        "sample_id": "sample",
+        "task_id": "demo::sample_w0_r0",
+        "dispatch_id": "d1",
+        "job_type": "window_boundary",
+        "source_count": 1,
+        "transport_mode": "shared_fs",
+        "artifact_reuse": False,
+        "ts": "2026-04-10T12:00:00.000+08:00",
+        "ts_unix_ms": 1712721600000,
+    }
+
+    store.persist_event_record("demo", "sample", record)
+
+    sample_events_path = Path(store.sample_out_dir("demo", "sample")) / "events.jsonl"
+    run_events_path = Path(tmp_path) / "demo" / "testrun" / "events.jsonl"
+
+    assert json.loads(sample_events_path.read_text(encoding="utf-8").strip()) == record
+    assert json.loads(run_events_path.read_text(encoding="utf-8").strip()) == record
+
+
 def test_sample_store_failure_writes_sample_runtime_when_provided(tmp_path: Path) -> None:
     store = _make_store(tmp_path)
     sample_dir = Path(store.sample_out_dir("demo", "sample"))

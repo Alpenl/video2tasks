@@ -10,7 +10,7 @@ from .run_manifest import RunManifest
 
 
 RUN_SUMMARY_FILENAME = "run_summary.json"
-SAMPLE_RUNTIME_SCHEMA_VERSION = 1
+SAMPLE_RUNTIME_SCHEMA_VERSION = 2
 RUN_SUMMARY_SCHEMA_VERSION = 1
 
 
@@ -31,6 +31,85 @@ def _int_value(value: Any, default: int = 0) -> int:
         return max(default, int(value))
     except (TypeError, ValueError):
         return default
+
+
+def _nonempty_text(value: Any) -> str:
+    return str(value).strip()
+
+
+def build_sample_timing_record(event_records: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    records = [dict(record) for record in event_records if isinstance(record, dict)]
+    if not records:
+        return None
+
+    first_ts = None
+    last_ts = None
+    first_event_at = ""
+    last_event_at = ""
+    event_counts: dict[str, int] = {}
+    stage_elapsed_ms: dict[str, int] = {}
+    job_elapsed_ms = {
+        "artifact_extract_total": 0,
+        "infer_total": 0,
+        "submit_total": 0,
+        "finalize_total": 0,
+    }
+
+    for record in records:
+        event_name = _nonempty_text(record.get("event"))
+        if not event_name:
+            continue
+
+        event_counts[event_name] = event_counts.get(event_name, 0) + 1
+
+        ts_value = record.get("ts_unix_ms")
+        try:
+            ts_ms = int(ts_value)
+        except (TypeError, ValueError):
+            ts_ms = None
+
+        ts_text = _nonempty_text(record.get("ts"))
+        if ts_ms is not None:
+            if first_ts is None or ts_ms < first_ts:
+                first_ts = ts_ms
+                first_event_at = ts_text or first_event_at
+            if last_ts is None or ts_ms > last_ts:
+                last_ts = ts_ms
+                last_event_at = ts_text or last_event_at
+
+        if event_name == "sample_stage_done":
+            stage_name = _nonempty_text(record.get("stage"))
+            if stage_name:
+                stage_elapsed_ms[stage_name] = stage_elapsed_ms.get(stage_name, 0) + _int_value(record.get("elapsed_ms"))
+        elif event_name == "artifact_extract_done":
+            job_elapsed_ms["artifact_extract_total"] += _int_value(record.get("artifact_extract_ms"))
+        elif event_name == "infer_attempt":
+            job_elapsed_ms["infer_total"] += _int_value(record.get("infer_ms"))
+        elif event_name in {"job_done", "result_empty_retry"}:
+            job_elapsed_ms["submit_total"] += _int_value(record.get("submit_ms"))
+        elif event_name == "finalize_done":
+            job_elapsed_ms["finalize_total"] += _int_value(record.get("finalize_ms"))
+
+    if not event_counts:
+        return None
+
+    if not first_event_at:
+        first_event_at = _nonempty_text(records[0].get("ts"))
+    if not last_event_at:
+        last_event_at = _nonempty_text(records[-1].get("ts"))
+
+    total_elapsed_ms = 0
+    if first_ts is not None and last_ts is not None:
+        total_elapsed_ms = max(0, last_ts - first_ts)
+
+    return {
+        "first_event_at": first_event_at,
+        "last_event_at": last_event_at,
+        "total_elapsed_ms": total_elapsed_ms,
+        "stage_elapsed_ms": stage_elapsed_ms,
+        "job_elapsed_ms": job_elapsed_ms,
+        "event_counts": event_counts,
+    }
 
 
 def _fallback_overview(diagnostics: dict[str, Any]) -> dict[str, Any]:
@@ -122,6 +201,7 @@ def build_sample_runtime_record(
     completed_stages: Iterable[str],
     diagnostics: dict[str, Any] | None = None,
     retry_summary: dict[str, Any] | None = None,
+    timing: dict[str, Any] | None = None,
     failure_reason: str = "",
     failure_details: dict[str, Any] | None = None,
     failure_report_path: str = "",
@@ -179,6 +259,7 @@ def build_sample_runtime_record(
             failure_reason=normalized_failure_reason,
             failure_details=details_payload,
         ),
+        "timing": dict(timing or {}),
         "failure": failure_payload,
     }
 

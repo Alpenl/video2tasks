@@ -146,7 +146,7 @@ def test_official_smoke_demo_contract(tmp_path: Path) -> None:
         assert required_key in first_segment
 
     sample_runtime_payload = json.loads(sample_runtime_path.read_text(encoding="utf-8"))
-    assert sample_runtime_payload.get("schema_version") == 1
+    assert sample_runtime_payload.get("schema_version") == 2
     assert sample_runtime_payload.get("subset") == subset
     assert sample_runtime_payload.get("sample_id") == sample_id
     assert sample_runtime_payload.get("terminal_state") == "done"

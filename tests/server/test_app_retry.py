@@ -350,6 +350,136 @@ def test_create_app_exposes_runtime_state_facade_with_legacy_state_aliases(tmp_p
     assert runtime_state.run_manifest_paths is app.state.run_manifest_paths
 
 
+def test_build_sample_runtime_includes_timing_summary_from_persisted_events(tmp_path) -> None:
+    app, _sample_dir, _sample_out_dir = _make_dataset_app(tmp_path, with_mp4=False, start_runtime=False)
+    runtime_state = app.state.runtime_state
+
+    runtime_state.sample_store.persist_event_record(
+        "demo",
+        "sample",
+        {
+            "event": "sample_stage_start",
+            "subset": "demo",
+            "sample_id": "sample",
+            "stage": "stage1_segments",
+            "ts": "2026-04-10T12:00:00.000+08:00",
+            "ts_unix_ms": 1000,
+        },
+    )
+    runtime_state.sample_store.persist_event_record(
+        "demo",
+        "sample",
+        {
+            "event": "sample_stage_done",
+            "subset": "demo",
+            "sample_id": "sample",
+            "stage": "stage1_segments",
+            "elapsed_ms": 4200,
+            "ts": "2026-04-10T12:00:04.200+08:00",
+            "ts_unix_ms": 5200,
+        },
+    )
+
+    payload = runtime_state.build_sample_runtime(
+        "demo",
+        "sample",
+        terminal_state="done",
+        required_stages=["stage1_segments"],
+        completed_stages=["stage1_segments"],
+        diagnostics={},
+    )
+
+    assert payload["timing"]["total_elapsed_ms"] == 4200
+    assert payload["timing"]["stage_elapsed_ms"] == {"stage1_segments": 4200}
+    assert payload["timing"]["event_counts"] == {
+        "sample_stage_start": 1,
+        "sample_stage_done": 1,
+    }
+
+
+def test_persist_sample_failure_updates_run_summary_before_failed_marker(tmp_path, monkeypatch) -> None:
+    app, _sample_dir, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=False, start_runtime=False)
+    runtime_state = app.state.runtime_state
+    failed_marker = sample_out_dir / ".FAILED"
+    observed = {}
+
+    def fake_persist_run_summary(subset: str) -> None:
+        observed["subset"] = subset
+        observed["failed_marker_exists_during_summary"] = failed_marker.exists()
+
+    monkeypatch.setattr(runtime_state, "persist_run_summary", fake_persist_run_summary)
+
+    runtime_state.persist_sample_failure(
+        "demo",
+        "sample",
+        "export_failed",
+        {
+            "stage": "export",
+            "required_stages": ["stage1_segments", "export"],
+            "completed_stages": ["stage1_segments"],
+            "diagnostics": {
+                "export_enabled": True,
+                "export_attempted": True,
+                "export_reason": "failed",
+            },
+        },
+    )
+
+    assert observed == {
+        "subset": "demo",
+        "failed_marker_exists_during_summary": False,
+    }
+    assert failed_marker.exists()
+
+
+def test_mark_sample_done_updates_run_summary_before_done_marker(tmp_path, monkeypatch) -> None:
+    app, _sample_dir, sample_out_dir = _make_dataset_app(tmp_path, with_mp4=False, start_runtime=False)
+    runtime_state = app.state.runtime_state
+    done_marker = sample_out_dir / ".DONE"
+    observed = {}
+
+    def fake_persist_run_summary(subset: str) -> None:
+        observed["subset"] = subset
+        observed["done_marker_exists_during_summary"] = done_marker.exists()
+
+    monkeypatch.setattr(runtime_state, "persist_run_summary", fake_persist_run_summary)
+
+    state = {
+        "sample_status": {"sample": 0},
+        "cur_idx": 0,
+    }
+    global_done = runtime_state.mark_sample_done(
+        state,
+        "demo",
+        "sample",
+        {
+            "sample_id": "sample",
+            "nframes": 24,
+            "segments": [
+                {
+                    "seg_id": 0,
+                    "start_frame": 0,
+                    "end_frame": 24,
+                    "instruction": "Pick up the item",
+                }
+            ],
+            "diagnostics": {},
+        },
+        required_stages=["stage1_segments"],
+        completed_stages=["stage1_segments"],
+        finalize_start=time.perf_counter(),
+        global_done=0,
+        progress_total=1,
+    )
+
+    assert observed == {
+        "subset": "demo",
+        "done_marker_exists_during_summary": False,
+    }
+    assert done_marker.exists()
+    assert global_done == 1
+
+
 def test_window_scheduling_duplicate_check_accepts_typed_jobs_in_queue(tmp_path, monkeypatch) -> None:
     entered = threading.Event()
     release = threading.Event()

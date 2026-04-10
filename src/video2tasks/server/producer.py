@@ -134,10 +134,6 @@ def create_producer_loop(runtime_state: ServerRuntimeState):
                         exhausted_timeouts.append((task_id, dispatch_id, meta, attempt, limit_label))
 
             for task_id, dispatch_id, meta, attempt, limit_label in timeout_retries_to_log:
-                runtime_state.persist_retry_evidence(
-                    str(meta.get("subset", "")),
-                    str(meta.get("sample_id", "")),
-                )
                 log_event(
                     runtime_state.logger,
                     "result_timeout_retry",
@@ -148,6 +144,20 @@ def create_producer_loop(runtime_state: ServerRuntimeState):
                     job_type=str(meta.get("job_type", "")),
                     attempt=attempt,
                     retry_limit=limit_label,
+                )
+                runtime_state.persist_structured_event_record(
+                    "result_timeout_retry",
+                    task_id=task_id,
+                    dispatch_id=dispatch_id,
+                    subset=str(meta.get("subset", "")),
+                    sample_id=str(meta.get("sample_id", "")),
+                    job_type=str(meta.get("job_type", "")),
+                    attempt=attempt,
+                    retry_limit=limit_label,
+                )
+                runtime_state.persist_retry_evidence(
+                    str(meta.get("subset", "")),
+                    str(meta.get("sample_id", "")),
                 )
                 runtime_state.logger.warning(
                     f"[Warn] Task {task_id} timed out, re-queueing to tail "
@@ -239,6 +249,7 @@ def create_producer_loop(runtime_state: ServerRuntimeState):
 
                 if sample_status[sample_id] == 0:
                     try:
+                        runtime_state.ensure_stage_started(ctx.subset, sample_id, "stage1_segments")
                         fps, nframes = deps.read_video_info(mp4)
                         windows = deps.build_windows(
                             fps,
@@ -356,6 +367,7 @@ def create_producer_loop(runtime_state: ServerRuntimeState):
                 if sample_status[sample_id] == 2:
                     try:
                         finalize_start = time.perf_counter()
+                        runtime_state.ensure_stage_started(ctx.subset, sample_id, "stage1_segments")
                         fps, nframes = deps.read_video_info(mp4)
                         windows = deps.build_windows(
                             fps,
@@ -692,6 +704,7 @@ def create_producer_loop(runtime_state: ServerRuntimeState):
                                 final_res["diagnostics"] = diagnostics
 
                             completed_stages.append("stage1_segments")
+                            runtime_state.mark_stage_done(ctx.subset, sample_id, "stage1_segments")
                             early_done = runtime_state.required_stages_satisfied(required_stages, completed_stages)
                             if early_done:
                                 global_done = runtime_state.mark_sample_done(
@@ -710,6 +723,7 @@ def create_producer_loop(runtime_state: ServerRuntimeState):
                                 early_done or "stage2_text" in required_stages
                             )
                             if stage2_writeback_required:
+                                runtime_state.ensure_stage_started(ctx.subset, sample_id, "stage2_text")
                                 try:
                                     stage2_res = runtime_state.apply_stage2_text_writeback(sample_id, final_res)
                                 except Exception as exc:
@@ -742,6 +756,7 @@ def create_producer_loop(runtime_state: ServerRuntimeState):
                                     continue
 
                                 final_res = stage2_res
+                                runtime_state.mark_stage_done(ctx.subset, sample_id, "stage2_text")
                                 if early_done:
                                     runtime_state.persist_sample_writeback(
                                         ctx.subset,
@@ -774,6 +789,7 @@ def create_producer_loop(runtime_state: ServerRuntimeState):
                                     for segment in final_res.get("segments", [])
                                     if isinstance(segment, dict)
                                 ]
+                                runtime_state.ensure_stage_started(ctx.subset, sample_id, "export")
 
                                 try:
                                     export_diagnostics = deps.export_sample_outputs(
@@ -819,6 +835,7 @@ def create_producer_loop(runtime_state: ServerRuntimeState):
                                     time.sleep(0.01)
                                     continue
                                 completed_stages.append("export")
+                                runtime_state.mark_stage_done(ctx.subset, sample_id, "export")
                                 global_done = runtime_state.mark_sample_done(
                                     state,
                                     ctx.subset,

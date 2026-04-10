@@ -7,6 +7,7 @@ import os
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -19,7 +20,7 @@ from ..vlm.base import normalize_task_window_result
 from .job_builder import ArtifactReuseEntry, JobBuilder
 from .protocol import JobEnvelope
 from .run_manifest import ensure_run_manifest, load_run_manifest, run_manifest_path
-from .run_summary import build_run_summary, build_sample_runtime_record, write_run_summary
+from .run_summary import build_run_summary, build_sample_runtime_record, build_sample_timing_record, write_run_summary
 from .sample_store import SampleStore
 from .task_artifacts import TaskArtifactWriter
 
@@ -325,6 +326,9 @@ class ServerRuntimeState:
         self.run_manifest_status_by_subset = run_manifest_status_by_subset
         self.step_a_producer_batch_limit = int(step_a_producer_batch_limit)
         self._app_state: Any = None
+        self._stage_timing_lock = threading.Lock()
+        self._stage_start_ts: Dict[Tuple[str, str, str], float] = {}
+        self._stage_done_keys: set[Tuple[str, str, str]] = set()
 
     def attach_app_state(self, app: FastAPI) -> None:
         self._app_state = app.state
@@ -489,6 +493,7 @@ class ServerRuntimeState:
             completed_stages=(stages.get("completed", []) if isinstance(stages, dict) else []),
             diagnostics={},
             retry_summary=self.sample_retry_summary(subset, sample_id),
+            timing=self.sample_timing_summary(subset, sample_id),
             failure_reason=(str(failure.get("reason", "")).strip() if isinstance(failure, dict) else ""),
             failure_details=(dict(failure.get("details", {})) if isinstance(failure, dict) else {}),
             failure_report_path=(str(failure.get("report_path", "")).strip() if isinstance(failure, dict) else ""),
@@ -568,9 +573,93 @@ class ServerRuntimeState:
             completed_stages=completed_stages,
             diagnostics=self.runtime_diagnostics_payload(diagnostics),
             retry_summary=self.sample_retry_summary(subset, sample_id),
+            timing=self.sample_timing_summary(subset, sample_id),
             failure_reason=failure_reason,
             failure_details=dict(failure_details or {}),
             failure_report_path=(Path(self.sample_store.failure_report_path(subset, sample_id)).name if failure_reason else ""),
+        )
+
+    def _event_timestamp_fields(self) -> Dict[str, Any]:
+        now = datetime.now().astimezone()
+        return {
+            "ts": now.isoformat(timespec="milliseconds"),
+            "ts_unix_ms": int(now.timestamp() * 1000),
+        }
+
+    def persist_structured_event_record(self, event: str, **fields: Any) -> None:
+        subset = str(fields.get("subset", "")).strip()
+        sample_id = str(fields.get("sample_id", "")).strip()
+        if not subset or not sample_id:
+            return
+
+        payload: Dict[str, Any] = {
+            "event": str(event),
+            **self._event_timestamp_fields(),
+        }
+        for key, value in fields.items():
+            if value is None:
+                continue
+            payload[str(key)] = value
+        self.sample_store.persist_event_record(subset, sample_id, payload)
+
+    def sample_timing_summary(self, subset: str, sample_id: str) -> Dict[str, Any]:
+        return dict(build_sample_timing_record(self.sample_store.load_sample_event_records(subset, sample_id)) or {})
+
+    def ensure_stage_started(self, subset: str, sample_id: str, stage: str) -> None:
+        stage_name = str(stage).strip()
+        if not stage_name:
+            return
+
+        key = (str(subset), str(sample_id), stage_name)
+        with self._stage_timing_lock:
+            if key in self._stage_start_ts or key in self._stage_done_keys:
+                return
+            self._stage_start_ts[key] = time.perf_counter()
+
+        log_event(
+            self.logger,
+            "sample_stage_start",
+            subset=str(subset),
+            sample_id=str(sample_id),
+            stage=stage_name,
+        )
+        self.persist_structured_event_record(
+            "sample_stage_start",
+            subset=str(subset),
+            sample_id=str(sample_id),
+            stage=stage_name,
+        )
+
+    def mark_stage_done(self, subset: str, sample_id: str, stage: str) -> None:
+        stage_name = str(stage).strip()
+        if not stage_name:
+            return
+
+        key = (str(subset), str(sample_id), stage_name)
+        with self._stage_timing_lock:
+            if key in self._stage_done_keys:
+                return
+            start_ts = self._stage_start_ts.pop(key, None)
+            self._stage_done_keys.add(key)
+
+        elapsed_ms = 0
+        if start_ts is not None:
+            elapsed_ms = int(round((time.perf_counter() - start_ts) * 1000.0))
+
+        log_event(
+            self.logger,
+            "sample_stage_done",
+            subset=str(subset),
+            sample_id=str(sample_id),
+            stage=stage_name,
+            elapsed_ms=elapsed_ms,
+        )
+        self.persist_structured_event_record(
+            "sample_stage_done",
+            subset=str(subset),
+            sample_id=str(sample_id),
+            stage=stage_name,
+            elapsed_ms=elapsed_ms,
         )
 
     def with_minimal_done_export_diagnostics(
@@ -663,8 +752,10 @@ class ServerRuntimeState:
             reason,
             details_payload,
             sample_runtime=runtime_payload,
+            publish_failed_marker=False,
         )
         self.persist_run_summary(subset)
+        self.sample_store.publish_failed_marker(subset, sample_id)
 
     def clear_sample_jobs(self, subset: str, sample_id: str) -> None:
         removed_task_ids: set[str] = set()
@@ -729,6 +820,12 @@ class ServerRuntimeState:
                 sample_id=sample_id,
                 **fallback_fields,
             )
+            self.persist_structured_event_record(
+                "fallback_applied",
+                subset=subset,
+                sample_id=sample_id,
+                **fallback_fields,
+            )
 
     def fail_sample(
         self,
@@ -745,6 +842,13 @@ class ServerRuntimeState:
         self.persist_sample_failure(subset, sample_id, reason, details)
         log_event(
             self.logger,
+            "sample_failed",
+            subset=subset,
+            sample_id=sample_id,
+            reason=reason,
+            details=details or {},
+        )
+        self.persist_structured_event_record(
             "sample_failed",
             subset=subset,
             sample_id=sample_id,
@@ -865,20 +969,30 @@ class ServerRuntimeState:
                 completed_stages=completed_stages,
                 diagnostics=diagnostics,
             ),
+            publish_done_marker=False,
         )
         self.persist_run_summary(subset)
+        self.sample_store.publish_done_marker(subset, sample_id)
 
         state["sample_status"][sample_id] = 3
         state["cur_idx"] += 1
 
         if not already_done:
             global_done += 1
+        finalize_ms = int(round((time.perf_counter() - finalize_start) * 1000.0))
         log_event(
             self.logger,
             "finalize_done",
             subset=subset,
             sample_id=sample_id,
-            finalize_ms=int(round((time.perf_counter() - finalize_start) * 1000.0)),
+            finalize_ms=finalize_ms,
+            segment_count=len(payload_to_persist.get("segments", [])),
+        )
+        self.persist_structured_event_record(
+            "finalize_done",
+            subset=subset,
+            sample_id=sample_id,
+            finalize_ms=finalize_ms,
             segment_count=len(payload_to_persist.get("segments", [])),
         )
         self.logger.info(f"[Progress] {global_done}/{progress_total} (finished: {subset}/{sample_id})")
@@ -1000,7 +1114,7 @@ def build_runtime_state(config: Config, logger: Any, dependencies: RuntimeDepend
                 f"mismatches={manifest_status.resume.mismatch_fields}"
             )
 
-    return ServerRuntimeState(
+    runtime_state = ServerRuntimeState(
         config=config,
         logger=logger,
         dependencies=dependencies,
@@ -1023,3 +1137,5 @@ def build_runtime_state(config: Config, logger: Any, dependencies: RuntimeDepend
         run_manifest_status_by_subset=run_manifest_status_by_subset,
         step_a_producer_batch_limit=STEP_A_PRODUCER_BATCH_LIMIT,
     )
+    job_builder.bind_event_recorder(lambda event, fields: runtime_state.persist_structured_event_record(event, **fields))
+    return runtime_state

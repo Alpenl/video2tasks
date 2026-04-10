@@ -19,17 +19,8 @@ def _load_config(config: Path | None) -> Config:
         raise click.UsageError(str(exc)) from exc
 
 
-@click.command()
-@click.option(
-    "--config",
-    "-c",
-    type=click.Path(exists=True, path_type=Path),
-    help="Path to configuration file",
-)
-def main(config: Path | None) -> None:
-    """Start one server process plus N worker processes."""
-    cfg = _load_config(config)
-
+def run_cluster(cfg: Config) -> None:
+    """Start one server process plus N worker processes from a config object."""
     worker_count = int(cfg.worker.count)
     server_proc = multiprocessing.Process(
         target=run_server,
@@ -64,6 +55,19 @@ def main(config: Path | None) -> None:
                 proc.terminate()
         for proc in reversed(procs):
             proc.join(timeout=5)
+
+
+@click.command()
+@click.option(
+    "--config",
+    "-c",
+    type=click.Path(exists=True, path_type=Path),
+    help="Path to configuration file",
+)
+def main(config: Path | None) -> None:
+    """Start one server process plus N worker processes."""
+    cfg = _load_config(config)
+    run_cluster(cfg)
 
 
 if __name__ == "__main__":

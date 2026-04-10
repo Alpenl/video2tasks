@@ -6,6 +6,7 @@ from video2tasks.server.run_manifest import build_run_manifest
 from video2tasks.server.run_summary import (
     build_run_summary,
     build_sample_runtime_record,
+    build_sample_timing_record,
     run_summary_path,
     write_run_summary,
 )
@@ -85,6 +86,126 @@ def test_build_sample_runtime_record_references_failure_details() -> None:
         "details": {"stage": "export"},
         "report_path": "failure.json",
     }
+
+
+def test_build_sample_timing_record_aggregates_stage_and_request_elapsed() -> None:
+    payload = build_sample_timing_record(
+        [
+            {
+                "event": "sample_stage_start",
+                "subset": "demo",
+                "sample_id": "sample",
+                "stage": "stage1_segments",
+                "ts": "2026-04-10T12:00:00.000+08:00",
+                "ts_unix_ms": 1000,
+            },
+            {
+                "event": "artifact_extract_done",
+                "subset": "demo",
+                "sample_id": "sample",
+                "task_id": "demo::sample_w0_r0",
+                "job_type": "window_boundary",
+                "artifact_extract_ms": 120,
+                "image_count": 8,
+                "transport_mode": "shared_fs",
+                "artifact_reuse": False,
+                "ts": "2026-04-10T12:00:00.200+08:00",
+                "ts_unix_ms": 1200,
+            },
+            {
+                "event": "infer_attempt",
+                "subset": "demo",
+                "sample_id": "sample",
+                "task_id": "demo::sample_w0_r0",
+                "dispatch_id": "d1",
+                "job_type": "window_boundary",
+                "infer_ms": 2300,
+                "ts": "2026-04-10T12:00:02.700+08:00",
+                "ts_unix_ms": 3700,
+            },
+            {
+                "event": "job_done",
+                "subset": "demo",
+                "sample_id": "sample",
+                "task_id": "demo::sample_w0_r0",
+                "dispatch_id": "d1",
+                "job_type": "window_boundary",
+                "infer_ms": 2300,
+                "submit_ms": 40,
+                "ts": "2026-04-10T12:00:02.740+08:00",
+                "ts_unix_ms": 3740,
+            },
+            {
+                "event": "sample_stage_done",
+                "subset": "demo",
+                "sample_id": "sample",
+                "stage": "stage1_segments",
+                "elapsed_ms": 4200,
+                "ts": "2026-04-10T12:00:04.200+08:00",
+                "ts_unix_ms": 5200,
+            },
+            {
+                "event": "finalize_done",
+                "subset": "demo",
+                "sample_id": "sample",
+                "finalize_ms": 180,
+                "segment_count": 7,
+                "ts": "2026-04-10T12:00:04.400+08:00",
+                "ts_unix_ms": 5400,
+            },
+        ]
+    )
+
+    assert payload == {
+        "first_event_at": "2026-04-10T12:00:00.000+08:00",
+        "last_event_at": "2026-04-10T12:00:04.400+08:00",
+        "total_elapsed_ms": 4400,
+        "stage_elapsed_ms": {"stage1_segments": 4200},
+        "job_elapsed_ms": {
+            "artifact_extract_total": 120,
+            "infer_total": 2300,
+            "submit_total": 40,
+            "finalize_total": 180,
+        },
+        "event_counts": {
+            "sample_stage_start": 1,
+            "artifact_extract_done": 1,
+            "infer_attempt": 1,
+            "job_done": 1,
+            "sample_stage_done": 1,
+            "finalize_done": 1,
+        },
+    }
+
+
+def test_build_sample_runtime_record_includes_timing_payload() -> None:
+    payload = build_sample_runtime_record(
+        subset="demo",
+        sample_id="sample",
+        terminal_state="done",
+        required_stages=["stage1_segments"],
+        completed_stages=["stage1_segments"],
+        diagnostics={},
+        retry_summary={"dispatch_count": 1},
+        timing={
+            "first_event_at": "2026-04-10T12:00:00.000+08:00",
+            "last_event_at": "2026-04-10T12:00:04.400+08:00",
+            "total_elapsed_ms": 4400,
+            "stage_elapsed_ms": {"stage1_segments": 4200},
+            "job_elapsed_ms": {
+                "artifact_extract_total": 120,
+                "infer_total": 2300,
+                "submit_total": 40,
+                "finalize_total": 180,
+            },
+            "event_counts": {"finalize_done": 1},
+        },
+    )
+
+    assert payload["timing"]["total_elapsed_ms"] == 4400
+    assert payload["timing"]["stage_elapsed_ms"] == {"stage1_segments": 4200}
+    assert payload["timing"]["job_elapsed_ms"]["infer_total"] == 2300
+    assert payload["timing"]["event_counts"] == {"finalize_done": 1}
 
 
 def test_build_sample_runtime_record_preserves_export_failure_diagnostics_from_failure_details() -> None:

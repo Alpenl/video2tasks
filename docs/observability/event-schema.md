@@ -15,6 +15,8 @@
 - `task_id`: 队列任务唯一 ID
 - `dispatch_id`: 下发尝试 ID（如 `d1`, `d2`）
 - 耗时字段（毫秒）：`artifact_extract_ms`, `infer_ms`, `submit_ms`, `finalize_ms`
+- 阶段字段：`stage` 目前固定用于 `stage1_segments` / `stage2_text` / `export`
+- 阶段耗时字段（毫秒）：`elapsed_ms`
 
 ## Frozen Events
 
@@ -76,14 +78,28 @@
 - 兼容扩展字段（当前实现可出现）：
   `*_fallback_used`, `*_fallback_reason`, `*used_subtitle_fallback`
 
-### 9) `sample_failed`
+### 9) `sample_stage_start`
+
+- 必有字段：
+  `subset`, `sample_id`, `stage`
+- 可选字段：
+  无（当前版本）
+
+### 10) `sample_stage_done`
+
+- 必有字段：
+  `subset`, `sample_id`, `stage`, `elapsed_ms`
+- 可选字段：
+  无（当前版本）
+
+### 11) `sample_failed`
 
 - 必有字段：
   `subset`, `sample_id`, `reason`, `details`
 - 可选字段：
   无（当前版本）
 
-### 10) `finalize_done`
+### 12) `finalize_done`
 
 - 必有字段：
   `subset`, `sample_id`, `finalize_ms`, `segment_count`

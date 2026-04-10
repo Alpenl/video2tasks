@@ -272,6 +272,18 @@ After the command exits, inspect results in this order:
 
 For full commands and expected outputs, see [Official Smoke Demo Runbook](docs/runbooks/official-smoke-demo.md).
 
+### Run A Single Video Directly
+
+```bash
+uv run v2t-single [--config /path/to/config.yaml] /path/to/video.mp4 [/path/to/output_dir]
+```
+
+- `--config/-c` is optional. When provided, `v2t-single` loads that config file explicitly.
+- `video_path` is required.
+- `output_dir` is optional. If omitted, the output base directory defaults to the input video directory.
+- If `--config` is omitted, config loading behavior is unchanged: first check `VIDEO2TASKS_CONFIG`, then fall back to env overrides/defaults.
+- Outputs are written under the normal run layout rooted at `output_dir`, for example `output_dir/<video_stem>/<run_id>/...`.
+
 ### Move To Your Own Data (After Smoke)
 
 ```bash
